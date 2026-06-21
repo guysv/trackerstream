@@ -32,6 +32,21 @@ function ensureBufs(frames) {
   lP = M._malloc(frames * 4); rP = M._malloc(frames * 4); CAP = frames;
 }
 
+// Low-level helpers for callers that need to poll position while rendering.
+export function ensureBufsExport(frames) { ensureBufs(frames); }
+export function curOrder(ptr) { return M._openmpt_module_get_current_order(ptr); }
+// Read one chunk (<= frames) as a mono Float32Array; empty when the song ends.
+export function readChunk(ptr, frames) {
+  ensureBufs(frames);
+  const got = M._openmpt_module_read_float_stereo(ptr, SR, frames, lP, rP);
+  if (got <= 0) return new Float32Array(0);
+  const L = M.HEAPF32.subarray(lP / 4, lP / 4 + got);
+  const R = M.HEAPF32.subarray(rP / 4, rP / 4 + got);
+  const out = new Float32Array(got);
+  for (let i = 0; i < got; i++) out[i] = (L[i] + R[i]) * 0.5;
+  return out;
+}
+
 // Render the first `seconds` of audio as a mono Float32Array (left+right)/2.
 export function render(ptr, seconds) {
   const chunk = 4096; ensureBufs(chunk);
@@ -66,6 +81,29 @@ export function renderFirstPattern(ptr, maxSeconds = 20, chunk = 64) {
   return out.subarray(0, n);
 }
 
+// --- seeking ---
+// Returns the actual playback position libopenmpt landed on (it snaps to a row).
+export function seekSeconds(ptr, seconds) {
+  const t0 = process.hrtime.bigint();
+  const at = M._openmpt_module_set_position_seconds(ptr, seconds);
+  const t1 = process.hrtime.bigint();
+  return { at, ms: Number(t1 - t0) / 1e6 };
+}
+export function seekOrderRow(ptr, order, row) {
+  const t0 = process.hrtime.bigint();
+  const at = M._openmpt_module_set_position_order_row(ptr, order, row);
+  const t1 = process.hrtime.bigint();
+  return { at, ms: Number(t1 - t0) / 1e6 };
+}
+export function pos(ptr) {
+  return {
+    seconds: M._openmpt_module_get_position_seconds(ptr),
+    order: M._openmpt_module_get_current_order(ptr),
+    row: M._openmpt_module_get_current_row(ptr),
+    pattern: M._openmpt_module_get_current_pattern(ptr),
+  };
+}
+
 export function meta(ptr, key) {
   const kPtr = M._malloc(key.length + 1);
   for (let i = 0; i < key.length; i++) M.HEAP8[kPtr + i] = key.charCodeAt(i);
@@ -85,6 +123,21 @@ export function info(ptr) {
     samples: M._openmpt_module_get_num_samples(ptr),
     channels: M._openmpt_module_get_num_channels(ptr),
   };
+}
+
+// Alignment-tolerant similarity: slide `test` against `ref` within +/-maxLag
+// samples and return the best sim. Two capture paths (chunk-granular playthrough
+// vs exact-row seek) can differ by a sub-row offset; that phase shift destroys a
+// sample-exact RMS diff even when the music is identical, so we search the lag.
+export function bestSim(ref, test, maxLag = 512) {
+  let best = 0, bestLag = 0;
+  for (let lag = -maxLag; lag <= maxLag; lag++) {
+    const a = lag >= 0 ? ref.subarray(lag) : ref;
+    const b = lag >= 0 ? test : test.subarray(-lag);
+    const s = similarity(a, b).sim;
+    if (s > best) { best = s; bestLag = lag; }
+  }
+  return { sim: best, lag: bestLag };
 }
 
 // RMS-based similarity of a truncated render vs the full-file reference.
