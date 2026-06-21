@@ -65,7 +65,7 @@ The full local Mod Archive torrent is available offline, so it can seed the serv
 **Goal:** Play modules streamed from the server, starting before the whole file arrives. This is the ambitious core of the MVP.
 
 **Scope**
-- **Repack pipeline (server):** on ingest, transform each module into a manifest (order list, pattern metadata, instrument table) plus instrument **segments** ordered by first-needed-in-playback-order (pattern→instrument deps walked along the order list). Segment 0 = enough to start.
+- **Repack pipeline (server):** on ingest, transform each module into a manifest (order list, pattern metadata, instrument table) plus instrument **segments** ordered by first-needed-in-playback-order (pattern→instrument deps walked along the order list). Segment 0 = enough to start. The manifest also carries **seek-support tables** (validated in the lab — [`lab/SEEK.md`](lab/SEEK.md)): a **timing map** (per order + tempo change → `T ↔ order:row`) and, per seek checkpoint, the **resident sample set** (samples live/triggered at that point) — optionally as **byte ranges** for partial-sample fetch. These make cold seeks into unbuffered regions cheap (Phase 4).
 - **Delivery (server):** serve the manifest first, then segments on request.
 - **Fetch plan (client):** read the manifest, request segment 0 to begin playback, prefetch later segments by configurable lookahead (N patterns / T seconds). Seek/loop follow jumps in the order list and reuse cached segments.
 - **Segment cache (client):** keep fetched segments for seek/loop and re-listens.
@@ -109,12 +109,14 @@ The full local Mod Archive torrent is available offline, so it can seed the serv
 
 **Scope**
 - Full transport: play/pause, seek (by `order:row` and by seconds), next/previous, auto-advance.
+- **Cold-seek into an unbuffered region** uses the packer's per-checkpoint **resident sample set** + **timing map** (baked in Phase 2) — fetch only the samples live/triggered at the target, `set_position`, play; lookahead streams the rest. Validated in the lab to ~3× faster time-to-playback than a naive prefix download (up to ~7× on late seeks), bit-exact, with stock libopenmpt — see [`lab/SEEK.md`](lab/SEEK.md).
 - Now-playing display: pattern/row position, per-channel VU/activity, instrument/sample table, subsong selector.
 - Gapless / auto-next handoff between modules.
 - Persisted playback settings (interpolation, volume).
 
 **Exit criteria**
 - Seeking and looping reuse engine + segment-cache state correctly (no full reload on seek).
+- A cold seek into an un-fetched region starts playing without downloading a whole-file prefix (fetches the target's resident set, not everything up to it).
 - Subsongs selectable; multi-subsong modules handled.
 - Continuous listening across a queue with no gaps or drop-outs.
 

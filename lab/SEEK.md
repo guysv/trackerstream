@@ -58,20 +58,82 @@ divergence, not phase noise).
 whole file, gets the *same* approximate seek. Streaming can't do worse on accuracy
 as long as we hand the engine the same bytes.
 
-## Open question for the next probe — "what samples must be resident to seek to order N?"
+## Result 3 — random-seek packer: resident-set fetch (`seek-pack.mjs`)
 
-Result 1 says a correct post-seek render needs PCM only for the notes audible at
-the target. The next step is to make that precise and verify it:
+Goal: faster time-to-playback on a **random seek into a not-yet-buffered module**.
+At pack time, statically compute the **resident set** for a seek to order N: the
+samples still *live* on each channel entering N (last note-on per channel, minus
+cuts) plus the samples *triggered* in the first-audio window. A cold seek fetches
+only those, calls stock `set_position_order_row(N,0)`, and plays — no whole-file
+prefix.
 
-- statically walk the pattern/order stream from 0→N, tracking per channel the
-  current (last-triggered, not-yet-cut) sample → the **resident set** at N;
-- build a module containing only those samples (rest zero-filled), seek to N,
-  and confirm the post-seek opening matches the full-file seek;
-- size the resident set vs. channel count and vs. "everything used up to N".
+Verified by building a resident-only module (others silenced), seeking it, and
+comparing to the full-file seek. Same engine path ⇒ a complete resident set is
+**bit-identical**. IT random vol/pan neutralized for determinism (it changes
+volume/pan, never *which* sample plays, so the resident set is valid for real
+playback too).
 
-If the resident set is ~channel-count small (expected), streamed seeking is a
-matter of: fetch those few segments, `set_position`, play — while normal lookahead
-fetches the rest. That's the client-side seek strategy for Phase 2/4.
+Two refinements over a naive "all live samples" set, both needed because the
+crude set over-fetches the big sustained samples (50–95% of bytes):
+
+1. **Drop stale notes.** A held one-shot whose tail already finished before N
+   isn't needed. Walk 0→N with a tempo/speed timeline (`Axx`/`Txx`), track each
+   note's onset time, and keep a held sample only if it loops or
+   `now − onset < sampleDuration(note)`. (This timeline is also the
+   second→`order:row` map the seek bar needs — one computation, two uses.)
+2. **Bound the window** to the actual first-audio seconds, not a fixed pattern
+   count.
+
+Result — refined resident set is **6/6 bit-correct** and over-fetches only 0–7
+samples vs. the true minimum. The true minimum is computable at pack time
+empirically (silence each sample, see if the first 0.5s changes — exact because
+channels sum and the render is deterministic), so the packer can ship it directly:
+
+| IT | naive prefix | crude set | refined (static) | **minimal (bakeable)** |
+|---|---|---|---|---|
+| a-windf.it | 26 ms | 23 | 19 | **18 ms** (1.4×) |
+| bz_pif.it | 521 ms | 469 | 364 | **294 ms** (1.8×) |
+| beyond_the_network.it | 699 ms | 468 | 376 | **318 ms** (2.2×) |
+
+(mean TTFPB over 6 seek points each, 50 Mbit. Naive prefix is the minimal
+original-order download that makes the seek correct — 73–100% of the file, since
+live samples are scattered to the end.)
+
+## Result 4 — partial-sample (byte-range) fetch (`seek-partial.mjs`)
+
+The manifest is **not** the floor (1.5–5.7% of a big IT — patterns + headers).
+Samples are: even the minimal resident set is ~50% of the file because live
+samples are large. But rendering the first 0.5 s only *reads a slice* of each
+sample (a held one-shot from its play position; a looped sample around its loop).
+Block-probing each needed sample (zero a block, see if the window audio changes):
+
+| IT | seek | needed samples | full bytes | **read bytes** | read% | TTFPB full→partial |
+|---|---|---|---|---|---|---|
+| bz_pif.it | order 28 | 17 | 2056K | 1033K | 50% | 345 → **178 ms** |
+| beyond_the_network.it | order 207 | 11 | 1312K | 628K | 48% | 256 → **144 ms** |
+
+Only **48–63%** of needed-sample PCM is touched in the first window, so shipping
+byte *ranges* (and rewriting sample length/loop in the manifest) buys another
+~1.6–1.9× on top of the resident set.
+
+**Combined: cold random-seek TTFPB drops ~3× vs. the naive prefix** (up to ~7× on
+late seeks), with stock libopenmpt — no fork. e.g. bz_pif ~530 → ~160 ms, beyond
+~700 → ~100–240 ms.
+
+## Packer recommendation (random seek)
+
+- Bake a **timing map** (per order + tempo change) → instant `T ↔ order:row` and
+  the staleness/window timing.
+- Bake, per seek checkpoint, the **minimal resident set** (computed at pack time
+  with the deterministic engine); fall back to the static refined heuristic if
+  pack-time rendering is too costly. Reference samples by opaque id (the existing
+  manifest seam).
+- For the largest wins, bake **per-sample byte ranges** for each checkpoint and
+  have the client assemble sparse samples (length/loop rewritten), streaming the
+  remainder via normal lookahead.
+- A fork is still *not* required for fast seeks; it remains the route only to
+  sample-*exact* XM/IT seek and instant scrub (see "fork" discussion), which are
+  post-MVP polish.
 
 ## Reproduce
 
@@ -79,4 +141,6 @@ fetches the rest. That's the client-side seek strategy for Phase 2/4.
 cd lab
 npm install
 node seek-mechanics.mjs   # seek cost vs target + seek-vs-playthrough accuracy
+node seek-pack.mjs        # random-seek resident-set packer: crude vs refined vs minimal
+node seek-partial.mjs     # partial-sample (byte-range) read fraction headroom
 ```
