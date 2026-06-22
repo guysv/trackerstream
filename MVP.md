@@ -10,7 +10,7 @@ Design constraints carried through every phase (from the [spec](README.md)):
 - **Streaming repack** (manifest + needed-instruments-first segments) is in scope — see Phase 2. Instruments are referenced by an opaque id; no content addressing. The core viability of this approach has already been proven in a WASM lab — see [`lab/FINDINGS.md`](lab/FINDINGS.md).
 - **Desktop-first** (Tauri). Mobile-lite is a later, separate effort.
 - **AGPL-compatible dependencies only** (see [License](README.md#license)).
-- IPFS / CID dedup is **out of MVP** — a later swap of the delivery backend, not the foundation.
+- IPFS / CID dedup is **out of MVP** — a later swap of the delivery backend, not the foundation. Its payoff is now quantified (a lab measured ~30% whole-sample / ~41% chunk-level byte-exact sample dedup across the full archive — [`lab/CID.md`](lab/CID.md)), and the design seam is the same opaque instrument id used in Phase 2.
 
 The full local Mod Archive torrent is available offline, so it can seed the server and every phase can be developed and tested without a public network.
 
@@ -176,6 +176,6 @@ The full local Mod Archive torrent is available offline, so it can seed the serv
 
 Deferred, but the architecture is designed to accommodate them (see [Future ideas](README.md#future-ideas)):
 - IPFS sharing layer; funded pinning + STUN service.
-- CID-native modules (opaque instrument ids → CIDs for cross-module dedup).
+- CID-native modules (opaque instrument ids → CIDs for cross-module dedup). Decompose modules into a content-addressed DAG with chunk-level (FastCDC) sample blocks; measured to dedup ~41% of sample bytes corpus-wide ([`lab/CID.md`](lab/CID.md)). The same chunk is the seek/repack partial-fetch unit.
 - Mobile-lite client.
 - Format-specific playback engines for bit-exact fidelity (e.g. ProTracker `.mod`).
