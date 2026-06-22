@@ -11,7 +11,7 @@ Tracker modules are a deep catalog of community-made music, but discovery and pl
 | Phase | Target | Notes |
 |-------|--------|-------|
 | **Now** | PC (desktop) | Full UI, keyboard shortcuts, rich browsing |
-| **Later** | Mobile (lite) | Stream, queue, and social—trimmed chrome |
+| **Later** | Mobile | Full peer (fetch + re-serve); stream, queue, social—trimmed chrome |
 
 ## MVP
 
@@ -60,56 +60,57 @@ This is a deliberate departure from prior art. The reference Mod Archive web pla
 
 ## Architecture
 
-trackerstream is a **client–server** application, not a decentralized one. Full decentralization was considered and dropped as not worth the cost for now; the IPFS sharing layer under [Future ideas](#future-ideas) is a later addition, not the foundation.
+trackerstream is a **hybrid**: a **decentralized data plane** over a **centralized control plane**. The *bytes of modules* travel peer-to-peer as content-addressed blocks (clients fetch **and re-serve** them); everything user-facing and private—catalog, search, accounts, playlists, social, presence—stays server-owned. (An earlier draft was "client–server, not decentralized"; the [content-addressing labs](MVP.md) showed ~30–41% byte-exact sample dedup across the archive, which made decentralizing *delivery* worth it. Only delivery is decentralized.)
 
 ### Central server
 
-- Owns the canonical **catalog**: module files, extracted metadata, and the search/browse APIs.
-- Runs the **repack pipeline** on ingest (see below).
-- **Streams** modules to clients—manifest first, then segments on demand.
-- Owns user **accounts**, **playlists**, the **social graph** (follows), **presence** ("now playing"), and **share links**.
+- Owns the canonical **catalog**: extracted metadata, the search/browse APIs, and the mapping from each module to its **root CID**.
+- Runs the **repack → content-addressed DAG pipeline** on ingest (see below), and **pins the archive modules on a master IPFS node**—the guaranteed availability floor when no peer holds the content.
+- Acts as a **Kademlia DHT bootstrap node and guaranteed CID provider** for every archive module, and runs **STUN** (with a circuit-relay fallback) for NAT traversal — so peers discover each other and content via the DHT while rare modules stay reachable through the master.
+- Owns user **accounts**, **playlists**, the **social graph** (follows), **presence** ("now playing"), and **share links**—all over HTTP, never on the P2P plane.
 
 ### Client (Tauri desktop)
 
 - Synthesizes audio locally with libopenmpt in an AudioWorklet (see [Playback architecture](#playback-architecture)).
-- Derives a **fetch plan** from a module's manifest and streams segments progressively.
-- **Caches** fetched segments for seek/loop reuse and re-listens.
+- Runs a **libp2p/IPFS node**: resolves a module's **root CID**, fetches its DAG blocks from peers + master, **verifies each block against its CID**, and **re-serves** cached blocks to other peers.
+- Derives a **fetch plan** from the manifest and streams blocks progressively in playback order.
+- **Caches** fetched blocks (keyed by CID) for seek/loop reuse, re-listens, and **cross-module reuse** (a later track reuses an earlier one's shared chunks).
 - Owns all UI: browsing, dense IT-style views, the (ephemeral, local) play **queue**, keyboard navigation, transport, and now-playing display.
 
-Playlists and the queue are plain ordered lists of module references—no content addressing involved.
+Playlists and the queue are plain ordered lists of module references (catalog id + root CID), held on the server / locally—never gossiped over P2P.
 
-### Streaming repack (MVP)
+### Content-addressed repack (MVP)
 
-Tracker modules can be several megabytes, so to start playback quickly the server stores them in a repacked, streaming-friendly format rather than shipping the whole file up front:
+Tracker modules can be several megabytes, so the server stores each as a **content-addressed block DAG** rather than a single file—which makes playback start fast *and* lets identical samples dedupe and travel peer-to-peer:
 
-- A small **manifest** (order list, pattern metadata, instrument table) ships first.
-- Instruments are grouped into **segments** ordered by when they are first needed—walking pattern→instrument dependencies in **playback order** (the order list), not raw pattern index. Segment 0 is enough to begin playback; later segments prefetch in the background (HLS-like, but keyed on tracker dependencies).
-- **Lookahead** is configurable (N patterns or T seconds ahead): required-now vs prefetch vs on-demand.
-- **Seek/loop** reuse already-fetched segments; the fetch plan follows jumps in the order list, not sequential pattern files.
-- Optional: inline tiny one-shot samples in the manifest to avoid extra round trips.
+- A small **manifest** (root) ships first: order list, pattern metadata, instrument table, per-sample `pcm-root` CIDs, and baked **seek tables** (timing map + per-checkpoint resident sets).
+- **Sample PCM is content-defined-chunked (FastCDC)** into blocks addressed by **CID**. Identical chunks across modules share a CID—stored once on the master, cached once per client. The chunk is simultaneously the **dedup unit**, the **partial-fetch granule**, and the **seek resident-set unit**.
+- The client's **fetch plan** resolves the blocks for **segment 0** (the first pattern's resident chunks) first, then prefetches later blocks by configurable **lookahead** (N patterns / T seconds) in playback order, sourcing from peers + master.
+- **Seek/loop** reuse cached blocks; a cold seek fetches only the target's resident-set chunk CIDs, not the whole DAG.
 
-This is purely a buffering optimization and does **not** require content addressing—instruments are referenced by an opaque id within the module's manifest.
+Self-verifying CIDs mean peer-served content can't be tampered; only public archive modules travel P2P.
 
 ## Future ideas
 
 Out of MVP scope, but the architecture above is designed to accommodate them:
 
-### IPFS sharing layer
+### Deeper decentralization
 
-- Mirror or reference module assets on IPFS for decentralized availability, reducing reliance on a single origin.
-- Fund a dedicated **pinning + STUN** service so playback and peer discovery stay reliable.
-- **CID-native modules:** make the repack's opaque instrument ids resolve to **content IDs (CIDs)**, so identical samples across modules dedupe at the content layer (better cache hit rates, less storage). Because the MVP repack already separates instruments behind ids, this is a delivery-backend swap, not a redesign.
+The MVP already puts module delivery on IPFS/libp2p with a Kademlia DHT (see [Architecture](#architecture)). Beyond it:
+
+- **Funded / incentivized public pinning** beyond the single master node—community seeding so availability doesn't rest on one origin.
+- **Dedicated, scaled relay infrastructure** for clients on symmetric NATs (the MVP ships only a minimal relay fallback).
 
 ### Other
 
-- Mobile-lite client.
+- Mobile client—a **full peer** like desktop, with trimmed UI chrome.
 - Format-specific playback engines for bit-exact fidelity (e.g. Amiga ProTracker `.mod`).
 
 ## Project status
 
 **Early stage.** Repository bootstrap—product spec and README only. Implementation details (API shape, Mod Archive integration) will be documented here as they land.
 
-**Stack:** desktop client built on **Tauri** (small footprint; the Rust backend handles native playback glue, the segment cache, and a future IPFS layer). Overall shape is **client–server** (see [Architecture](#architecture)). The playback engine (libopenmpt → WASM in an AudioWorklet) is described under [Playback architecture](#playback-architecture). Other choices (UI framework, server stack, social providers) are still open.
+**Stack:** desktop client built on **Tauri** (small footprint; the Rust backend handles native playback glue, the block cache, and the libp2p/IPFS node). Overall shape is a **hybrid**—decentralized data plane, centralized control plane (see [Architecture](#architecture)). The playback engine (libopenmpt → WASM in an AudioWorklet) is described under [Playback architecture](#playback-architecture). Other choices (UI framework, server stack, social providers, P2P stack) are still open.
 
 ## License
 
