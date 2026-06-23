@@ -89,14 +89,18 @@ export function enqueue(hit: ModuleHit, next = false): void {
 let connected = false;
 async function ensureConnected() {
   if (connected) return;
-  const addr = BOOTSTRAP_MULTIADDRS[0];
-  if (!addr) return;
-  try {
-    await connectPeer(addr);
-    connected = true;
-  } catch {
-    /* will retry on next play; master may be momentarily unreachable */
+  // Try every bootstrap addr (literal IPs first, then /dns*) until one connects —
+  // a failed dial (e.g. an unsupported /dns* transport) just falls through.
+  for (const addr of BOOTSTRAP_MULTIADDRS) {
+    try {
+      await connectPeer(addr);
+      connected = true;
+      return;
+    } catch {
+      /* try the next addr */
+    }
   }
+  /* none connected; will retry on next play (master may be momentarily unreachable) */
 }
 
 /** Stream + play a module, starting on the first (skeleton) blocks. */
