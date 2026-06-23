@@ -1,0 +1,17 @@
+[Unit]
+Description=trackerstream master IPFS/libp2p node (kubo) — DHT bootstrap + provider + relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trackerstream
+Group=trackerstream
+Environment=IPFS_PATH=/srv/trackerstream/ipfs
+ExecStart=/usr/local/bin/ipfs daemon --enable-gc=false
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

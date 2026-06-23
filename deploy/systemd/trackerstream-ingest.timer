@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic trackerstream ingest (pick up corpus additions)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
