@@ -1,0 +1,21 @@
+{
+  "name": "@trackerstream/repack",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Module -> content-addressed CID-DAG repack: parsers, FastCDC, DAG build + reassemble",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./parse": "./src/parse.ts",
+    "./cdc": "./src/cdc.ts",
+    "./dag": "./src/dag.ts",
+    "./kubo": "./src/kubo.ts"
+  },
+  "scripts": {
+    "test": "node test/roundtrip.ts"
+  },
+  "dependencies": {
+    "@ipld/dag-cbor": "^9.2.1",
+    "multiformats": "^13.3.1"
+  }
+}
