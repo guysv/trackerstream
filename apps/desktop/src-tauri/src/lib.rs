@@ -132,6 +132,11 @@ async fn get_stream_buffer(root: String, streams: State<'_, Streams>) -> Result<
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // RUST_LOG-driven tracing (rust-ipfs/libp2p/bitswap + our own spans). No-op
+    // unless RUST_LOG is set, so release runs stay quiet.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // Deep links: trackerstream://share/<code> (E2). The frontend handles the
