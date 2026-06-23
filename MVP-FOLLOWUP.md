@@ -43,6 +43,13 @@ A focused pass executed almost all of the below. Highlights:
   physical cross-NAT measurement is deferred** (clients circuit-relaying each
   other — to revisit).
 - **⏸ D4 TURN/relay load + symmetric-NAT** — deferred with the NAT work above.
+- **◐ G. Over-internet P2P playback** — A1 (HTTPS) let the embedded data plane run
+  over the **public** internet for the first time, exposing the client as a full
+  public-DHT crawler (stalled playback). **✅ Fixed** with a lightweight,
+  master-centric client (no Kademlia + direct `.provider(master)` Bitswap) +
+  bootstrap/UI fixes (pending live re-verify). **The private-swarm design to bring
+  the DHT back without public crawling (pnet vs custom-kad) is documented in §G;
+  ⏸ pnet implementation pending go-ahead.**
 
 The per-item detail below is the original plan; treat the markers above as current.
 
@@ -97,6 +104,11 @@ Not yet measured on real networks:
   *different* networks (the localhost swarm only proved the mechanism: cold 1.4 s /
   warm 31 ms for a 4.5 MB module).
 - DHT **provide / find-providers latency** validation (Phase 1 risk note).
+
+**Update (2026-06-23):** over-internet testing reframed this — the client now
+fetches **master-direct** (§G2), so peer-assist + cross-NAT depend on the **private
+DHT + client-providing** work in **§G3** (pnet). That's the prerequisite for any
+client↔client / circuit-relay measurement here.
 
 ---
 
@@ -186,7 +198,9 @@ Tauri updater. Also: Windows/Linux build targets.
 ### 🟢 D4. TURN/relay load + symmetric-NAT validation
 coturn is configured with a static TURN credential but the relay path for symmetric
 NATs isn't load-tested (ties to A3). Rotate the TURN secret management out of the
-plaintext config too.
+plaintext config too. **Note:** the relay path only matters once clients fetch from
+**each other** — i.e. after the private-DHT + client-providing work in **§G3**; the
+current model is master-direct, so there's nothing to relay yet.
 
 ---
 
@@ -200,6 +214,96 @@ leaves OAuth / ActivityPub open ([`apps/server/src/social.ts`](apps/server/src/s
 Shares resolve to catalog id + root CID and open via a pasted **code**. A real
 deep-link/custom-protocol (`trackerstream://share/<code>`) handler and richer
 playlist-share + listening-session-share UX are follow-ups.
+
+---
+
+## G. P2P client networking — over-internet playback + private swarm (pnet / DHT)
+
+A1 (HTTPS) finally let the packaged app reach the catalog over the real internet,
+so the **embedded rust-ipfs data plane was exercised over the public network for
+the first time** (it was previously blocked at "catalog offline", so all prior P2P
+validation was localhost-only). That surfaced real issues and a design decision
+about the DHT.
+
+### G1. Over-internet playback findings (2026-06-23)
+Live testing: the first track played; subsequent tracks stalled ("streaming stuck
+mid-way", "no sound"). Root cause, from the libp2p/Bitswap trace:
+- The embedded client ran as a **full public-DHT node** — `with_default()` enables
+  Kademlia joined to the **global** IPFS DHT. It crawled and churned **hundreds**
+  of random public peers (`BadCertificate` / `KeepAliveTimeout` / connection
+  refused — ~200k log lines), starving the single master connection.
+- **Bitswap had no provider hint**, so each block fetch did DHT provider discovery
+  across that flaky public swarm instead of asking the always-on master. With
+  `Provide.Strategy=roots`, leaf blocks have no provider records at all, so this
+  path is especially unreliable.
+- The **server was fine**: the master holds complete DAGs (offline `ipfs refs -r`
+  resolves every child block) and serves Bitswap. The problem was entirely the
+  client's networking posture.
+- A separate earlier regression: the D1 `/dns4`-only bootstrap list silently failed
+  to dial (the embedded node didn't resolve `/dns4`), causing "streaming 0%".
+
+### G2. Fix applied — lightweight, master-centric client (✅ applied, pending live re-verify)
+[`apps/desktop/src-tauri/src/ipfs.rs`](apps/desktop/src-tauri/src/ipfs.rs):
+- **No public-DHT crawl** — build the libp2p behaviour with only identify (needed
+  by relay/AutoNAT/DCUtR), bitswap, and ping; **drop Kademlia + pubsub**
+  (`with_default()` → explicit `with_identify/.with_bitswap/.with_ping`).
+- **Direct provider fetch** — `get_block(cid).provider(MASTER_PEER_ID)` so Bitswap
+  dials the master directly (it has every block and we bootstrap-connect to it),
+  skipping DHT discovery.
+- **Bootstrap robustness** — the client now tries **every** `BOOTSTRAP_MULTIADDRS`
+  entry (literal `/ip4`+`/ip6` first, `/dns*` as durability fallback) until one
+  connects, instead of only `[0]`.
+- **Diagnostics** — the app honours `RUST_LOG` (a `tracing_subscriber` is
+  installed) and prints `[connect]` / `[stream]` progress markers to stderr; run
+  the binary directly with e.g. `RUST_LOG=warn,desktop=info` to trace fetches.
+
+This makes **master-served** playback fast and reliable, independent of any DHT. It
+deliberately does **not** do client↔client transfer — that needs a DHT, but a
+*private* one (below).
+
+### G3. Keeping a DHT without crawling the public network (pnet vs custom-kad)
+We want a DHT for **client↔client peer-assist** (warm-cache offload, the A3/D4
+story), but confined to trackerstream peers — never the public IPFS swarm. Two real
+mechanisms, **both supported by rust-ipfs** (verified in the 0.15 source):
+
+**Option A — Private network (pnet / pre-shared swarm key).  ← recommended**
+A 256-bit PSK baked into the master + every client gates the **transport**: a node
+can only complete a connection with a peer holding the same key; public IPFS nodes
+literally cannot connect. Keep Kademlia **on** — its routing table can then only
+ever contain trackerstream peers, so you get a **private DHT for free**, with zero
+public crawling.
+- **kubo (master):** generate `swarm.key`, drop it in `IPFS_PATH`, set
+  `LIBP2P_FORCE_PNET=1`. Native, well-trodden. The master leaves the public swarm.
+- **rust-ipfs (client):** compile with the `pnet` cargo feature, call
+  `.enable_pnet(psk)` (`builder.rs:407`), re-enable `with_kademlia()`, bootstrap off
+  the master.
+- **Trade-offs:** the master loses its public-IPFS DHT/provider role (fine for a
+  self-contained archive — arguably desirable). The PSK is a shared secret baked
+  into the client binary (extractable), so this is swarm **segmentation**, not
+  access control — standard for pnet, and adequate for "keep the swarm to
+  ourselves".
+
+**Option B — Custom Kademlia protocol id (`/trackerstream/kad/1.0.0`).**
+Only the DHT *overlay* is private — rust-ipfs supports a `custom_protocol_id`
+(`builder.rs:223`), so nodes form a separate DHT and never populate routing from
+public `/ipfs/kad` peers. **But** connections aren't gated (a node can still connect
+to a public peer if it learns its address), and **kubo hardcodes `/ipfs/kad/1.0.0`**
+for the WAN DHT — the master would need a custom libp2p build. Weaker isolation,
+more work. **Not recommended.**
+
+**Recommended sequencing:**
+1. **G2 master-direct** as the fast default — applied.
+2. **Add pnet** — `swarm.key` on the master + `.enable_pnet(psk)` on the client,
+   re-enable Kademlia → a private trackerstream DHT, no public crawl. Keep
+   `.provider(master)` as the fast path; the DHT is only for discovery.
+3. **Client providing** — for client↔client to actually transfer, clients must
+   `provide` the CIDs they cache to the private DHT, and the fetch path must try
+   discovered peers (not only the master). This is the peer-assist feature and the
+   substrate for **A3** (cross-NAT, clients circuit-relaying each other) and **D4**.
+
+**Caveat.** With pnet on, the master can *only* talk to private peers — its public
+connections and any public-IPFS role end. If the master should also mirror to public
+IPFS, that requires a separate, non-private node.
 
 ---
 
@@ -230,4 +334,5 @@ playlist-share + listening-session-share UX are follow-ups.
 3. **A2** ingest throughput fix → full-corpus ingest (real catalog + the ~59% dedup
    number).
 4. **B1/B2 seek + segment-0 tables** — the biggest UX wins, already proven in labs.
-5. **A3** physical NAT test — validates the P2P offload story end-to-end.
+5. **§G3 private DHT (pnet)** + client-providing — the real prerequisite for any
+   client↔client peer-assist; **A3** physical NAT/relay test follows from it.
