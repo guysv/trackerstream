@@ -35,17 +35,22 @@ export const API_PORT = 8080;
 export const API_BASE_URL = `https://${MASTER_HOST}`;
 
 // libp2p bootstrap / DHT. The master is a Kademlia bootstrap peer and always-on
-// provider for every archive CID. DNS-based (/dns4 + /dns6) so the data plane is
-// durable across an IP change. tcp listed first (most reliable initial dial),
-// then QUIC; v4 then v6.
+// provider for every archive CID. The client tries EVERY entry until one
+// connects (player.ensureConnected). Literal IPs are listed FIRST — the embedded
+// rust-ipfs node dials those directly and reliably — followed by the /dns4+/dns6
+// names for durability across an IP change (used when the node resolves /dns*).
+// (Unlike the HTTP plane, which the WKWebView resolves by name, the embedded
+// libp2p node's /dns* dialing is best-effort, so the literals are the floor.)
 export const LIBP2P_SWARM_PORT = 4001;
 export const MASTER_PEER_ID = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL"; // fra1 master
 export const BOOTSTRAP_MULTIADDRS = MASTER_PEER_ID
   ? [
+      `/ip4/${MASTER_IPV4}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
+      `/ip4/${MASTER_IPV4}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
+      `/ip6/${MASTER_IPV6}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
+      `/ip6/${MASTER_IPV6}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
       `/dns4/${MASTER_HOST}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
       `/dns6/${MASTER_HOST}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
-      `/dns4/${MASTER_HOST}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
-      `/dns6/${MASTER_HOST}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
     ]
   : [];
 
