@@ -1,22 +1,29 @@
 # trackerstream HTTP API reverse proxy (TLS termination).
 #
-# The MVP ships WITHOUT a domain (clients hard-code the IP), so TLS is deferred
-# per MVP.md §"No domain yet". This config is domain-READY: once a hostname
-# points at the droplet, set TS_DOMAIN and Caddy obtains + renews a Let's Encrypt
-# cert automatically, fronting the API.
+# Caddy fronts the control-plane API: it terminates TLS on :443 with an
+# automatic Let's Encrypt cert (renewed automatically) and reverse-proxies to the
+# API bound on 127.0.0.1:8080. The API itself is NOT exposed externally (serve.ts
+# binds 127.0.0.1, ufw denies :8080) — every request reaches it through Caddy.
 #
-#   apt install caddy
-#   TS_DOMAIN=trackerstream.example  caddy run --config deploy/Caddyfile
+# This is a TEMPLATE: deploy/setup-tls.sh renders ${TS_DOMAIN} (envsubst) to the
+# literal hostname into /etc/caddy/Caddyfile before starting Caddy. To run by hand:
 #
-# Until a domain exists, the API is reached directly on :8080 (ufw-allowed).
+#   TS_DOMAIN=trackerstream.xyz envsubst '${TS_DOMAIN}' < deploy/Caddyfile | caddy run --config -
+#
+# Caddy needs :80 (ACME HTTP-01 challenge + HTTP->HTTPS redirect) and :443.
 
-{$TS_DOMAIN} {
+${TS_DOMAIN} {
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:8080 {
 		health_uri /healthz
+		health_interval 30s
 	}
 	header {
-		Strict-Transport-Security "max-age=31536000"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
 	}
+	# Access logs go to journald (the default) — kept inside Caddy's systemd
+	# sandbox, retention via journald (see deploy/backup.sh / D3 log rotation).
 }

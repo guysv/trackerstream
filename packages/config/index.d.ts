@@ -1,4 +1,5 @@
 // Types for the server-address config (see index.js).
+export const MASTER_HOST: string;
 export const MASTER_IPV4: string;
 export const MASTER_IPV6: string;
 export const API_PORT: number;

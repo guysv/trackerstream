@@ -63,7 +63,11 @@ cfg Addresses.Gateway "/ip4/127.0.0.1/tcp/8081"
 cfg --json Addresses.Swarm "[\"/ip4/0.0.0.0/tcp/$SWARM_PORT\",\"/ip6/::/tcp/$SWARM_PORT\",\"/ip4/0.0.0.0/udp/$SWARM_PORT/quic-v1\",\"/ip6/::/udp/$SWARM_PORT/quic-v1\"]"
 cfg --json Addresses.Announce "[\"/ip4/$PUBLIC_IP/tcp/$SWARM_PORT\",\"/ip6/$PUBLIC_IP6/tcp/$SWARM_PORT\",\"/ip4/$PUBLIC_IP/udp/$SWARM_PORT/quic-v1\",\"/ip6/$PUBLIC_IP6/udp/$SWARM_PORT/quic-v1\"]"
 cfg Routing.Type dht                                  # full DHT server (bootstrap peer)
-cfg Provide.Strategy all                              # always-on provider for every archive CID
+# Provide only pinned ROOTS to the DHT, not every leaf block (MVP-FOLLOWUP A2):
+# a per-block DHT provide throttled bulk ingest to ~1.3 modules/s. Clients always
+# bootstrap to this always-on master and Bitswap-fetch every block directly from
+# it, so only roots need DHT provider records (for warm-cache peer discovery).
+cfg Provide.Strategy roots                            # was: all (per-block provide = ingest bottleneck)
 cfg Provide.DHT.Interval 22h                          # (kubo 0.42 renamed Reprovider.* -> Provide.*)
 cfg --json Swarm.RelayService.Enabled true            # circuit-relay v2 (NAT fallback for peers)
 cfg --json Swarm.AddrFilters '[]'

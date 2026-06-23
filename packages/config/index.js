@@ -1,35 +1,55 @@
-// trackerstream — server-address config (MVP).
+// trackerstream — server-address config.
 //
-// SINGLE SOURCE OF TRUTH for the master node's literal addresses. There is no
-// domain/DNS yet, so the desktop client ships these baked in (MVP shortcut,
-// MVP.md "No domain yet"). Keep the indirection clean: every call site reads
-// from here, never a scattered literal, so a hostname / DigitalOcean Reserved
-// IP can replace these later without touching call sites.
+// SINGLE SOURCE OF TRUTH for the master node's addresses. The desktop client
+// ships these baked in; every call site reads from here, never a scattered
+// literal, so the hostname / a DigitalOcean Reserved IP can replace the
+// underlying machine without touching call sites.
 //
-// The Tauri Rust backend mirrors these values in apps/desktop/src-tauri (Rust
-// can't import JS); when these change, update that mirror too. This file stays
-// the canonical reference.
+// Addressing is now DNS-based (MVP-FOLLOWUP A1 + D1): `trackerstream.xyz`
+// resolves (A/AAAA) to the master droplet, so both planes survive an IP change
+// once DNS is updated (point the domain at a Reserved IP and a droplet rebuild
+// needs nothing here). The literal IPs below are kept only as reference/fallback.
+//
+// The Tauri Rust backend does NOT mirror these: the Svelte frontend passes the
+// bootstrap multiaddr to Rust via the `connect_peer` command, so this file is
+// the only place addresses live.
 
-// The fra1 droplet (single master node).
+// Canonical hostname for the master node (A + AAAA -> the droplet / Reserved IP).
+export const MASTER_HOST = "trackerstream.xyz";
+
+// Literal addresses of the fra1 droplet (reference/fallback only — prefer the
+// DNS name above so a rebuild/Reserved-IP swap doesn't require a client rebuild).
 export const MASTER_IPV4 = "165.227.155.138";
 export const MASTER_IPV6 = "2a03:b0c0:3:f0:0:2:959c:b000";
 
-// HTTP control-plane API (catalog/search/accounts/playlists/social).
+// HTTP control-plane API (catalog/search/accounts/playlists/social). It is
+// fronted by Caddy with a Let's Encrypt cert on 443 (deploy/setup-tls.sh) and is
+// NOT exposed directly — the client talks HTTPS to the hostname (no port), Caddy
+// reverse-proxies to the API on 127.0.0.1:API_PORT. HTTPS is required: the
+// packaged app runs at a secure `tauri://` origin and macOS App Transport
+// Security blocks a cleartext http fetch (the old "catalog offline" symptom).
+//
+// API_PORT is the API's INTERNAL bind port (serve.ts default + Caddy's
+// reverse_proxy target), not the public port. The public URL is plain HTTPS.
 export const API_PORT = 8080;
-export const API_BASE_URL = `http://${MASTER_IPV4}:${API_PORT}`;
+export const API_BASE_URL = `https://${MASTER_HOST}`;
 
 // libp2p bootstrap / DHT. The master is a Kademlia bootstrap peer and always-on
-// provider for every archive CID. PeerID is filled in once the master kubo node
-// is initialized (Phase 1/2) — placeholder until then.
+// provider for every archive CID. DNS-based (/dns4 + /dns6) so the data plane is
+// durable across an IP change. tcp listed first (most reliable initial dial),
+// then QUIC; v4 then v6.
 export const LIBP2P_SWARM_PORT = 4001;
 export const MASTER_PEER_ID = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL"; // fra1 master
 export const BOOTSTRAP_MULTIADDRS = MASTER_PEER_ID
   ? [
-      `/ip4/${MASTER_IPV4}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
-      `/ip6/${MASTER_IPV6}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
+      `/dns4/${MASTER_HOST}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
+      `/dns6/${MASTER_HOST}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
+      `/dns4/${MASTER_HOST}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
+      `/dns6/${MASTER_HOST}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
     ]
   : [];
 
-// STUN endpoint for NAT traversal (circuit-relay fallback for symmetric NATs).
+// STUN/TURN endpoint for NAT traversal (coturn; circuit-relay v2 + DCUtR are the
+// primary path, this is the symmetric-NAT fallback). Hostname-based for durability.
 export const STUN_PORT = 3478;
-export const STUN_ENDPOINT = `${MASTER_IPV4}:${STUN_PORT}`;
+export const STUN_ENDPOINT = `${MASTER_HOST}:${STUN_PORT}`;
