@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use cid::Cid;
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use rust_ipfs::builder::IpfsBuilder;
-use rust_ipfs::{Ipfs, Keypair, Multiaddr};
+use rust_ipfs::{Ipfs, Keypair, Multiaddr, PeerId};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,6 +19,17 @@ use tokio::sync::mpsc;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const FETCH_CONCURRENCY: usize = 32;
+
+// The fra1 master (mirror of packages/config MASTER_PEER_ID). Every block fetch
+// names it as the Bitswap provider, so we ask the always-on master directly
+// instead of doing DHT provider discovery across the public swarm — the master
+// holds the whole archive and we bootstrap-connect to it, so this is both faster
+// and reliable. (Client-to-client discovery via the DHT is a deferred follow-up.)
+const MASTER_PEER_ID: &str = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL";
+
+fn master_provider() -> Option<PeerId> {
+    MASTER_PEER_ID.parse().ok()
+}
 
 /// The growing partial module buffer for a progressive (streaming) fetch.
 #[derive(Default)]
@@ -143,8 +154,15 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
     let peer_id = keypair.public().to_peer_id().to_string();
     // The builder is generic over a custom NetworkBehaviour; we don't need one,
     // so pin it to libp2p's no-op dummy behaviour (ToSwarm = Infallible).
+    // A LIGHTWEIGHT client node — deliberately NOT a DHT server. with_default()
+    // would enable Kademlia, making the node crawl + hold connections to hundreds
+    // of public peers (huge churn, and it starves the master connection). We only
+    // need to talk to the master, so enable just identify (for relay/autonat/dcutr),
+    // bitswap (block transfer), and ping (keep-alive) — no kademlia, no pubsub.
     let mut builder = IpfsBuilder::with_keypair(&keypair)?
-        .with_default()
+        .with_identify(Default::default())
+        .with_bitswap()
+        .with_ping(Default::default())
         .enable_tcp()
         .enable_quic()
         .add_listening_addr("/ip4/0.0.0.0/tcp/0".parse()?)
@@ -163,17 +181,24 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
 /// Dial a peer by multiaddr (must include `/p2p/<peer-id>`).
 pub async fn connect(ipfs: &Ipfs, addr: &str) -> Result<()> {
     let ma: Multiaddr = addr.parse()?;
-    ipfs.connect(ma).await?;
+    let r = ipfs.connect(ma).await;
+    match &r {
+        Ok(_) => eprintln!("[connect] OK {addr}"),
+        Err(e) => eprintln!("[connect] FAIL {addr}: {e}"),
+    }
+    r?;
     Ok(())
 }
 
 /// Fetch one block (Bitswap when not local); `Block::new` verifies cid == hash.
 async fn fetch_bytes(ipfs: &Ipfs, cid: Cid) -> Result<Vec<u8>> {
-    let block = ipfs
-        .get_block(cid)
-        .set_local(false)
-        .timeout(FETCH_TIMEOUT)
-        .await?;
+    let mut req = ipfs.get_block(cid).set_local(false).timeout(FETCH_TIMEOUT);
+    // Ask the master directly (Bitswap dials it) rather than DHT-discovering
+    // providers — skips the flaky public-swarm crawl.
+    if let Some(p) = master_provider() {
+        req = req.provider(p);
+    }
+    let block = req.await?;
     Ok(block.data().to_vec())
 }
 
@@ -280,8 +305,15 @@ pub async fn stream_reassemble(
     buf: Arc<Mutex<StreamBuffer>>,
     progress: mpsc::UnboundedSender<Progress>,
 ) -> Result<()> {
+    eprintln!("[stream] {root}: fetching manifest…");
     let manifest: Manifest = serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, root).await?)?;
     let total = manifest.original_length as usize;
+    eprintln!(
+        "[stream] {root}: manifest ok — {} samples, {} skeleton chunks, {} bytes",
+        manifest.samples.len(),
+        manifest.skeleton_chunks.len(),
+        total
+    );
     {
         let mut b = buf.lock().unwrap();
         b.data = vec![0u8; total];
@@ -308,9 +340,16 @@ pub async fn stream_reassemble(
     // samples, B2) first, then a static playback-order proxy (B3), then the rest.
     // Falls back to file order when the manifest carries no tables.
     let fetch_order = stream_fetch_order(&manifest);
+    eprintln!("[stream] {root}: skeleton done, fetching {} samples", fetch_order.len());
     let mut done = 0usize;
-    for &si in &fetch_order {
+    for (n, &si) in fetch_order.iter().enumerate() {
         let s = &manifest.samples[si];
+        eprintln!(
+            "[stream] {root}: sample {}/{} (idx {si}, pcmRoot {})…",
+            n + 1,
+            fetch_order.len(),
+            s.pcm_root
+        );
         let pcm_root: PcmRoot =
             serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, s.pcm_root).await?)?;
         let chunks = fetch_many(ipfs, &pcm_root.chunks).await?;
