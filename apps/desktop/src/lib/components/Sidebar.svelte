@@ -56,6 +56,7 @@
     background: var(--panel);
     border-right: 1px solid var(--border);
     padding: 0.8rem 0.6rem;
+    min-height: 0;
     overflow-y: auto;
   }
   .brand {
