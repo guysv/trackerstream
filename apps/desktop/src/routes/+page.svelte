@@ -18,6 +18,7 @@
     type PlaylistSummary,
   } from "$lib/catalog";
   import { playList, playNext, playPrev, player, nowPlaying, queue } from "$lib/player.svelte";
+  import { initDeepLinks } from "$lib/deeplink";
 
   let playlists = $state<PlaylistSummary[]>([]);
   let rightView = $state<"detail" | "queue" | "social">("detail");
@@ -93,6 +94,8 @@
       .then((f) => ((formats = f.formats), (total = f.total)))
       .catch(() => (apiError = true));
     void refreshPlaylists();
+    // E2: trackerstream://share/<code> links open straight onto the shared module.
+    void initDeepLinks({ onPlaylist: (id) => void openPlaylist(id) });
     window.addEventListener("keydown", globalKeys);
     return () => window.removeEventListener("keydown", globalKeys);
   });
