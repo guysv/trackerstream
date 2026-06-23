@@ -1,0 +1,21 @@
+{
+  "name": "@trackerstream/wasm",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Custom Emscripten build of libopenmpt (MO3 + compressed samples) for trackerstream playback",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./libopenmpt.js": {
+      "types": "./dist/libopenmpt.d.ts",
+      "default": "./dist/libopenmpt.js"
+    }
+  },
+  "scripts": {
+    "build": "bash build.sh",
+    "test": "node test/smoke.mjs && node test/reassembly.mjs",
+    "clean": "rm -rf build dist"
+  }
+}
