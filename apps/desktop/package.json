@@ -1,0 +1,36 @@
+{
+  "name": "@trackerstream/desktop",
+  "version": "0.1.0",
+  "description": "trackerstream desktop client (Tauri + Svelte)",
+  "type": "module",
+  "scripts": {
+    "build:worklet": "node scripts/build-worklet.mjs",
+    "predev": "node scripts/build-worklet.mjs",
+    "dev": "vite dev",
+    "prebuild": "node scripts/build-worklet.mjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "test": "node scripts/build-worklet.mjs && node test/worklet-harness.mjs",
+    "tauri": "tauri"
+  },
+  "license": "AGPL-3.0-or-later",
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "@trackerstream/config": "workspace:*",
+    "@trackerstream/wasm": "workspace:*"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.6",
+    "@sveltejs/kit": "^2.9.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.0.0",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3",
+    "@tauri-apps/cli": "^2",
+    "esbuild": "^0.24.0"
+  }
+}
