@@ -104,6 +104,21 @@ async fn start_stream(
     Ok(())
 }
 
+/// Cold seek (B1): resolve a module to a partial buffer that is playable at
+/// `order` (skeleton + only that seek target's resident samples), far smaller
+/// than the whole DAG. The frontend loads these bytes and calls set_position;
+/// normal streaming then fills the remainder. Falls back to a full fetch when
+/// the module has no seek table.
+#[tauri::command]
+async fn seek_module(root: String, order: u32, state: State<'_, IpfsState>) -> Result<Response, String> {
+    let cid: Cid = root.parse().map_err(|e| format!("bad CID {root}: {e}"))?;
+    let ipfs = state.ipfs.clone();
+    let bytes = ipfs::seek_module(&ipfs, cid, order)
+        .await
+        .map_err(|e| format!("seek_module {root}@{order} failed: {e}"))?;
+    Ok(Response::new(bytes))
+}
+
 /// Current bytes of an in-flight (or finished) streaming fetch.
 #[tauri::command]
 async fn get_stream_buffer(root: String, streams: State<'_, Streams>) -> Result<Response, String> {
@@ -137,6 +152,7 @@ pub fn run() {
             connect_peer,
             fetch_module,
             start_stream,
+            seek_module,
             get_stream_buffer
         ])
         .run(tauri::generate_context!())
