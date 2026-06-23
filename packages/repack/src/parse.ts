@@ -5,7 +5,7 @@
 // payload (not the format's sample blob) is what dedupes across modules: loop
 // points / C5Speed / name / flags vary per module even when the PCM is identical.
 
-export type Format = "mod" | "it" | "s3m" | "xm";
+export type Format = "mod" | "it" | "s3m" | "xm" | "mptm" | "mo3";
 
 /** A contiguous run of sample PCM bytes within the module file. */
 export interface SampleRegion {
@@ -59,8 +59,13 @@ function extractMOD(b: Uint8Array): SampleRegion[] | null {
   return out;
 }
 
-function extractIT(b: Uint8Array): SampleRegion[] | null {
-  if (b.length < 0xc0 || tag4(b, 0) !== "IMPM") return null;
+// Core IT sample-region locator. Parses the IT on-disk layout (header @ 0x20:
+// ordNum/insNum/smpNum, then the sample-header pointer table) WITHOUT requiring
+// the "IMPM" magic at offset 0 — MPTM reuses this exact layout but may carry a
+// different 4-byte signature ("tpm.", see extractMPTM), so the magic check lives
+// in the per-format wrappers/detectFormat, not here.
+function extractITLike(b: Uint8Array): SampleRegion[] | null {
+  if (b.length < 0xc0) return null;
   const ordNum = u16le(b, 0x20),
     insNum = u16le(b, 0x22),
     smpNum = u16le(b, 0x24);
@@ -73,11 +78,43 @@ function extractIT(b: Uint8Array): SampleRegion[] | null {
       len = u32le(b, so + 0x30),
       ptr = u32le(b, so + 0x48);
     if (!(flg & 1) || !len || !ptr) continue;
+    // Skip OpenMPT/IT compressed samples (flag 0x08): the on-disk bytes are not
+    // raw PCM, so carving a fixed len*bpf region would be wrong. They fall into
+    // the skeleton instead — still byte-exact, just not sample-deduped.
+    if (flg & 8) continue;
     const bpf = ((flg & 2) ? 2 : 1) * ((flg & 4) ? 2 : 1);
     const bytes = Math.min(len * bpf, b.length - ptr);
     if (bytes > 0) out.push({ offset: ptr, length: bytes });
   }
   return out;
+}
+
+function extractIT(b: Uint8Array): SampleRegion[] | null {
+  if (tag4(b, 0) !== "IMPM") return null;
+  return extractITLike(b);
+}
+
+// MPTM (OpenMPT native) is the IT format with extra OpenMPT chunks appended at
+// the end (custom tunings etc.); the IT sample/instrument/pattern layout from
+// offset 0 is intact, so the IT locator applies directly. Older MPTM files
+// replace the "IMPM" magic with "tpm." (these are the ones detectFormat used to
+// miss -> flat DAG); newer ones keep "IMPM" with cwtv in 0x0889..0x0FFF. Either
+// way the bytes parse as IT. (wiki.openmpt.org Development:_Formats/MPTM)
+function extractMPTM(b: Uint8Array): SampleRegion[] | null {
+  if (b.length < 0xc0) return null;
+  const magic = tag4(b, 0);
+  if (magic !== "tpm." && magic !== "IMPM") return null;
+  return extractITLike(b);
+}
+
+// MO3 is a COMPRESSED container (un4seen): the module structure and sample data
+// are encoded (LZ + optional MP3/OGG for samples), so there are NO raw-PCM byte
+// regions to carve and cross-module sample dedup is not applicable without
+// decoding (which would break byte-exact reassembly). Returning null routes MO3
+// to the whole-file CDC "flat DAG" — fetchable + byte-exact + playable, just
+// without sample separation. This is correct by design, not a parser gap.
+function extractMO3(_b: Uint8Array): SampleRegion[] | null {
+  return null;
 }
 
 function extractS3M(b: Uint8Array): SampleRegion[] | null {
@@ -151,10 +188,20 @@ const EXTRACTORS: Record<Format, (b: Uint8Array) => SampleRegion[] | null> = {
   it: extractIT,
   s3m: extractS3M,
   xm: extractXM,
+  mptm: extractMPTM,
+  mo3: extractMO3,
 };
 
 export function detectFormat(b: Uint8Array): Format | null {
-  if (b.length >= 4 && tag4(b, 0) === "IMPM") return "it";
+  // MO3 magic is 3 bytes "MO3" + a version byte (compressed container -> flat).
+  if (b.length >= 4 && b[0] === 0x4d && b[1] === 0x4f && b[2] === 0x33) return "mo3";
+  if (b.length >= 4 && tag4(b, 0) === "tpm.") return "mptm"; // older MPTM magic
+  if (b.length >= 0x2c && tag4(b, 0) === "IMPM") {
+    // MPTM (newer) keeps IMPM but tags cwtv (0x28) in 0x0889..0x0FFF. Same
+    // sample layout as IT, so the label is cosmetic — both route to extractITLike.
+    const cwtv = u16le(b, 0x28);
+    return cwtv >= 0x0889 && cwtv <= 0x0fff ? "mptm" : "it";
+  }
   if (b.length >= 0x30 && tag4(b, 0x2c) === "SCRM") return "s3m";
   if (b.length >= 17 && tag4(b, 0) === "Exte") return "xm";
   if (b.length >= 1084 && modChannels(tag4(b, 1080))) return "mod";
