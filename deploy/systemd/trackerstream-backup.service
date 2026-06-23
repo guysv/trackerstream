@@ -1,0 +1,18 @@
+[Unit]
+Description=trackerstream control-plane backup (catalog + pinset + DO volume snapshot)
+After=trackerstream-api.service trackerstream-ipfs.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=trackerstream
+Group=trackerstream
+EnvironmentFile=-/etc/trackerstream/server.env
+WorkingDirectory=/opt/trackerstream
+ExecStart=/usr/bin/env bash deploy/backup.sh
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

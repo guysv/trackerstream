@@ -74,7 +74,7 @@ cfg --json Swarm.AddrFilters '[]'
 # Drop the deprecated Reprovider block if an older init created one (0.42 is fatal on it).
 F="$IPFS_PATH/config"; jq 'del(.Reprovider)' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 chown -R trackerstream:trackerstream "$DATA/ipfs"
-echo "kubo configured (DHT server, provider=all, relay v2)"
+echo "kubo configured (DHT server, provider=roots, relay v2)"
 
 echo "=== [5/8] coturn STUN/TURN ==="
 secret_file=/etc/trackerstream/turn.secret
@@ -91,10 +91,17 @@ echo "=== [6/8] server config + systemd units ==="
 [ -f /etc/trackerstream/server.env ] || cp "$PREFIX/deploy/server.env.sample" /etc/trackerstream/server.env
 mkdir -p "$DATA/catalog"; chown trackerstream:trackerstream "$DATA/catalog"
 install -m644 "$PREFIX"/deploy/systemd/*.service "$PREFIX"/deploy/systemd/*.timer /etc/systemd/system/
+# journald retention drop-in (explicit size/time bounds for all our services).
+mkdir -p /etc/systemd/journald.conf.d
+install -m644 "$PREFIX/deploy/journald-trackerstream.conf" /etc/systemd/journald.conf.d/trackerstream.conf
+systemctl restart systemd-journald
 systemctl daemon-reload
 systemctl enable --now trackerstream-ipfs.service
 systemctl enable --now trackerstream-api.service
 systemctl enable --now trackerstream-ingest.timer
+# Scheduled ops (D3): daily backup + ~1-min /healthz metrics export.
+systemctl enable --now trackerstream-backup.timer
+systemctl enable --now trackerstream-metrics.timer
 
 echo "=== [7/8] firewall (ufw) ==="
 ufw allow OpenSSH >/dev/null 2>&1 || true
