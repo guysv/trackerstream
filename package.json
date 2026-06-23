@@ -11,6 +11,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
+    "test:ci": "pnpm --filter @trackerstream/repack test",
     "desktop:dev": "pnpm --filter @trackerstream/desktop dev",
     "wasm:build": "pnpm --filter @trackerstream/wasm build"
   },
