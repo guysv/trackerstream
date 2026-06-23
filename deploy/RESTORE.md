@@ -42,3 +42,71 @@ curl localhost:8080/healthz      # API up, module count matches
 
 A successful drill = services up, `verify-pinset.sh` reports 0 missing, and the
 search/fetch/play path works against the restored instance.
+
+## Scheduled ops (backups, metrics, log retention) — D3
+
+`deploy/install.sh` installs and enables these automatically. To enable/refresh
+them by hand on an existing droplet:
+
+```
+# (re)install units + journald drop-in from the artifact root (/opt/trackerstream)
+install -m644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
+mkdir -p /etc/systemd/journald.conf.d
+install -m644 deploy/journald-trackerstream.conf /etc/systemd/journald.conf.d/trackerstream.conf
+systemctl restart systemd-journald
+systemctl daemon-reload
+
+# daily catalog+pinset backup (+ DO volume snapshot if doctl is authed)
+systemctl enable --now trackerstream-backup.timer
+# ~1-min /healthz -> Prometheus textfile export
+systemctl enable --now trackerstream-metrics.timer
+
+# check
+systemctl list-timers 'trackerstream-*'
+systemctl start trackerstream-backup.service   # run a backup now
+journalctl -u trackerstream-backup.service -n 50
+```
+
+### Backups (`trackerstream-backup.timer` → `deploy/backup.sh`)
+Daily, `Persistent=true` (catches up after downtime). Writes
+`/srv/trackerstream/backups/<ts>/` (catalog.db + pinset.txt + server.env),
+rotates to the last `KEEP_LOCAL` (default 14). If `doctl` is installed **and**
+authenticated it also triggers a DigitalOcean Block Storage volume snapshot and
+prunes to the last `KEEP_SNAPSHOTS` (default 7) `trackerstream-*` snapshots.
+Tunables via env / `/etc/trackerstream/server.env`: `KEEP_LOCAL`,
+`KEEP_SNAPSHOTS`, `DO_VOLUME_ID`, `DO_VOLUME_NAME` (default `trackerstream`).
+
+**Operator action — enable volume snapshots:** install + auth doctl on the droplet:
+```
+# install doctl (see DO docs), then:
+doctl auth init        # paste a DO API token with read/write on volumes+snapshots
+doctl account get      # confirm auth
+```
+Without doctl the script still succeeds — it just backs up catalog+pinset locally
+and prints a hint. Restore from a volume snapshot via the DO control panel /
+`doctl compute volume create --snapshot <id>` and reattach (see "Restore from
+backup" 2a above).
+
+### Metrics (`trackerstream-metrics.timer` → `deploy/metrics-export.sh`)
+Every ~1 min, curls `http://127.0.0.1:8080/healthz` and atomically writes
+`/var/lib/node_exporter/textfile_collector/trackerstream.prom` with gauges:
+`trackerstream_up`, `trackerstream_modules`, `trackerstream_playlists`,
+`trackerstream_users`, `trackerstream_uptime_seconds` (`_up 0` when the API is
+down, so outages are observable, not just absent).
+
+**Operator action — surface the metrics** (optional):
+```
+apt-get install -y prometheus-node-exporter
+# ensure node_exporter runs with the textfile collector pointed at the dir:
+#   ARGS="--collector.textfile.directory=/var/lib/node_exporter/textfile_collector"
+# in /etc/default/prometheus-node-exporter, then restart it.
+```
+Or skip Prometheus and point an external uptime check straight at
+`http(s)://<host>/healthz` (HTTP 200 = up). Tunables: `HEALTHZ_URL`,
+`TEXTFILE_DIR`, `TEXTFILE`.
+
+### Log retention (`deploy/journald-trackerstream.conf`)
+All services (Caddy, API, kubo, coturn) log to journald. The drop-in
+(`/etc/systemd/journald.conf.d/trackerstream.conf`) bounds the journal:
+`SystemMaxUse=1G`, `MaxRetentionSec=30day`, persistent storage. Edit + reapply
+with `systemctl restart systemd-journald` to change the window.

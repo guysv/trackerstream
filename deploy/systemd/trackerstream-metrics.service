@@ -1,0 +1,16 @@
+[Unit]
+Description=trackerstream /healthz -> Prometheus textfile metrics
+After=trackerstream-api.service
+Wants=trackerstream-api.service
+
+[Service]
+Type=oneshot
+# Runs as root so it can write under /var/lib/node_exporter/textfile_collector
+# (owned by the node_exporter package). The script only reads localhost /healthz
+# and writes one .prom file.
+EnvironmentFile=-/etc/trackerstream/server.env
+WorkingDirectory=/opt/trackerstream
+ExecStart=/usr/bin/env bash deploy/metrics-export.sh
+
+[Install]
+WantedBy=multi-user.target

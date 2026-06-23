@@ -1,0 +1,11 @@
+[Unit]
+Description=Export trackerstream /healthz metrics every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+# Don't backfill missed runs — metrics are a point-in-time snapshot, not a log.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
