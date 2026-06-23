@@ -189,6 +189,7 @@
     display: grid;
     grid-template-rows: auto 1fr auto;
     height: 100vh;
+    overflow: hidden;
   }
   header {
     display: flex;
@@ -225,15 +226,19 @@
     display: grid;
     grid-template-columns: 180px 1fr 320px;
     min-height: 0;
+    overflow: hidden;
   }
   .results {
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0;
+    overflow: hidden;
     border-right: 1px solid var(--border);
   }
   .detail {
     min-height: 0;
+    overflow: hidden;
     background: var(--panel-2);
   }
   .toast {

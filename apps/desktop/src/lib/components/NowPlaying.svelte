@@ -84,14 +84,18 @@
 
 <style>
   .bar {
+    position: relative;
+    z-index: 5;
     display: grid;
     grid-template-columns: auto 1fr auto 140px;
     gap: 1rem;
     align-items: center;
     height: 64px;
     padding: 0 1rem;
+    /* Opaque — must fully occlude any content above it (was showing through). */
     background: var(--panel);
     border-top: 1px solid var(--border-hi);
+    box-shadow: 0 -10px 24px rgba(0, 0, 0, 0.45);
   }
   .controls {
     display: flex;
