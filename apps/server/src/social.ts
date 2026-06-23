@@ -45,7 +45,19 @@ export class Social {
         code TEXT PRIMARY KEY, kind TEXT NOT NULL, ref_id INTEGER NOT NULL,
         root_cid TEXT, created_at INTEGER
       );
+      -- OAuth/OIDC identities linked to a local user (one row per provider login).
+      -- A user with no scrypt password (oauth-only) keeps salt/hash empty.
+      CREATE TABLE IF NOT EXISTS oauth_identities (
+        provider TEXT NOT NULL, provider_user_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL, created_at INTEGER,
+        PRIMARY KEY (provider, provider_user_id)
+      );
     `);
+    // ActivityPub handle stored as an identity *alias* on the user (webfinger-verified,
+    // not full federation — see oauth.ts). ADD COLUMN is not idempotent, so guard it.
+    const cols = this.db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "ap_handle"))
+      this.db.exec("ALTER TABLE users ADD COLUMN ap_handle TEXT");
   }
 
   // --- auth ---
@@ -74,6 +86,50 @@ export class Social {
     const token = randomBytes(24).toString("hex");
     this.db.prepare("INSERT INTO sessions (token, user_id, created_at) VALUES (?,?,?)").run(token, userId, Date.now());
     return token;
+  }
+
+  /** Mint a fresh session token for an already-existing user (used by OAuth login). */
+  mintToken(userId: number): string {
+    return this.mkSession(userId);
+  }
+
+  // --- OAuth identities ---
+
+  /**
+   * Find the local user linked to (provider, providerUserId), or create one.
+   * Linking strategy: (1) existing oauth_identity row -> that user; (2) else, if a
+   * user with this email already exists (e.g. an email/scrypt account), link the
+   * identity to it; (3) else create a fresh password-less user. Returns the user.
+   */
+  findOrCreateOAuthUser(provider: string, providerUserId: string, email: string): User {
+    const linked = this.db
+      .prepare(
+        `SELECT u.id, u.email FROM oauth_identities oi JOIN users u ON u.id = oi.user_id
+         WHERE oi.provider = ? AND oi.provider_user_id = ?`,
+      )
+      .get(provider, providerUserId) as User | undefined;
+    if (linked) return linked;
+
+    const lc = email.toLowerCase();
+    let user = this.db.prepare("SELECT id, email FROM users WHERE email = ?").get(lc) as User | undefined;
+    if (!user) {
+      // Password-less account: empty salt/hash mean login() can never succeed for it.
+      const res = this.db
+        .prepare("INSERT INTO users (email, salt, hash, created_at) VALUES (?,?,?,?)")
+        .run(lc, "", "", Date.now());
+      user = { id: res.lastInsertRowid as number, email: lc };
+    }
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO oauth_identities (provider, provider_user_id, user_id, created_at) VALUES (?,?,?,?)",
+      )
+      .run(provider, providerUserId, user.id, Date.now());
+    return user;
+  }
+
+  /** Store a webfinger-verified ActivityPub handle (e.g. @user@instance) as an alias. */
+  setApHandle(userId: number, handle: string): void {
+    this.db.prepare("UPDATE users SET ap_handle = ? WHERE id = ?").run(handle, userId);
   }
 
   userForToken(token: string | null): User | null {
