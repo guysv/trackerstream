@@ -66,17 +66,37 @@ export class KuboRpc {
   }
 }
 
-/** Put every block of a built DAG into kubo and recursively pin the root. */
+/** Run `fn` over `items` with a bounded concurrency pool (order-independent). */
+async function mapPool<T>(items: T[], concurrency: number, fn: (t: T) => Promise<void>): Promise<void> {
+  let i = 0;
+  const worker = async () => {
+    while (i < items.length) await fn(items[i++]);
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+}
+
+/**
+ * Put every block of a built DAG into kubo and recursively pin the root.
+ *
+ * Block puts run CONCURRENTLY (bounded pool) — the previous serial loop was a
+ * major ingest bottleneck (MVP-FOLLOWUP A2): a big module is hundreds of leaf
+ * blocks, each a separate kubo RPC round-trip. `pin=false` on each put then a
+ * single recursive pin of the root keeps the DAG self-verifying. (The other half
+ * of the A2 fix is ops: Provide.Strategy=roots on the master so a per-block DHT
+ * provide doesn't dominate — clients Bitswap-fetch all blocks from the always-on
+ * master they bootstrap to, so only roots need provider records.)
+ */
 export async function loadDagToKubo(
   rpc: KuboRpc,
   blocks: Block[],
   root: CID,
+  concurrency = 16,
 ): Promise<{ put: number; mismatched: string[] }> {
   const mismatched: string[] = [];
-  for (const b of blocks) {
+  await mapPool(blocks, concurrency, async (b) => {
     const got = await rpc.blockPut(b.bytes, b.cid.code);
     if (got.toString() !== b.cid.toString()) mismatched.push(`${b.cid} != ${got}`);
-  }
+  });
   await rpc.pinAdd(root, true);
   return { put: blocks.length, mismatched };
 }
