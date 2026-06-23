@@ -59,6 +59,25 @@ export function logout(): void {
   saveAuth();
 }
 
+// OAuth login: open the server's /start route (it 302s to the provider). The
+// callback returns { token, user } — in a full desktop integration that JSON is
+// surfaced back via a deep-link/loopback so completeOAuth() can persist it. Here
+// we just kick off the flow consistently with the rest of this module.
+export function startOAuth(provider: "github" | "google" | "oidc" = "github"): void {
+  window.open(`${API_BASE_URL}/auth/oauth/${provider}/start`, "_blank");
+}
+
+/** Persist a { token, user } handed back by the OAuth callback (same shape as login). */
+export function completeOAuth(r: { token: string; user: { email: string } }): void {
+  auth.token = r.token;
+  auth.email = r.user.email;
+  saveAuth();
+}
+
+// Verify + attach an ActivityPub handle (@user@instance) as an identity alias.
+export const verifyApHandle = (handle: string): Promise<{ handle: string; actor: string }> =>
+  call("/ap/verify", "POST", { handle });
+
 export const followUser = (email: string) => call("/follow", "POST", { email });
 
 export interface Presence {

@@ -5,12 +5,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Catalog } from "./catalog.ts";
 import { Social, type User } from "./social.ts";
+import { handleCallback, isProvider, resolveApHandle, startUrl } from "./oauth.ts";
 
 type Handler = (
   req: IncomingMessage,
   res: ServerResponse,
   ctx: { url: URL; body: unknown; catalog: Catalog; social: Social; user: User | null },
-) => void;
+) => void | Promise<void>;
 
 const requireAuth = (res: ServerResponse, user: User | null): user is User => {
   if (!user) {
@@ -141,11 +142,20 @@ export function createApi(catalog: Catalog, social: Social): Server {
     {
       method: "POST",
       pattern: /^\/auth\/register$/,
-      handler: (_q, res, { body }) => {
-        const b = (body ?? {}) as { email?: string; password?: string };
+      handler: async (_q, res, { body }) => {
+        const b = (body ?? {}) as { email?: string; password?: string; apHandle?: string };
         if (!b.email || !b.password) return send(res, 400, { error: "email + password required" });
+        // Optional ActivityPub handle: webfinger-verify before accepting (alias only).
+        let apHandle: string | null = null;
+        if (b.apHandle) {
+          const r = await resolveApHandle(b.apHandle);
+          if (!r) return send(res, 400, { error: "apHandle not found / unverifiable" });
+          apHandle = r.handle;
+        }
         try {
-          send(res, 201, social.register(b.email, b.password));
+          const out = social.register(b.email, b.password);
+          if (apHandle) social.setApHandle(out.user.id, apHandle);
+          send(res, 201, out);
         } catch {
           send(res, 409, { error: "email already registered" });
         }
@@ -164,6 +174,56 @@ export function createApi(catalog: Catalog, social: Social): Server {
       method: "GET",
       pattern: /^\/me$/,
       handler: (_q, res, { user }) => (requireAuth(res, user) ? send(res, 200, user) : undefined),
+    },
+
+    // --- OAuth (authorization-code) ---
+    // Pluggable providers (github, google, generic oidc). No-op (501) when the
+    // provider's env vars are unset, so the default build needs no config.
+    {
+      method: "GET",
+      pattern: /^\/auth\/oauth\/([\w-]+)\/start$/,
+      handler: (_q, res, { url }) => {
+        const provider = url.pathname.split("/")[3];
+        if (!isProvider(provider)) return send(res, 404, { error: "no such provider" });
+        const dest = startUrl(provider);
+        if (!dest) return send(res, 501, { error: "oauth not configured" });
+        // Browsers follow the 302 to the provider; API/JSON callers can read Location.
+        res.statusCode = 302;
+        res.setHeader("Location", dest);
+        res.end();
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/auth\/oauth\/([\w-]+)\/callback$/,
+      handler: async (_q, res, { url, social }) => {
+        const provider = url.pathname.split("/")[3];
+        if (!isProvider(provider)) return send(res, 404, { error: "no such provider" });
+        const code = url.searchParams.get("code");
+        const state = url.searchParams.get("state");
+        if (!code || !state) return send(res, 400, { error: "code + state required" });
+        try {
+          const r = await handleCallback(social, provider, code, state);
+          r ? send(res, 200, r) : send(res, 501, { error: "oauth not configured" });
+        } catch (e) {
+          send(res, 401, { error: String((e as Error).message ?? e) });
+        }
+      },
+    },
+
+    // --- ActivityPub handle (identity alias; webfinger-verified, not federation) ---
+    {
+      method: "POST",
+      pattern: /^\/ap\/verify$/,
+      handler: async (_q, res, { body, user }) => {
+        if (!requireAuth(res, user)) return;
+        const b = (body ?? {}) as { handle?: string };
+        if (!b.handle) return send(res, 400, { error: "handle required" });
+        const r = await resolveApHandle(b.handle);
+        if (!r) return send(res, 404, { error: "handle not found / unverifiable" });
+        social.setApHandle(user.id, r.handle);
+        send(res, 200, { ok: true, handle: r.handle, actor: r.actor });
+      },
     },
 
     // --- follow + presence ---
@@ -242,7 +302,7 @@ export function createApi(catalog: Catalog, social: Social): Server {
       const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "") || null;
       const user = social.userForToken(token);
       const body = req.method === "POST" || req.method === "PUT" ? await readBody(req) : undefined;
-      route.handler(req, res, { url, body, catalog, social, user });
+      await route.handler(req, res, { url, body, catalog, social, user });
     } catch (e) {
       send(res, 500, { error: String(e) });
     }
