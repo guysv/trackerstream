@@ -108,9 +108,24 @@ The MVP already puts module delivery on IPFS/libp2p with a Kademlia DHT (see [Ar
 
 ## Project status
 
-**Early stage.** Repository bootstrap—product spec and README only. Implementation details (API shape, Mod Archive integration) will be documented here as they land.
+**MVP implemented across all phases** (see [MVP.md](MVP.md)). The control plane is
+**deployed and live** on the fra1 droplet (master kubo node + catalog/search API +
+coturn STUN/TURN under systemd); the desktop client streams modules 100 % from CID
+blocks over libp2p. Monorepo layout:
 
-**Stack:** desktop client built on **Tauri** (small footprint; the Rust backend handles native playback glue, the block cache, and the libp2p/IPFS node). Overall shape is a **hybrid**—decentralized data plane, centralized control plane (see [Architecture](#architecture)). The playback engine (libopenmpt → WASM in an AudioWorklet) is described under [Playback architecture](#playback-architecture). Other choices (UI framework, server stack, social providers, P2P stack) are still open.
+- `packages/wasm` — custom Emscripten **libopenmpt** build (MO3 + compressed samples)
+- `packages/repack` — module ↔ **CID-DAG** repack (parsers, FastCDC, DAG build/reassemble, kubo client)
+- `packages/config` — single source of truth for the master node addresses
+- `apps/server` — ingest→DAG→pin pipeline, **SQLite + FTS5** catalog/search, playlists, accounts/social
+- `apps/desktop` — **Tauri + Svelte** client with an **embedded in-process rust-ipfs node** and an AudioWorklet engine
+- `deploy/` — provisioning, deploy artifact + `install.sh`, systemd units, backup/restore/verify ops
+
+**Stack (decided):** UI **Svelte/SvelteKit**; client P2P **embedded rust-ipfs** (no
+sidecar — revises the earlier "kubo sidecar" pick); server **Node.js + kubo over RPC**,
+**SQLite + FTS5**, tarball + `install.sh` + systemd artifact; accounts **custom email**
+(OAuth/ActivityPub deferred). Overall shape is a **hybrid** — decentralized data plane,
+centralized control plane (see [Architecture](#architecture)). The playback engine
+(libopenmpt → WASM in an AudioWorklet) is described under [Playback architecture](#playback-architecture).
 
 ## License
 
