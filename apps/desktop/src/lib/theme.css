@@ -1,0 +1,82 @@
+/* trackerstream — Impulse Tracker–inspired theme tokens. Functional-first,
+   dense, monospace, retro palette. */
+:root {
+  --bg: #0b0b11;
+  --panel: #14141d;
+  --panel-2: #1a1b26;
+  --border: #2a2b3d;
+  --border-hi: #3b4261;
+  --fg: #c8d0e8;
+  --dim: #6b7394;
+  --accent: #9ece6a; /* IT green */
+  --amber: #e0af68;
+  --blue: #7aa2f7;
+  --cyan: #7dcfff;
+  --violet: #bb9af7;
+  --hot: #f7768e;
+  --row-sel: #283457;
+  --row-hover: #1d1f2e;
+  --mono: "SF Mono", "JetBrains Mono", "DejaVu Sans Mono", Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+::selection {
+  background: var(--row-sel);
+}
+input,
+button,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: var(--fg);
+}
+input,
+select {
+  background: var(--bg);
+  border: 1px solid var(--border-hi);
+  border-radius: 4px;
+  padding: 0.35rem 0.55rem;
+}
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+button {
+  background: var(--panel-2);
+  border: 1px solid var(--border-hi);
+  border-radius: 4px;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+button:hover:not(:disabled) {
+  border-color: var(--blue);
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-hi);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
