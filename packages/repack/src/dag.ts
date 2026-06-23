@@ -17,6 +17,7 @@ import { sha256 } from "multiformats/hashes/sha2";
 import * as dagCbor from "@ipld/dag-cbor";
 import { cdcChunks, DEFAULT_CDC, type CdcConfig } from "./cdc.ts";
 import { sampleRegions, type Format } from "./parse.ts";
+import { computeSeekTables } from "./seek.ts";
 
 const RAW_CODE = 0x55;
 const DAG_CBOR_CODE = 0x71;
@@ -32,6 +33,15 @@ export interface SampleEntry {
   pcmRoot: CID;
 }
 
+/** Seek-support tables (MVP-FOLLOWUP B1/B2/B3); sample refs are indices into
+ * `samples[]`. Optional — absent for flat DAGs and non-IT-family modules. */
+export interface SeekTable {
+  /** Cumulative seconds at the start of each order entry (the T<->order map). */
+  orderSeconds: { order: number; seconds: number }[];
+  /** Per-order resident sample sets for cold seeks (indices into samples[]). */
+  checkpoints: { order: number; samples: number[] }[];
+}
+
 export interface Manifest {
   v: number;
   format: string; // parser Format, or a bare extension for flat DAGs
@@ -39,6 +49,10 @@ export interface Manifest {
   cdc: CdcConfig;
   skeletonChunks: CID[];
   samples: SampleEntry[];
+  /** Sample indices the first played pattern triggers — fetch first (B2). */
+  segment0?: number[];
+  /** Seek/timing tables for cold-seek resident-set fetch (B1/B3). */
+  seek?: SeekTable;
 }
 
 export interface BuiltDag {
@@ -159,6 +173,36 @@ async function buildFromRegions(
     skeletonChunks,
     samples,
   };
+
+  // Bake seek-support tables (B1/B2/B3) for IT-family modules. The tables key
+  // samples by PCM byte offset; map those to indices into samples[] (an
+  // offset-sorted subset — compressed/absent samples don't appear and are
+  // dropped here). Purely additive: a consumer that ignores these still streams
+  // bit-exactly, so this never affects reassembly.
+  if (regions.length) {
+    const tables = computeSeekTables(data, format as Format);
+    if (tables) {
+      const idxByOffset = new Map<number, number>();
+      samples.forEach((s, i) => idxByOffset.set(s.offset, i));
+      const toIdx = (offs: number[]): number[] => {
+        const out: number[] = [];
+        for (const o of offs) {
+          const i = idxByOffset.get(o);
+          if (i !== undefined) out.push(i);
+        }
+        return out;
+      };
+      const segment0 = toIdx(tables.segment0Offsets);
+      if (segment0.length) manifest.segment0 = segment0;
+      const checkpoints = tables.checkpoints
+        .map((c) => ({ order: c.order, samples: toIdx(c.residentOffsets) }))
+        .filter((c) => c.samples.length);
+      if (checkpoints.length) {
+        manifest.seek = { orderSeconds: tables.orderSeconds, checkpoints };
+      }
+    }
+  }
+
   const manifestBlock = await cborBlock(manifest);
   add(manifestBlock);
 
