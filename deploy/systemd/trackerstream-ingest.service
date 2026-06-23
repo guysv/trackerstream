@@ -1,0 +1,19 @@
+[Unit]
+Description=trackerstream corpus ingest (build CID-DAGs, pin, catalog) — re-runnable
+After=trackerstream-ipfs.service
+Requires=trackerstream-ipfs.service
+
+[Service]
+Type=oneshot
+User=trackerstream
+Group=trackerstream
+EnvironmentFile=/etc/trackerstream/server.env
+WorkingDirectory=/opt/trackerstream/apps/server
+# Incremental: skips modules already in the catalog, so re-runs are cheap.
+ExecStart=/usr/bin/env node --experimental-sqlite bin/ingest.ts
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

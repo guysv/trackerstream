@@ -1,0 +1,22 @@
+# trackerstream HTTP API reverse proxy (TLS termination).
+#
+# The MVP ships WITHOUT a domain (clients hard-code the IP), so TLS is deferred
+# per MVP.md §"No domain yet". This config is domain-READY: once a hostname
+# points at the droplet, set TS_DOMAIN and Caddy obtains + renews a Let's Encrypt
+# cert automatically, fronting the API.
+#
+#   apt install caddy
+#   TS_DOMAIN=trackerstream.example  caddy run --config deploy/Caddyfile
+#
+# Until a domain exists, the API is reached directly on :8080 (ufw-allowed).
+
+{$TS_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080 {
+		health_uri /healthz
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+	}
+}
