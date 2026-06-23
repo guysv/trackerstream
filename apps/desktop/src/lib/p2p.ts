@@ -33,3 +33,15 @@ export function startStream(root: string, onProgress: (p: StreamProgress) => voi
 /** Current bytes of an in-flight/finished streaming fetch. */
 export const getStreamBuffer = (root: string): Promise<ArrayBuffer> =>
   invoke<ArrayBuffer>("get_stream_buffer", { root });
+
+/**
+ * Cold seek (B1): resolve a module to a partial buffer playable at `order` —
+ * skeleton + only that seek target's resident sample set (far smaller than the
+ * whole DAG, lab-measured ~3x faster time-to-playback). Load the returned bytes
+ * and call set_position(order); normal streaming then fills the rest. Falls back
+ * to a full fetch for modules without a seek table. UX wiring (mapping a seek-bar
+ * position in seconds to an order via the manifest timing map, then a worklet
+ * set_position) is the remaining integration step.
+ */
+export const seekModule = (root: string, order: number): Promise<ArrayBuffer> =>
+  invoke<ArrayBuffer>("seek_module", { root, order });

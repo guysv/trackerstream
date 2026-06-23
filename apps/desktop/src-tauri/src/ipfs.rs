@@ -68,6 +68,26 @@ struct Manifest {
     #[serde(rename = "skeletonChunks")]
     skeleton_chunks: Vec<Cid>,
     samples: Vec<SampleEntry>,
+    // Seek-support tables (MVP-FOLLOWUP B1/B2/B3); absent on older/flat manifests.
+    #[serde(default)]
+    segment0: Vec<u64>,
+    #[serde(default)]
+    seek: Option<SeekTable>,
+}
+
+// Per-order resident sample set (indices into samples[]) for a cold seek. We
+// ignore the manifest's `orderSeconds` here (the seek bar's time<->order map is
+// a UI concern); Rust seeks by order index, so only the checkpoints are needed.
+#[derive(Debug, Deserialize)]
+struct Checkpoint {
+    order: u32,
+    samples: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SeekTable {
+    #[serde(default)]
+    checkpoints: Vec<Checkpoint>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +95,37 @@ struct PcmRoot {
     chunks: Vec<Cid>,
     #[allow(dead_code)]
     length: u64,
+}
+
+/// Fetch order for a streaming reassembly: segment0 (the first pattern's audible
+/// samples, B2) first, then by checkpoint appearance (earliest order a sample is
+/// resident — a static playback-order proxy, B3), then any remaining samples in
+/// file order. Returns indices into `manifest.samples`. Falls back to plain file
+/// order when there are no tables (older/flat manifests).
+fn stream_fetch_order(manifest: &Manifest) -> Vec<usize> {
+    let n = manifest.samples.len();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let push = |order: &mut Vec<usize>, seen: &mut Vec<bool>, i: usize| {
+        if i < seen.len() && !seen[i] {
+            seen[i] = true;
+            order.push(i);
+        }
+    };
+    for &i in &manifest.segment0 {
+        push(&mut order, &mut seen, i as usize);
+    }
+    if let Some(seek) = &manifest.seek {
+        for cp in &seek.checkpoints {
+            for &i in &cp.samples {
+                push(&mut order, &mut seen, i as usize);
+            }
+        }
+    }
+    for i in 0..n {
+        push(&mut order, &mut seen, i);
+    }
+    order
 }
 
 /// The embedded node plus its identity.
@@ -253,9 +304,13 @@ pub async fn stream_reassemble(
     };
     let _ = progress.send(Progress { version: v, pct: 5.0, playable: true, complete: false });
 
-    // Sample PCM, in file order (first patterns generally hit low samples first).
+    // Sample PCM in seek-table fetch order: segment0 (first pattern's audible
+    // samples, B2) first, then a static playback-order proxy (B3), then the rest.
+    // Falls back to file order when the manifest carries no tables.
+    let fetch_order = stream_fetch_order(&manifest);
     let mut done = 0usize;
-    for s in &manifest.samples {
+    for &si in &fetch_order {
+        let s = &manifest.samples[si];
         let pcm_root: PcmRoot =
             serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, s.pcm_root).await?)?;
         let chunks = fetch_many(ipfs, &pcm_root.chunks).await?;
@@ -287,4 +342,55 @@ pub async fn stream_reassemble(
     };
     let _ = progress.send(Progress { version: v, pct: 100.0, playable: true, complete: true });
     Ok(())
+}
+
+/// Cold seek (B1): resolve a module to a partial buffer playable at `target_order`,
+/// fetching ONLY the resident sample set for the nearest checkpoint <= target_order
+/// (plus the skeleton) instead of streaming the whole DAG — lab-measured ~3x faster
+/// time-to-playback (lab/SEEK.md). The result is a valid module: the skeleton makes
+/// it parse, the resident samples make the seek target audible, everything else is
+/// silent until normal streaming fills it. The frontend loads this and calls
+/// set_position(order). Falls back to a full reassemble when the module carries no
+/// seek table (older/flat manifests).
+pub async fn seek_module(ipfs: &Ipfs, root: Cid, target_order: u32) -> Result<Vec<u8>> {
+    let manifest: Manifest = serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, root).await?)?;
+    let checkpoints = match &manifest.seek {
+        Some(s) if !s.checkpoints.is_empty() => &s.checkpoints,
+        _ => return reassemble(ipfs, root).await, // no table -> full fetch
+    };
+    // Nearest checkpoint at or before the target (else the earliest checkpoint).
+    let cp = checkpoints
+        .iter()
+        .filter(|c| c.order <= target_order)
+        .max_by_key(|c| c.order)
+        .unwrap_or(&checkpoints[0]);
+
+    // Skeleton -> a valid, parseable module.
+    let skel_map = fetch_many(ipfs, &manifest.skeleton_chunks).await?;
+    let mut skel: Vec<u8> = Vec::new();
+    for c in &manifest.skeleton_chunks {
+        skel.extend_from_slice(skel_map.get(c).ok_or_else(|| anyhow!("missing skel {c}"))?);
+    }
+    let total = manifest.original_length as usize;
+    let mut out = vec![0u8; total];
+    write_skeleton(&mut out, &manifest, &skel);
+
+    // Only the samples resident at the seek target.
+    for &si in &cp.samples {
+        let si = si as usize;
+        if si >= manifest.samples.len() {
+            continue;
+        }
+        let s = &manifest.samples[si];
+        let pcm_root: PcmRoot =
+            serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, s.pcm_root).await?)?;
+        let chunks = fetch_many(ipfs, &pcm_root.chunks).await?;
+        let mut w = s.offset as usize;
+        for c in &pcm_root.chunks {
+            let bytes = chunks.get(c).ok_or_else(|| anyhow!("missing chunk {c}"))?;
+            out[w..w + bytes.len()].copy_from_slice(bytes);
+            w += bytes.len();
+        }
+    }
+    Ok(out)
 }
