@@ -5,28 +5,74 @@ All 8 phases of [MVP.md](MVP.md) are implemented, and the control plane is
 **deferred, simplified, or shipped as a functional-but-not-optimal version** —
 so nothing falls through the cracks.
 
-Status legend: 🔴 blocks full real-world use · 🟡 proven in labs, not yet wired ·
-🟢 nice-to-have / hardening · ⚪ explicitly out of MVP (from the spec).
+**Domain acquired (2026-06-23):** `trackerstream.xyz` is registered and its A/AAAA
+records resolve to the droplet (`165.227.155.138` / `2a03:b0c0:3:f0:0:2:959c:b000`),
+propagation confirmed on Cloudflare + Google; `http://trackerstream.xyz:8080/healthz`
+reaches the live API. **This unblocks A1 (TLS) — staged for execution below.**
+
+Status legend: ▶️ ready to execute now · 🔴 blocks full real-world use ·
+🟡 proven in labs, not yet wired · 🟢 nice-to-have / hardening ·
+⚪ explicitly out of MVP (from the spec).
+
+---
+
+## Execution status — 2026-06-23 pass (✅ done · 📋 operator step · ⏸ deferred)
+
+A focused pass executed almost all of the below. Highlights:
+
+- **✅ A1 TLS** — Caddy fronts `https://trackerstream.xyz` (Let's Encrypt, HSTS,
+  HTTP→HTTPS redirect); API rebound to `127.0.0.1`, `:8080` firewalled; client
+  points at HTTPS (`packages/config`). `deploy/setup-tls.sh` added. Live + verified.
+- **✅ A2 ingest throughput** — concurrent `block put` + `Provide.Strategy=roots`.
+  Benchmarked on the droplet: **1.31 → 3.68 modules/s (100 → 281 blocks/s, ~2.8×)**.
+  📋 the full 52 GB / 122k-module ingest itself is still an operator run
+  (`deploy/sync-archive.sh` then `systemctl start trackerstream-ingest`).
+- **✅ B1/B2/B3 seek tables** — `packages/repack/src/seek.ts` bakes a timing map +
+  segment0 + per-order resident sets into the manifest (bit-exact verified); the
+  Rust streamer fetches segment0-first + playback-order proxy and gains
+  `seek_module(root, order)`. 📋 seek-bar UX wiring + a re-ingest populate it live.
+- **✅ C1 MPTM/MO3** — MPTM (incl. older `tpm.` magic) parses IT-style for real
+  dedup; MO3 documented flat-by-design (compressed, no raw PCM).
+- **✅ C2** fixtures + CI · **✅ B4** warm-cache benchmark · **✅ E1** OAuth +
+  ActivityPub handle alias · **✅ E2** `trackerstream://` deep links ·
+  **✅ D3** backups/metrics/journald · **✅ D2** signing/notarization scaffold +
+  `docs/RELEASE.md` (📋 notarization needs an Apple Developer account).
+- **✅ D1 (code)** hostname/DNS addressing in `packages/config`; **📋 D1 Reserved
+  IP** is an operator step (`deploy/RESERVED-IP.md`, needs the DO account).
+- **✅ A3** code pushed (`origin/main`) + `docs/BUILD-SECOND-MAC.md`; **⏸ the
+  physical cross-NAT measurement is deferred** (clients circuit-relaying each
+  other — to revisit).
+- **⏸ D4 TURN/relay load + symmetric-NAT** — deferred with the NAT work above.
+
+The per-item detail below is the original plan; treat the markers above as current.
 
 ---
 
 ## A. Needed to actually use the deployed app end-to-end
 
-### 🔴 A1. TLS for the HTTP API (catalog is unreachable from the packaged app)
-**Symptom:** the packaged desktop app shows **"catalog offline."** The API is up
-and reachable, but the WKWebView runs at a secure `tauri://` origin and macOS App
-Transport Security **blocks the cleartext `http://165.227.155.138:8080` fetch**.
-**Why deferred:** MVP.md ships with *no domain* (clients hard-code the IP), and
-real TLS (Let's Encrypt) needs a hostname.
-**Current state:** [`deploy/Caddyfile`](deploy/Caddyfile) is domain-ready (auto-HTTPS
-once `TS_DOMAIN` points at the droplet). The **P2P data plane is unaffected** (it
-runs through the embedded rust-ipfs node in Rust, not the webview).
-**To do:** point a hostname at the droplet → run Caddy → set `API_BASE_URL` to
-`https://<host>` in [`packages/config`](packages/config/index.js). No client code
-change needed; the webview `fetch` to `https://` is allowed.
-**Stopgap (if you want it working before TLS):** route catalog/social HTTP through
-Rust via `@tauri-apps/plugin-http` (requests originate in Rust, bypassing ATS/CORS).
-We deliberately chose to wait for TLS instead.
+### ▶️ A1. TLS for the HTTP API — UNBLOCKED (domain live), staged for execution
+**Symptom (the fix target):** the packaged desktop app shows **"catalog offline"**
+because the WKWebView runs at a secure `tauri://` origin and macOS App Transport
+Security **blocks the cleartext `http://…:8080` fetch**. Serving the API over HTTPS
+resolves it directly — no client code change beyond the base URL.
+**Now possible:** `trackerstream.xyz` resolves to the droplet (see header), so
+Let's Encrypt can issue a cert.
+**Execution plan** (artifact: [`deploy/setup-tls.sh`](deploy/setup-tls.sh)):
+1. **Droplet — stand up TLS:** install Caddy; write `/etc/caddy/Caddyfile`
+   (`trackerstream.xyz` → `reverse_proxy 127.0.0.1:8080`, HSTS, health check);
+   `ufw allow 80,443`; start Caddy → automatic Let's Encrypt cert + renewal.
+2. **Lock the API behind Caddy:** bind the API to `127.0.0.1:8080` (serve.ts) and
+   `ufw deny 8080` so it's reachable only via Caddy on 443. (Caddy needs :80 for the
+   ACME HTTP-01 challenge + redirect, :443 for HTTPS.)
+3. **Point the client at the domain:** set `API_BASE_URL = https://trackerstream.xyz`
+   in [`packages/config`](packages/config/index.js) (drop `:8080`); rebuild +
+   repackage the desktop app.
+4. **Verify:** `curl https://trackerstream.xyz/healthz`; launch the app → catalog
+   loads (no "offline"); browse/search/playlists/social all work.
+**Note:** the **P2P data plane is unaffected** (runs through the embedded rust-ipfs
+node, not the webview); only the HTTP control plane moves to HTTPS here. Moving the
+libp2p/STUN multiaddrs to `/dns4/trackerstream.xyz/…` is a separate durability step
+(see D1).
 
 ### 🔴 A2. Full-corpus sync + ingest (only a slice is live)
 **Current state:** ~1,376 modules ingested (a 480 MB / 37-zip slice). The pipeline
@@ -115,10 +161,16 @@ tamper, worklet, swarm/interop) run on every change.
 
 ## D. Production / ops hardening
 
-### 🔴 D1. Reserved IP
-The client hard-codes the droplet IP in [`packages/config`](packages/config/index.js).
-A droplet rebuild changes the IP and bricks every shipped client. Move to a
-**DigitalOcean Reserved IP** (MVP.md §"No domain yet") before any real distribution.
+### 🔴 D1. Reserved IP + DNS-based addressing (durability)
+With the domain live, the **HTTP API** moves to `https://trackerstream.xyz` (A1), so
+it survives an IP change once DNS is updated. Two gaps remain:
+- The `trackerstream.xyz` A/AAAA records point at the **current** droplet IP; a
+  rebuild changes it. Point DNS at a **DigitalOcean Reserved IP** so a rebuild only
+  needs the volume + reserved-IP reattached.
+- The **libp2p bootstrap + STUN** addresses in
+  [`packages/config`](packages/config/index.js) are still hard-coded IPs. Move them to
+  `/dns4/trackerstream.xyz/…` (and a hostname for STUN) so the data plane is durable
+  too. (libp2p has no ATS issue, so this is durability, not a blocker.)
 
 ### 🟢 D2. Code signing + notarization + auto-update
 The packaged `trackerstream_0.1.0_aarch64.dmg` is **unsigned** (Gatekeeper will warn).
@@ -163,15 +215,19 @@ playlist-share + listening-session-share UX are follow-ups.
 - **Format-specific playback engines** for bit-exact fidelity (e.g. ProTracker `.mod`).
 - **Horizontal scaling / managed infra / multi-origin pinning** (MVP sizes a single
   master node).
-- **Domain + DNS-based peer/service discovery** (beyond the Reserved IP step in D1).
+- **DNS-based peer/service discovery** beyond pointing the API hostname (e.g.
+  `/dnsaddr` bootstrap, SRV records) — partially addressed by D1.
 
 ---
 
 ## Quick triage if picking this back up
 
-1. **D1 Reserved IP** + **A1 TLS** (domain → Caddy) — unblocks the packaged app and
-   makes the deployment durable.
-2. **A2** ingest throughput fix → full-corpus ingest (gets the real catalog + the
-   ~59% dedup number).
-3. **B1/B2 seek + segment-0 tables** — the biggest UX wins, already proven in labs.
-4. **A3** physical NAT test — validates the P2P offload story end-to-end.
+1. **▶️ A1 TLS** (domain is live) — install Caddy, serve `https://trackerstream.xyz`,
+   point the client at it, repackage. **Unblocks the packaged app** ("catalog
+   offline" → fixed). *This is the immediate next action.*
+2. **D1 Reserved IP** + DNS-based libp2p/STUN addresses — makes the deployment
+   survive a droplet rebuild.
+3. **A2** ingest throughput fix → full-corpus ingest (real catalog + the ~59% dedup
+   number).
+4. **B1/B2 seek + segment-0 tables** — the biggest UX wins, already proven in labs.
+5. **A3** physical NAT test — validates the P2P offload story end-to-end.
