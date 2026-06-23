@@ -1,0 +1,90 @@
+# trackerstream CI
+#
+# The BLOCKING job ("oracles") runs only the kubo-free, fixture-driven test
+# oracles so every push/PR is gated on the core correctness invariants without
+# any local corpus, local kubo daemon, or emscripten/Rust toolchain:
+#
+#   - DAG build + reassemble is BYTE-IDENTICAL to the original module
+#   - reassembly is self-verifying (every block checked against its CID)
+#   - a tampered block is rejected during reassembly
+#   - byte-identical sample PCM dedups to a SHARED chunk + pcm-root CID across
+#     modules (and across formats)
+#
+# Fixtures are tiny, structurally-valid, COPYRIGHT-FREE modules generated
+# deterministically by packages/repack/test/fixtures/gen-fixtures.mjs (committed
+# alongside the generator). The job also re-runs the generator and fails if the
+# committed fixtures drift from it.
+#
+# GATED / NON-BLOCKING ("gated-info"): the remaining oracles need artifacts or
+# services that aren't available (or aren't fast) on a stock CI runner, so they
+# are intentionally NOT run here. They are documented in that job and remain
+# runnable locally:
+#   - packages/wasm  smoke.mjs / reassembly.mjs  -> need the emscripten-built
+#       dist/libopenmpt.js (gitignored, produced by `pnpm wasm:build`)
+#   - apps/desktop   worklet-harness.mjs          -> needs the built worklet +
+#       wasm artifact above, plus local module files
+#   - packages/repack test/roundtrip.ts ("test:corpus") -> needs the local
+#       ~/tmp/somemods corpus
+#   - packages/repack test/rust-interop.sh, test/swarm.sh -> need a live kubo
+#       daemon (and cargo for the rust-interop example)
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Newer pushes to the same ref cancel in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oracles:
+    name: kubo-free oracles
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.8.0
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify fixtures match their generator (deterministic)
+        run: |
+          node packages/repack/test/fixtures/gen-fixtures.mjs
+          if ! git diff --quiet -- packages/repack/test/fixtures; then
+            echo "::error::Committed fixtures differ from gen-fixtures.mjs output. Re-run the generator and commit the result."
+            git --no-pager diff --stat -- packages/repack/test/fixtures
+            exit 1
+          fi
+
+      - name: Fixture roundtrip + dedup + tamper oracle (no kubo)
+        run: pnpm run test:ci
+
+  gated-info:
+    name: gated (needs kubo / wasm build / corpus)
+    runs-on: ubuntu-latest
+    # Non-blocking: this job documents the oracles that require artifacts or
+    # services not available on a stock runner. It never fails the pipeline.
+    continue-on-error: true
+    steps:
+      - name: Why these are skipped
+        run: |
+          echo "Skipped here (run locally):"
+          echo "  - packages/wasm  smoke.mjs / reassembly.mjs   (needs emscripten-built dist/libopenmpt.js: pnpm wasm:build)"
+          echo "  - apps/desktop   worklet-harness.mjs           (needs built worklet + wasm artifact + local modules)"
+          echo "  - packages/repack roundtrip.ts (test:corpus)    (needs ~/tmp/somemods corpus)"
+          echo "  - packages/repack rust-interop.sh / swarm.sh    (needs a live kubo daemon, and cargo for rust-interop)"

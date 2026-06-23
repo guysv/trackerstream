@@ -12,7 +12,8 @@
     "./kubo": "./src/kubo.ts"
   },
   "scripts": {
-    "test": "node test/roundtrip.ts"
+    "test": "node test/roundtrip-fixtures.ts",
+    "test:corpus": "node test/roundtrip.ts"
   },
   "dependencies": {
     "@ipld/dag-cbor": "^9.2.1",
