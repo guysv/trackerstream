@@ -134,7 +134,17 @@ async fn get_stream_buffer(root: String, streams: State<'_, Streams>) -> Result<
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // Deep links: trackerstream://share/<code> (E2). The frontend handles the
+        // URL via @tauri-apps/plugin-deep-link's onOpenUrl/getCurrent.
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
+            // On Linux/Windows the scheme must be registered at runtime (macOS
+            // registers it from the bundle Info.plist). Harmless if already set.
+            #[cfg(any(target_os = "linux", windows))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let _ = app.deep_link().register_all();
+            }
             // Persistent blockstore under the app data dir = the client CID cache.
             let dir = app.path().app_data_dir().ok().map(|d| d.join("ipfs"));
             // Start the (non-Send) builder once here, off the command path.
