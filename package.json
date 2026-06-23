@@ -1,0 +1,18 @@
+{
+  "name": "trackerstream",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A Spotify-like client for browsing, streaming, and sharing tracker music",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "desktop:dev": "pnpm --filter @trackerstream/desktop dev",
+    "wasm:build": "pnpm --filter @trackerstream/wasm build"
+  },
+  "packageManager": "pnpm@11.8.0"
+}
