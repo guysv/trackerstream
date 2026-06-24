@@ -17,10 +17,10 @@
 // Canonical hostname for the master node (A + AAAA -> the droplet / Reserved IP).
 export const MASTER_HOST = "trackerstream.xyz";
 
-// Literal addresses of the fra1 droplet (reference/fallback only — prefer the
-// DNS name above so a rebuild/Reserved-IP swap doesn't require a client rebuild).
-export const MASTER_IPV4 = "165.227.155.138";
-export const MASTER_IPV6 = "2a03:b0c0:3:f0:0:2:959c:b000";
+// Literal addresses of the master box (Hetzner nbg1 — reference/fallback only;
+// prefer the DNS name above so an IP swap doesn't require a client rebuild).
+export const MASTER_IPV4 = "5.75.131.145";
+export const MASTER_IPV6 = "2a01:4f8:1c1f:9120::1";
 
 // HTTP control-plane API (catalog/search/accounts/playlists/social). It is
 // fronted by Caddy with a Let's Encrypt cert on 443 (deploy/setup-tls.sh) and is
@@ -34,23 +34,25 @@ export const MASTER_IPV6 = "2a03:b0c0:3:f0:0:2:959c:b000";
 export const API_PORT = 8080;
 export const API_BASE_URL = `https://${MASTER_HOST}`;
 
-// libp2p bootstrap / DHT. The master is a Kademlia bootstrap peer and always-on
-// provider for every archive CID. The client tries EVERY entry until one
-// connects (player.ensureConnected). Literal IPs are listed FIRST — the embedded
-// rust-ipfs node dials those directly and reliably — followed by the /dns4+/dns6
-// names for durability across an IP change (used when the node resolves /dns*).
-// (Unlike the HTTP plane, which the WKWebView resolves by name, the embedded
-// libp2p node's /dns* dialing is best-effort, so the literals are the floor.)
+// libp2p bootstrap. The master is an always-on provider for every archive CID.
+// The client tries EVERY entry until one connects (player.ensureConnected).
+// /dns4 + /dns6 are listed FIRST and are the durable path: the embedded node now
+// enables the DNS transport (src-tauri/src/ipfs.rs `.enable_dns()`), so it resolves
+// trackerstream.xyz at dial time and a master IP change needs NO client rebuild.
+// The literal /ip4 + /ip6 entries follow as a fallback only (used if DNS is
+// momentarily unavailable); keep them pointed at the current master.
 export const LIBP2P_SWARM_PORT = 4001;
-export const MASTER_PEER_ID = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL"; // fra1 master
+export const MASTER_PEER_ID = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL"; // master identity (stable across IP moves)
 export const BOOTSTRAP_MULTIADDRS = MASTER_PEER_ID
   ? [
+      `/dns4/${MASTER_HOST}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
+      `/dns4/${MASTER_HOST}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
+      `/dns6/${MASTER_HOST}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
+      `/dns6/${MASTER_HOST}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
       `/ip4/${MASTER_IPV4}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
       `/ip4/${MASTER_IPV4}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
       `/ip6/${MASTER_IPV6}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
       `/ip6/${MASTER_IPV6}/udp/${LIBP2P_SWARM_PORT}/quic-v1/p2p/${MASTER_PEER_ID}`,
-      `/dns4/${MASTER_HOST}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
-      `/dns6/${MASTER_HOST}/tcp/${LIBP2P_SWARM_PORT}/p2p/${MASTER_PEER_ID}`,
     ]
   : [];
 
