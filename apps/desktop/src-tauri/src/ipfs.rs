@@ -165,6 +165,13 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
         .with_ping(Default::default())
         .enable_tcp()
         .enable_quic()
+        // Wrap the transport in a DNS resolver so /dns4 + /dns6 bootstrap
+        // multiaddrs actually dial. Without this the embedded node could only dial
+        // literal /ip4 + /ip6 (the old workaround in packages/config), so a master
+        // IP change required a client rebuild. With it the client follows DNS:
+        // resolve trackerstream.xyz -> current IP -> dial, no rebuild on IP change.
+        // (rust-ipfs 0.15 `dns` feature is on by default; default resolver Cloudflare.)
+        .enable_dns()
         .add_listening_addr("/ip4/0.0.0.0/tcp/0".parse()?)
         .with_relay(true) // relay client + DCUtR hole punching
         .with_autonat()
