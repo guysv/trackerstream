@@ -214,7 +214,6 @@ function sampleInfos(b: Uint8Array, h: ItHeader): SmpInfo[] {
 }
 
 const ROWSEC = (speed: number, tempo: number) => (speed * 2.5) / tempo; // ticks/row * 2.5/BPM
-const WIN = 0.5; // forward-window seconds: imminent triggers a cold seek must cover
 const MAX_CHECKPOINTS = 512; // cap manifest growth for pathological order lists
 function sampleSeconds(s: SmpInfo, note: number): number {
   if (!s || s.len === 0) return 0;
@@ -335,39 +334,33 @@ function simulateTables(m: SimModel): SeekTables {
         t += ROWSEC(speed, tempo);
       }
     }
+    // A channel's last note-on is potentially-ringing until cut or replaced; keep
+    // it resident regardless of any computed duration. Over-counting is safe (a
+    // finished one-shot just lingers in the set, bounded by channel count) and it
+    // removes all pitch/rate-reference risk — the source of mid-track chops.
     const resident = new Set<number>();
     for (const hc of held) {
       if (!hc) continue;
-      const dur = m.sampleSeconds(hc.sample, hc.note);
-      if (dur === Infinity || t - hc.tOn < dur) {
-        const o = m.offsetOf(hc.sample);
-        if (o >= 0) resident.add(o);
-      }
+      const o = m.offsetOf(hc.sample);
+      if (o >= 0) resident.add(o);
     }
-    // forward window: samples triggered within WIN seconds from N
+    // Forward: every sample triggered between this checkpoint and the next, so
+    // checkpoint(N) covers the ENTIRE span it is the floor for — a gap-free
+    // continuous fence, not just a 0.5s cold-seek window. (held-at-N above + all
+    // triggers in [N, nextCheckpoint) = everything audible across the span.)
     {
-      let tw = 0,
-        sp = speed,
-        tp = tempo;
       const fl = latch.slice();
-      for (let pi = vi; pi < m.orderPats.length && tw < WIN; pi++) {
+      const nextPos = Math.min(vi + stride, m.orderPats.length);
+      for (let pi = vi; pi < nextPos; pi++) {
         const ev = m.decode(m.orderPats[pi].pat);
-        const rows = ev ? ev.rows : 64;
-        let ei = 0;
-        for (let row = 0; row < rows && tw < WIN; row++) {
-          if (ev)
-            while (ei < ev.events.length && ev.events[ei].row === row) {
-              const e = ev.events[ei++];
-              if (e.setSpeed) sp = e.setSpeed;
-              if (e.setTempo) tp = e.setTempo;
-              if (e.explicitSample >= 0) fl[e.ch] = e.explicitSample;
-              if (e.hasNote) {
-                const s = e.explicitSample >= 0 ? e.explicitSample : fl[e.ch];
-                const o = m.offsetOf(s);
-                if (o >= 0) resident.add(o);
-              }
-            }
-          tw += ROWSEC(sp, tp);
+        if (!ev) continue;
+        for (const e of ev.events) {
+          if (e.explicitSample >= 0) fl[e.ch] = e.explicitSample;
+          if (e.hasNote) {
+            const s = e.explicitSample >= 0 ? e.explicitSample : fl[e.ch];
+            const o = m.offsetOf(s);
+            if (o >= 0) resident.add(o);
+          }
         }
       }
     }
@@ -488,38 +481,29 @@ function computeItTables(b: Uint8Array): SeekTables | null {
         t += ROWSEC(speed, tempo);
       }
     }
+    // Last note-on per channel is potentially-ringing until cut/replaced — keep it
+    // resident regardless of duration (over-count safe, no pitch-ref risk).
     const resident = new Set<number>();
     for (const hc of held) {
       if (!hc) continue;
-      const s = smp[hc.sample];
-      if (s && (s.loops || t - hc.tOn < sampleSeconds(s, hc.note))) {
-        const o = offOf(hc.sample);
-        if (o >= 0) resident.add(o);
-      }
+      const o = offOf(hc.sample);
+      if (o >= 0) resident.add(o);
     }
-    // forward window: triggers within WIN seconds from N
+    // Forward: every sample triggered between N and the next checkpoint's order,
+    // so checkpoint(N) covers the whole span it is the floor for (gap-free
+    // continuous fence, not just a 0.5s cold-seek window).
     {
-      let tw = 0;
-      for (let oi = N; oi < h.ordNum && tw < WIN; oi++) {
+      const nextOrder = vi + stride < validOrders.length ? validOrders[vi + stride] : h.ordNum;
+      for (let oi = N; oi < nextOrder; oi++) {
         const pat = h.orders[oi];
         if (pat >= 254) continue;
         const ev = decode(pat);
         if (!ev) continue;
-        let ei = 0,
-          sp = speed,
-          tp = tempo;
-        for (let row = 0; row < ev.rows && tw < WIN; row++) {
-          while (ei < ev.events.length && ev.events[ei].row === row) {
-            const e = ev.events[ei++];
-            if (e.cmd === 1 && e.param) sp = e.param;
-            else if (e.cmd === 0x14 && e.param >= 0x20) tp = e.param;
-            if (e.note !== null && e.note < 120) {
-              const s = sampleForNote(b, h, e.ins, e.note);
-              const o = offOf(s);
-              if (o >= 0) resident.add(o);
-            }
+        for (const e of ev.events) {
+          if (e.note !== null && e.note < 120) {
+            const o = offOf(sampleForNote(b, h, e.ins, e.note));
+            if (o >= 0) resident.add(o);
           }
-          tw += ROWSEC(sp, tp);
         }
       }
     }

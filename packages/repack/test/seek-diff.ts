@@ -19,7 +19,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const SR = 48000;
-const WIN_SECONDS = 0.5; // matches the bake's forward-window promise
+const SPAN_CAP = 15; // cap per-checkpoint render seconds (huge strided spans)
 const MAX_TESTS = 12; // checkpoints probed per module
 
 let M: any;
@@ -38,21 +38,27 @@ function loadMod(bytes: Uint8Array): number {
   M._free(p);
   return mod;
 }
-function renderFrom(mod: number, order: number, seconds: number): Float32Array {
+// Render from `startOrder` until the playhead reaches `stopOrder` (the next
+// checkpoint) or `maxSec` elapses — small chunks, discarding any chunk that
+// crosses into stopOrder so EVERY returned frame is within [startOrder, stopOrder).
+// This honors real pattern breaks/jumps instead of a seconds estimate, so the
+// test mirrors exactly what the fence covers (checkpoint(N) until the next cp).
+function renderRange(mod: number, startOrder: number, stopOrder: number, maxSec: number): Float32Array {
   M._openmpt_module_set_render_param(mod, 3, 8);
-  M._openmpt_module_set_position_order_row(mod, order, 0);
-  const frames = 2048;
+  M._openmpt_module_set_position_order_row(mod, startOrder, 0);
+  const frames = 256;
   const lp = M._malloc(frames * 4);
   const rp = M._malloc(frames * 4);
-  const want = Math.floor(SR * seconds);
-  const out = new Float32Array(want * 2);
+  const cap = Math.floor(SR * maxSec);
+  const out = new Float32Array(cap * 2);
   let n = 0;
-  while (n < want) {
+  while (n < cap) {
     const got = M._openmpt_module_read_float_stereo(mod, SR, frames, lp, rp);
     if (got <= 0) break;
+    if (M._openmpt_module_get_current_order(mod) >= stopOrder) break; // crossed boundary -> drop chunk
     const L = M.HEAPF32.subarray(lp / 4, lp / 4 + got);
     const R = M.HEAPF32.subarray(rp / 4, rp / 4 + got);
-    for (let i = 0; i < got && n < want; i++, n++) {
+    for (let i = 0; i < got && n < cap; i++, n++) {
       out[n * 2] = L[i];
       out[n * 2 + 1] = R[i];
     }
@@ -135,8 +141,11 @@ for (const path of mods) {
   let pass = true;
   for (let ci = 0; ci < cps.length; ci += step) {
     const cp = cps[ci];
+    // Render until the playhead reaches the next checkpoint's order (the exact
+    // span checkpoint(N) is the floor for), honoring real pattern breaks/jumps.
+    const stopOrder = ci + 1 < cps.length ? cps[ci + 1].order : Number.MAX_SAFE_INTEGER;
     const refMod = loadMod(orig);
-    const ref = renderFrom(refMod, cp.order, WIN_SECONDS);
+    const ref = renderRange(refMod, cp.order, stopOrder, SPAN_CAP);
     M._openmpt_module_destroy(refMod);
     // streamed: skeleton + only this checkpoint's samples.
     const smod = loadMod(skeleton);
@@ -149,7 +158,7 @@ for (const path of mods) {
       M._openmpt_module_provide_sample(smod, idx, p, d.frames);
       M._free(p);
     }
-    const test = renderFrom(smod, cp.order, WIN_SECONDS);
+    const test = renderRange(smod, cp.order, stopOrder, SPAN_CAP);
     M._openmpt_module_destroy(smod);
 
     const rr = rms(ref);
