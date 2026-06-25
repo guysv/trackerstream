@@ -14,7 +14,8 @@
   "scripts": {
     "test": "node test/roundtrip-fixtures.ts",
     "test:corpus": "node test/roundtrip.ts",
-    "test:v2": "node test/provide-v2.ts"
+    "test:v2": "node test/provide-v2.ts",
+    "test:seek": "node test/seek-diff.ts"
   },
   "dependencies": {
     "@ipld/dag-cbor": "^9.2.1",
