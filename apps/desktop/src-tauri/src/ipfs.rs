@@ -9,9 +9,10 @@ use anyhow::{anyhow, Result};
 use cid::Cid;
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use rust_ipfs::builder::IpfsBuilder;
-use rust_ipfs::{Ipfs, Keypair, Multiaddr, PeerId};
+use rust_ipfs::{Ipfs, Keypair, Multiaddr, PeerId, Protocol};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -165,12 +166,13 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
         .with_ping(Default::default())
         .enable_tcp()
         .enable_quic()
-        // Wrap the transport in a DNS resolver so /dns4 + /dns6 bootstrap
-        // multiaddrs actually dial. Without this the embedded node could only dial
-        // literal /ip4 + /ip6 (the old workaround in packages/config), so a master
-        // IP change required a client rebuild. With it the client follows DNS:
-        // resolve trackerstream.xyz -> current IP -> dial, no rebuild on IP change.
-        // (rust-ipfs 0.15 `dns` feature is on by default; default resolver Cloudflare.)
+        // Enable the DNS transport. NOTE: connexa 0.4.1's builder composes this
+        // over a *dummy* transport (the real TCP/QUIC sit outside it), so a /dns*
+        // dial through it fails with "Unsupported resolved address" — it does NOT
+        // actually make /dns4//dns6 dialing work. We instead resolve the host in
+        // `connect()` (resolve_dns_multiaddr) and dial the literal IP, which is
+        // what delivers dial-by-hostname (IP change needs no client rebuild). This
+        // call is kept harmless/in-place pending an upstream connexa fix.
         .enable_dns()
         .add_listening_addr("/ip4/0.0.0.0/tcp/0".parse()?)
         .with_relay(true) // relay client + DCUtR hole punching
@@ -185,10 +187,71 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
     Ok(Node { ipfs, peer_id })
 }
 
-/// Dial a peer by multiaddr (must include `/p2p/<peer-id>`).
+/// Resolve a `/dns4|/dns6|/dnsaddr/<host>/…` multiaddr to a literal
+/// `/ip4|/ip6/<addr>/…` one, preserving every other protocol hop (tcp/udp/quic/p2p).
+///
+/// WHY: connexa 0.4.1 (the transport builder under rust-ipfs 0.15) composes its
+/// DNS transport over a *dummy* transport, while the real TCP/QUIC transports are
+/// added OUTSIDE that DNS layer. So a `/dns*` dial resolves the host and then
+/// hands the resolved address to the dummy → `Unsupported resolved address`, and
+/// the dial never connects (the bug is still present in connexa HEAD; only the
+/// wasm path was reworked). We resolve the host OURSELVES and dial the literal IP.
+/// This is what makes dial-by-hostname (`trackerstream.xyz`) actually connect —
+/// the durability guarantee in packages/config: a master IP change needs no
+/// client rebuild. Returns None when there's no `/dns*` hop (already literal) or
+/// nothing resolves in the requested address family.
+async fn resolve_dns_multiaddr(ma: &Multiaddr) -> Option<Multiaddr> {
+    let mut host: Option<String> = None;
+    let (mut want_v4, mut want_v6) = (true, true);
+    for p in ma.iter() {
+        match p {
+            Protocol::Dns4(h) => {
+                host = Some(h.into_owned());
+                want_v6 = false; // /dns4 -> A records only
+            }
+            Protocol::Dns6(h) => {
+                host = Some(h.into_owned());
+                want_v4 = false; // /dns6 -> AAAA records only
+            }
+            Protocol::Dnsaddr(h) => host = Some(h.into_owned()),
+            _ => {}
+        }
+    }
+    let host = host?;
+    // Port is irrelevant for the A/AAAA lookup; 0 is fine.
+    let ip = tokio::net::lookup_host((host.as_str(), 0))
+        .await
+        .ok()?
+        .map(|sa| sa.ip())
+        .find(|ip| match ip {
+            IpAddr::V4(_) => want_v4,
+            IpAddr::V6(_) => want_v6,
+        })?;
+    let resolved: Multiaddr = ma
+        .iter()
+        .map(|p| match p {
+            Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => match ip {
+                IpAddr::V4(a) => Protocol::Ip4(a),
+                IpAddr::V6(a) => Protocol::Ip6(a),
+            },
+            other => other,
+        })
+        .collect();
+    Some(resolved)
+}
+
+/// Dial a peer by multiaddr (must include `/p2p/<peer-id>`). `/dns*` hosts are
+/// resolved to a literal IP first (see `resolve_dns_multiaddr`).
 pub async fn connect(ipfs: &Ipfs, addr: &str) -> Result<()> {
     let ma: Multiaddr = addr.parse()?;
-    let r = ipfs.connect(ma).await;
+    let dial = match resolve_dns_multiaddr(&ma).await {
+        Some(resolved) => {
+            eprintln!("[connect] resolved {addr} -> {resolved}");
+            resolved
+        }
+        None => ma,
+    };
+    let r = ipfs.connect(dial).await;
     match &r {
         Ok(_) => eprintln!("[connect] OK {addr}"),
         Err(e) => eprintln!("[connect] FAIL {addr}: {e}"),
@@ -469,4 +532,29 @@ pub async fn seek_module(ipfs: &Ipfs, root: Cid, target_order: u32) -> Result<Ve
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // localhost resolves offline + deterministically, so this exercises the
+    // /dns* -> /ip* rewrite (and the hop-preservation) without external DNS.
+    #[tokio::test]
+    async fn dns4_rewrites_to_ip4_preserving_hops() {
+        let ma: Multiaddr =
+            "/dns4/localhost/tcp/4001/p2p/12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL"
+                .parse()
+                .unwrap();
+        let out = resolve_dns_multiaddr(&ma).await.expect("should resolve");
+        let s = out.to_string();
+        assert!(s.starts_with("/ip4/127.0.0.1/tcp/4001/p2p/"), "got {s}");
+    }
+
+    // A literal multiaddr has no /dns* hop -> nothing to resolve.
+    #[tokio::test]
+    async fn literal_multiaddr_is_left_alone() {
+        let ma: Multiaddr = "/ip4/5.75.131.145/tcp/4001".parse().unwrap();
+        assert!(resolve_dns_multiaddr(&ma).await.is_none());
+    }
 }

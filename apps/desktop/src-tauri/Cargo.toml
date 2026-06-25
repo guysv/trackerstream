@@ -27,7 +27,7 @@ rust-ipfs = "0.15"
 sha2 = "0.11.0"
 futures = "0.3.32"
 anyhow = "1.0.102"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
 cid = { version = "0.11", features = ["serde"] }
 serde_ipld_dagcbor = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
