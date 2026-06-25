@@ -79,18 +79,14 @@ struct CheckpointV2 {
     samples: Vec<u32>, // resident slot indices
 }
 
+// The Rust transport only needs `checkpoints` (prefetch ordering). We deliberately
+// do NOT model `orderSeconds`: dag-cbor encodes whole-number floats as ints, so a
+// `seconds: f64` field fails to deserialize on `seconds: 0`. serde ignores the
+// unmodeled field; the client doesn't use the time<->order map yet either.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct PlanV2 {
-    #[serde(default, rename = "orderSeconds")]
-    order_seconds: Vec<OrderSeconds>,
     #[serde(default)]
     checkpoints: Vec<CheckpointV2>,
-}
-
-#[derive(Debug, Deserialize, Clone, Serialize)]
-struct OrderSeconds {
-    order: u32,
-    seconds: f64,
 }
 
 #[derive(Debug, Deserialize)]

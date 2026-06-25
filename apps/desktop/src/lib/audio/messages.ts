@@ -32,9 +32,11 @@ export interface Position {
   vu: number[]; // per-channel mono VU, length == numChannels
 }
 
-// The v2 planning index the worklet fence needs (subset of repack PlanV2).
+// The v2 planning index the worklet fence needs (subset of repack PlanV2). Only
+// `checkpoints` is required/used; `orderSeconds` (the time<->order map) is not
+// carried by the Rust transport and isn't consumed by the fence.
 export interface PlanData {
-  orderSeconds: { order: number; seconds: number }[];
+  orderSeconds?: { order: number; seconds: number }[];
   checkpoints: { order: number; samples: number[] }[];
 }
 
