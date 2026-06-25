@@ -55,12 +55,6 @@ function modChannels(t: string): number {
   return 0;
 }
 
-/** A segment0-only result (no timing map / checkpoints) for MOD/S3M/XM. */
-function seg0Only(offsets: number[]): SeekTables {
-  const uniq = [...new Set(offsets)].filter((o) => o >= 0).sort((a, b) => a - b);
-  return { orderSeconds: [], segment0Offsets: uniq, checkpoints: [] };
-}
-
 export interface SeekCheckpoint {
   order: number; // order-list index
   residentOffsets: number[]; // PCM offsets of samples resident at a seek to this order
@@ -220,6 +214,8 @@ function sampleInfos(b: Uint8Array, h: ItHeader): SmpInfo[] {
 }
 
 const ROWSEC = (speed: number, tempo: number) => (speed * 2.5) / tempo; // ticks/row * 2.5/BPM
+const WIN = 0.5; // forward-window seconds: imminent triggers a cold seek must cover
+const MAX_CHECKPOINTS = 512; // cap manifest growth for pathological order lists
 function sampleSeconds(s: SmpInfo, note: number): number {
   if (!s || s.len === 0) return 0;
   const rate = s.c5 * Math.pow(2, (note - 60) / 12);
@@ -235,14 +231,173 @@ function sampleSeconds(s: SmpInfo, note: number): number {
 export function computeSeekTables(b: Uint8Array, format: Format): SeekTables | null {
   try {
     if (format === "it" || format === "mptm") return computeItTables(b);
-    if (format === "mod") return modSegment0(b);
-    if (format === "s3m") return s3mSegment0(b);
-    if (format === "xm") return xmSegment0(b);
+    if (format === "mod") return modTables(b);
+    if (format === "s3m") return s3mTables(b);
+    if (format === "xm") return xmTables(b);
   } catch {
     return null; // any decode surprise -> ship without tables (file-order stream)
   }
   return null;
 }
+
+// ===========================================================================
+// Generic held-note checkpoint engine (v2, decision 1: full checkpoints for all
+// parsed formats). A format adapter decodes its patterns into NORMALIZED events
+// and supplies a per-sample duration; this engine runs the timing + held-note +
+// forward-window simulation identically for MOD/S3M/XM. IT keeps its own
+// (already-proven) path above. Over-counting is safe, under-counting chops — so
+// durations err long (loops => Infinity, non-loops padded) and the forward
+// window covers imminent triggers.
+// ===========================================================================
+
+interface SimEvent {
+  row: number;
+  ch: number;
+  explicitSample: number; // 0-based resolved sample, or -1 (none this cell)
+  hasNote: boolean; // a note actually triggers on this cell
+  note: number; // duration key (period for MOD, semitone index for S3M/XM)
+  off: boolean; // note-off / cut -> channel goes silent
+  setSpeed: number; // 0 = none
+  setTempo: number; // 0 = none
+}
+
+interface SimModel {
+  orderPats: { order: number; pat: number }[]; // valid orders, in play sequence
+  speed0: number;
+  tempo0: number;
+  numChannels: number;
+  decode: (pat: number) => { rows: number; events: SimEvent[] } | null; // row-sorted, memoized
+  sampleSeconds: (sample: number, note: number) => number; // Infinity if looping
+  offsetOf: (sample: number) => number; // PCM offset, or -1
+}
+
+type HeldNote = { sample: number; note: number; tOn: number } | null;
+
+// Advance per-channel held/latch state for one event at song-time t.
+function applySim(e: SimEvent, held: HeldNote[], latch: number[], t: number): void {
+  if (e.off) held[e.ch] = null;
+  if (e.explicitSample >= 0) latch[e.ch] = e.explicitSample;
+  if (e.hasNote) {
+    const s = e.explicitSample >= 0 ? e.explicitSample : latch[e.ch];
+    if (s >= 0) {
+      held[e.ch] = { sample: s, note: e.note, tOn: t };
+      latch[e.ch] = s;
+    }
+  }
+}
+
+function simulateTables(m: SimModel): SeekTables {
+  // --- timing map: cumulative seconds at the start of each played order ---
+  const orderSeconds: { order: number; seconds: number }[] = [];
+  {
+    let speed = m.speed0,
+      tempo = m.tempo0,
+      t = 0;
+    for (const { order, pat } of m.orderPats) {
+      orderSeconds.push({ order, seconds: t });
+      const ev = m.decode(pat);
+      const rows = ev ? ev.rows : 64;
+      let ei = 0;
+      for (let row = 0; row < rows; row++) {
+        if (ev)
+          while (ei < ev.events.length && ev.events[ei].row === row) {
+            const e = ev.events[ei++];
+            if (e.setSpeed) speed = e.setSpeed;
+            if (e.setTempo) tempo = e.setTempo;
+          }
+        t += ROWSEC(speed, tempo);
+      }
+    }
+  }
+
+  const stride = Math.max(1, Math.ceil(m.orderPats.length / MAX_CHECKPOINTS));
+  const checkpoints: SeekCheckpoint[] = [];
+  for (let vi = 0; vi < m.orderPats.length; vi += stride) {
+    const N = m.orderPats[vi].order;
+    let speed = m.speed0,
+      tempo = m.tempo0,
+      t = 0;
+    const held: HeldNote[] = new Array(m.numChannels).fill(null);
+    const latch: number[] = new Array(m.numChannels).fill(-1);
+    // walk every played order strictly before position vi
+    for (let pi = 0; pi < vi; pi++) {
+      const ev = m.decode(m.orderPats[pi].pat);
+      const rows = ev ? ev.rows : 64;
+      let ei = 0;
+      for (let row = 0; row < rows; row++) {
+        if (ev)
+          while (ei < ev.events.length && ev.events[ei].row === row) {
+            const e = ev.events[ei++];
+            applySim(e, held, latch, t);
+            if (e.setSpeed) speed = e.setSpeed;
+            if (e.setTempo) tempo = e.setTempo;
+          }
+        t += ROWSEC(speed, tempo);
+      }
+    }
+    const resident = new Set<number>();
+    for (const hc of held) {
+      if (!hc) continue;
+      const dur = m.sampleSeconds(hc.sample, hc.note);
+      if (dur === Infinity || t - hc.tOn < dur) {
+        const o = m.offsetOf(hc.sample);
+        if (o >= 0) resident.add(o);
+      }
+    }
+    // forward window: samples triggered within WIN seconds from N
+    {
+      let tw = 0,
+        sp = speed,
+        tp = tempo;
+      const fl = latch.slice();
+      for (let pi = vi; pi < m.orderPats.length && tw < WIN; pi++) {
+        const ev = m.decode(m.orderPats[pi].pat);
+        const rows = ev ? ev.rows : 64;
+        let ei = 0;
+        for (let row = 0; row < rows && tw < WIN; row++) {
+          if (ev)
+            while (ei < ev.events.length && ev.events[ei].row === row) {
+              const e = ev.events[ei++];
+              if (e.setSpeed) sp = e.setSpeed;
+              if (e.setTempo) tp = e.setTempo;
+              if (e.explicitSample >= 0) fl[e.ch] = e.explicitSample;
+              if (e.hasNote) {
+                const s = e.explicitSample >= 0 ? e.explicitSample : fl[e.ch];
+                const o = m.offsetOf(s);
+                if (o >= 0) resident.add(o);
+              }
+            }
+          tw += ROWSEC(sp, tp);
+        }
+      }
+    }
+    checkpoints.push({ order: N, residentOffsets: [...resident].sort((a, c) => a - c) });
+  }
+
+  // segment0 = the first played order's triggered samples.
+  const segment0 = new Set<number>();
+  if (m.orderPats.length) {
+    const ev = m.decode(m.orderPats[0].pat);
+    const latch: number[] = new Array(m.numChannels).fill(-1);
+    if (ev)
+      for (const e of ev.events) {
+        if (e.explicitSample >= 0) latch[e.ch] = e.explicitSample;
+        if (e.hasNote) {
+          const s = e.explicitSample >= 0 ? e.explicitSample : latch[e.ch];
+          const o = m.offsetOf(s);
+          if (o >= 0) segment0.add(o);
+        }
+      }
+  }
+
+  return {
+    orderSeconds,
+    segment0Offsets: [...segment0].sort((a, c) => a - c),
+    checkpoints,
+  };
+}
+
+const DUR_PAD = 1.3; // conservative pad on non-loop durations (pitch-ref slack)
 
 /** Full IT-family tables: timing map + segment0 + cold-seek checkpoints. */
 function computeItTables(b: Uint8Array): SeekTables | null {
@@ -304,8 +459,6 @@ function computeItTables(b: Uint8Array): SeekTables | null {
   }
 
   const validOrders = orderSeconds.map((x) => x.order);
-  const WIN = 0.5; // first-audio window seconds (lab SHORT)
-  const MAX_CHECKPOINTS = 512; // cap manifest growth for pathological order lists
   const stride = Math.max(1, Math.ceil(validOrders.length / MAX_CHECKPOINTS));
 
   for (let vi = 0; vi < validOrders.length; vi += stride) {
@@ -394,71 +547,113 @@ function computeItTables(b: Uint8Array): SeekTables | null {
   };
 }
 
-// --- MOD (ProTracker) segment0 (ported from lab/mod-repack.mjs) ----------------
-// Sample data is concatenated after the patterns in sample order; each cell is 4
-// bytes, sample number = (b0 & 0xf0) | (b2 >> 4), period = ((b0 & 0xf) << 8) | b1.
-// A cell with a period but sample 0 reuses the channel's last sample.
-function modSegment0(b: Uint8Array): SeekTables | null {
+
+// --- MOD (ProTracker) full tables ----------------------------------------------
+// Sample data is concatenated after the patterns in sample order; each 4-byte
+// cell: sample = (b0&0xf0)|(b2>>4), period = ((b0&0xf)<<8)|b1, effect = b2&0xf /
+// b3. A period with sample 0 reuses the channel's latched sample. Duration uses
+// the period directly (PAL paula rate), so MOD needs no pitch reference.
+function modTables(b: Uint8Array): SeekTables | null {
   if (b.length < 1084) return null;
   const ch = modChannels(tag4(b, 1080));
-  if (!ch) return null; // 15-sample / unknown variants -> file order
-
-  const lens: number[] = [];
-  for (let i = 0; i < 31; i++) lens.push(u16be(b, 20 + i * 30 + 22) * 2);
+  if (!ch) return null;
+  const songLen = b[950];
   let maxPat = 0;
   for (let i = 0; i < 128; i++) if (b[952 + i] > maxPat) maxPat = b[952 + i];
   const rowBytes = 64 * ch * 4;
   const smpDataStart = 1084 + (maxPat + 1) * rowBytes;
 
-  // Per-sample PCM offsets, mirroring parse.ts extractMOD exactly (samples with
-  // <= 2 bytes contribute no data and don't advance the cursor).
+  const frames = new Array(31).fill(0);
+  const loops = new Array(31).fill(false);
   const offsetOf = new Array(31).fill(-1);
   {
     let off = smpDataStart;
     for (let i = 0; i < 31; i++) {
-      const n = lens[i];
+      const n = u16be(b, 20 + i * 30 + 22) * 2;
+      const replen = u16be(b, 20 + i * 30 + 28);
       if (n <= 2) continue;
+      frames[i] = n; // 8-bit mono -> 1 byte/frame
+      loops[i] = replen > 1;
       offsetOf[i] = off;
-      if (off + n > b.length) break; // last sample clamped to EOF
+      if (off + n > b.length) {
+        frames[i] = b.length - off;
+        break;
+      }
       off += n;
     }
   }
 
-  const ord0 = b[952]; // first order entry
-  if (ord0 > maxPat) return seg0Only([]);
-  const patBase = 1084 + ord0 * rowBytes;
-  if (patBase + rowBytes > b.length) return null;
+  const orderPats: { order: number; pat: number }[] = [];
+  for (let i = 0; i < songLen && i < 128; i++) {
+    const pat = b[952 + i];
+    if (pat <= maxPat) orderPats.push({ order: i, pat });
+  }
 
-  const used = new Set<number>();
-  const lastSample = new Array(ch).fill(-1);
-  for (let row = 0; row < 64; row++) {
-    for (let c = 0; c < ch; c++) {
-      const cell = patBase + (row * ch + c) * 4;
-      const s = (b[cell] & 0xf0) | (b[cell + 2] >> 4);
-      const period = ((b[cell] & 0x0f) << 8) | b[cell + 1];
-      if (s > 0) lastSample[c] = s - 1;
-      if (period > 0 || s > 0) {
-        const si = s > 0 ? s - 1 : lastSample[c];
-        if (si >= 0 && offsetOf[si] >= 0) used.add(offsetOf[si]);
+  const cache = new Map<number, { rows: number; events: SimEvent[] }>();
+  const decode = (pat: number) => {
+    let e = cache.get(pat);
+    if (e) return e;
+    const base = 1084 + pat * rowBytes;
+    const events: SimEvent[] = [];
+    if (base + rowBytes <= b.length) {
+      for (let row = 0; row < 64; row++) {
+        for (let c = 0; c < ch; c++) {
+          const cell = base + (row * ch + c) * 4;
+          const sample = (b[cell] & 0xf0) | (b[cell + 2] >> 4);
+          const period = ((b[cell] & 0x0f) << 8) | b[cell + 1];
+          const cmd = b[cell + 2] & 0x0f;
+          const param = b[cell + 3];
+          let setSpeed = 0,
+            setTempo = 0;
+          if (cmd === 0x0f && param > 0) {
+            if (param < 0x20) setSpeed = param;
+            else setTempo = param;
+          }
+          const hasNote = period > 0;
+          const explicitSample = sample > 0 ? sample - 1 : -1;
+          if (hasNote || explicitSample >= 0 || setSpeed || setTempo)
+            events.push({ row, ch: c, explicitSample, hasNote, note: period, off: false, setSpeed, setTempo });
+        }
       }
     }
-  }
-  return seg0Only([...used]);
+    e = { rows: 64, events };
+    cache.set(pat, e);
+    return e;
+  };
+
+  return simulateTables({
+    orderPats,
+    speed0: 6,
+    tempo0: 125,
+    numChannels: ch,
+    decode,
+    offsetOf: (s) => (s >= 0 && s < 31 ? offsetOf[s] : -1),
+    sampleSeconds: (s, period) => {
+      if (s < 0 || s >= 31 || frames[s] === 0) return 0;
+      if (loops[s]) return Infinity;
+      if (period <= 0) return Infinity; // unknown pitch -> keep resident (safe)
+      return ((frames[s] * period) / 3546895) * DUR_PAD; // PAL paula clock
+    },
+  });
 }
 
-// --- S3M (ScreamTracker 3) segment0 --------------------------------------------
-// Sample-mode: a row event's instrument number IS the 1-based sample. Patterns
-// are packed: per row, bytes until a 0 terminator; flags select note+instrument
-// (2 bytes), volume (1), command (2). PCM offset comes from the sample header's
-// parapointer (matching parse.ts extractS3M), so it's read straight from disk.
-function s3mSegment0(b: Uint8Array): SeekTables | null {
+// --- S3M (ScreamTracker 3) full tables -----------------------------------------
+// Sample-mode: a cell's instrument number IS the 1-based sample. Packed pattern:
+// per row, bytes until a 0 terminator; flags select note+instrument (2), volume
+// (1), command (2). Effect A (1) sets speed, T (20) sets tempo. C2SPD drives the
+// per-note rate (ref C-5 = semitone 60, as IT).
+function s3mTables(b: Uint8Array): SeekTables | null {
   if (b.length < 0x60 || tag4(b, 0x2c) !== "SCRM") return null;
   const ordNum = u16(b, 0x20),
     insNum = u16(b, 0x22);
-  const ordBase = 0x60;
-  const paraInsBase = ordBase + ordNum; // instrument parapointers (2 bytes each)
-  const paraPatBase = paraInsBase + insNum * 2; // pattern parapointers
+  const speed0 = b[0x31] || 6,
+    tempo0 = b[0x32] || 125;
+  const paraInsBase = 0x60 + ordNum;
+  const paraPatBase = paraInsBase + insNum * 2;
 
+  const frames = new Array(insNum).fill(0);
+  const c2spd = new Array(insNum).fill(8363);
+  const loops = new Array(insNum).fill(false);
   const offsetOf = new Array(insNum).fill(-1);
   for (let i = 0; i < insNum; i++) {
     const pp = u16(b, paraInsBase + i * 2);
@@ -467,59 +662,100 @@ function s3mSegment0(b: Uint8Array): SeekTables | null {
     if (off + 0x50 > b.length || b[off] !== 1) continue; // type 1 = PCM
     const ptr = ((b[off + 0x0d] << 16) | u16(b, off + 0x0e)) * 16;
     const len = u32(b, off + 0x10);
-    if (len && ptr) offsetOf[i] = ptr;
+    const flg = b[off + 0x1f];
+    const spd = u32(b, off + 0x20) || 8363;
+    if (!len || !ptr) continue;
+    frames[i] = len; // length is in frames
+    c2spd[i] = spd;
+    loops[i] = !!(flg & 1);
+    offsetOf[i] = ptr < b.length ? ptr : -1;
   }
 
-  // First played order (skip 254 = marker, 255 = end).
-  let firstPat = -1;
-  for (let k = 0; k < ordNum; k++) {
-    const o = b[ordBase + k];
-    if (o < 254) {
-      firstPat = o;
-      break;
-    }
+  const orderPats: { order: number; pat: number }[] = [];
+  for (let i = 0; i < ordNum; i++) {
+    const o = b[0x60 + i];
+    if (o < 254) orderPats.push({ order: i, pat: o });
   }
-  if (firstPat < 0) return seg0Only([]);
-  const ppat = u16(b, paraPatBase + firstPat * 2);
-  if (!ppat) return seg0Only([]);
-  const po = ppat * 16;
-  if (po + 2 > b.length) return null;
 
-  const used = new Set<number>();
-  const lastIns = new Array(32).fill(-1);
-  const packLen = u16(b, po);
-  let p = po + 2;
-  const end = Math.min(po + 2 + packLen, b.length);
-  let row = 0;
-  while (p < end && row < 64) {
-    const what = b[p++];
-    if (what === 0) {
-      row++;
-      continue;
-    }
-    const chan = what & 31;
-    if (what & 32) {
-      const note = b[p++];
-      const ins = b[p++];
-      if (ins > 0) lastIns[chan] = ins - 1;
-      if (note < 254) {
-        const si = ins > 0 ? ins - 1 : lastIns[chan];
-        if (si >= 0 && si < insNum && offsetOf[si] >= 0) used.add(offsetOf[si]);
+  const cache = new Map<number, { rows: number; events: SimEvent[] }>();
+  const decode = (pat: number) => {
+    let e = cache.get(pat);
+    if (e) return e;
+    const events: SimEvent[] = [];
+    const ppat = u16(b, paraPatBase + pat * 2);
+    if (ppat) {
+      const po = ppat * 16;
+      if (po + 2 <= b.length) {
+        const packLen = u16(b, po);
+        let p = po + 2;
+        const end = Math.min(po + 2 + packLen, b.length);
+        let row = 0;
+        while (p < end && row < 64) {
+          const what = b[p++];
+          if (what === 0) {
+            row++;
+            continue;
+          }
+          const chan = what & 31;
+          let note = -1,
+            ins = 0,
+            cmd = 0,
+            info = 0,
+            hasCmd = false;
+          if (what & 32) {
+            note = b[p++];
+            ins = b[p++];
+          }
+          if (what & 64) p++; // volume column
+          if (what & 128) {
+            cmd = b[p++];
+            info = b[p++];
+            hasCmd = true;
+          }
+          let setSpeed = 0,
+            setTempo = 0;
+          if (hasCmd) {
+            if (cmd === 1 && info) setSpeed = info; // A: set speed
+            else if (cmd === 20 && info >= 0x20) setTempo = info; // T: set tempo
+          }
+          const off = note === 254 || note === 255; // cut / off
+          const hasNote = note >= 0 && note < 254;
+          const noteNum = hasNote ? (note >> 4) * 12 + (note & 0x0f) : 0;
+          const explicitSample = ins > 0 ? ins - 1 : -1;
+          if (hasNote || explicitSample >= 0 || off || setSpeed || setTempo)
+            events.push({ row, ch: chan, explicitSample, hasNote, note: noteNum, off, setSpeed, setTempo });
+        }
       }
     }
-    if (what & 64) p++; // volume column
-    if (what & 128) p += 2; // command + info
-  }
-  return seg0Only([...used]);
+    e = { rows: 64, events };
+    cache.set(pat, e);
+    return e;
+  };
+
+  return simulateTables({
+    orderPats,
+    speed0,
+    tempo0,
+    numChannels: 32,
+    decode,
+    offsetOf: (s) => (s >= 0 && s < insNum ? offsetOf[s] : -1),
+    sampleSeconds: (s, noteNum) => {
+      if (s < 0 || s >= insNum || frames[s] === 0) return 0;
+      if (loops[s]) return Infinity;
+      const rate = c2spd[s] * Math.pow(2, (noteNum - 60) / 12);
+      return rate > 0 ? (frames[s] / rate) * DUR_PAD : Infinity;
+    },
+  });
 }
 
-// --- XM (FastTracker 2) segment0 -----------------------------------------------
-// Instrument-based: a (note, instrument) plays a sample via the instrument's
-// note->sample map. We take the SAFE over-approximation — include every sample
-// of any instrument triggered in the first pattern — which avoids decoding the
-// keyboard map (most XM instruments have one sample anyway). Offsets mirror
-// parse.ts extractXM (samples concatenated per instrument, in order).
-function xmSegment0(b: Uint8Array): SeekTables | null {
+// --- XM (FastTracker 2) full tables --------------------------------------------
+// Instrument-based: (note, instrument) -> sample via the instrument's 96-byte
+// note->sample keymap; samples are numbered sequentially across instruments (the
+// global slot). Effect F (0x0f) sets speed (<0x20) or BPM (>=0x20). Duration uses
+// the XM linear-frequency period (relative note + finetune). Note-without-
+// instrument falls back to the channel's latched sample (engine), an accepted
+// approximation for multi-sampled instruments.
+function xmTables(b: Uint8Array): SeekTables | null {
   if (b.length < 80 || tag4(b, 0) !== "Exte") return null;
   const headerSize = u32(b, 60);
   const songLen = u16(b, 64);
@@ -527,8 +763,9 @@ function xmSegment0(b: Uint8Array): SeekTables | null {
   const npat = u16(b, 70),
     nins = u16(b, 72);
   if (!numCh || numCh > 64) return null;
+  const speed0 = u16(b, 76) || 6,
+    tempo0 = u16(b, 78) || 125;
 
-  // Walk pattern headers, recording each pattern's packed-data start/rows/size.
   let pos = 60 + headerSize;
   const pats: { dataStart: number; rows: number; packed: number }[] = [];
   for (let p = 0; p < npat; p++) {
@@ -540,88 +777,144 @@ function xmSegment0(b: Uint8Array): SeekTables | null {
     pos += phLen + packed;
   }
 
-  // Walk instruments, recording each instrument's sample PCM offsets (mirror of
-  // parse.ts extractXM: per-instrument sample headers then concatenated data).
-  const instSamples: number[][] = [];
+  // Global sample arrays + per-instrument firstSlot/keymap (sequential slots).
+  const sFrames: number[] = [],
+    sLoops: boolean[] = [],
+    sRel: number[] = [],
+    sFine: number[] = [],
+    sOff: number[] = [];
+  const insFirst: number[] = [],
+    insKeymap: Uint8Array[] = [];
   for (let ins = 0; ins < nins; ins++) {
     if (pos + 29 > b.length) break;
     const instStart = pos;
     const instSize = u32(b, pos);
     const numSamp = u16(b, pos + 27);
+    insFirst.push(sFrames.length);
     if (numSamp === 0) {
-      instSamples.push([]);
+      insKeymap.push(new Uint8Array(96));
       pos = instStart + instSize;
       continue;
     }
     const shSize = u32(b, pos + 29);
+    const km = b.subarray(instStart + 33, instStart + 33 + 96);
+    insKeymap.push(km.length === 96 ? new Uint8Array(km) : new Uint8Array(96));
     let hdr = instStart + instSize;
-    const lens: number[] = [];
+    const meta: { len: number; bits: number; rel: number; fine: number; loop: boolean }[] = [];
     for (let s = 0; s < numSamp; s++) {
       if (hdr + 18 > b.length) break;
-      lens.push(u32(b, hdr));
+      const len = u32(b, hdr);
+      const fine = (b[hdr + 13] << 24) >> 24; // s8
+      const type = b[hdr + 14];
+      const rel = (b[hdr + 16] << 24) >> 24; // s8
+      meta.push({ len, bits: type & 0x10 ? 16 : 8, rel, fine, loop: (type & 3) !== 0 });
       hdr += shSize;
     }
     let data = hdr;
-    const offs: number[] = [];
-    for (let s = 0; s < lens.length; s++) {
-      const n = lens[s];
-      if (n > 0 && data + n <= b.length) offs.push(data);
-      data += n;
+    for (const mt of meta) {
+      const bpf = mt.bits / 8;
+      sFrames.push(mt.len > 0 ? mt.len / bpf : 0);
+      sLoops.push(mt.loop);
+      sRel.push(mt.rel);
+      sFine.push(mt.fine);
+      sOff.push(mt.len > 0 && data + mt.len <= b.length ? data : -1);
+      data += mt.len;
     }
-    instSamples.push(offs);
     pos = data;
   }
 
-  // First played order (entries >= npat are skip markers).
-  let firstPat = -1;
-  for (let k = 0; k < songLen && k < 256; k++) {
-    const o = b[80 + k];
-    if (o < npat) {
-      firstPat = o;
-      break;
-    }
+  const orderPats: { order: number; pat: number }[] = [];
+  for (let i = 0; i < songLen && i < 256; i++) {
+    const o = b[80 + i];
+    if (o < npat) orderPats.push({ order: i, pat: o });
   }
-  if (firstPat < 0 || firstPat >= pats.length) return seg0Only([]);
 
-  // Decode the XM pattern: row-major note slots. A leading byte with 0x80 set is
-  // a bit-mask of present fields; otherwise it IS the note and all 5 fields follow.
-  const pi = pats[firstPat];
-  const used = new Set<number>(); // instrument indices
-  const lastIns = new Array(numCh).fill(-1);
-  let p = pi.dataStart;
-  const end = Math.min(pi.dataStart + pi.packed, b.length);
-  for (let row = 0; row < pi.rows && p < end; row++) {
-    for (let c = 0; c < numCh && p < end; c++) {
-      let note = 0,
-        ins = 0,
-        hasNote = false,
-        hasIns = false;
-      const first = b[p++];
-      if (first & 0x80) {
-        if (first & 0x01) {
-          note = b[p++];
-          hasNote = true;
+  const cache = new Map<number, { rows: number; events: SimEvent[] }>();
+  const decode = (pat: number) => {
+    let e = cache.get(pat);
+    if (e) return e;
+    const pi = pats[pat];
+    const events: SimEvent[] = [];
+    if (pi) {
+      let p = pi.dataStart;
+      const end = Math.min(pi.dataStart + pi.packed, b.length);
+      for (let row = 0; row < pi.rows && p < end; row++) {
+        for (let c = 0; c < numCh && p < end; c++) {
+          let note = 0,
+            ins = 0,
+            hasNoteByte = false,
+            hasIns = false,
+            efftype = 0,
+            effparam = 0,
+            hasEff = false;
+          const first = b[p++];
+          if (first & 0x80) {
+            if (first & 0x01) {
+              note = b[p++];
+              hasNoteByte = true;
+            }
+            if (first & 0x02) {
+              ins = b[p++];
+              hasIns = true;
+            }
+            if (first & 0x04) p++; // volume
+            if (first & 0x08) {
+              efftype = b[p++];
+              hasEff = true;
+            }
+            if (first & 0x10) {
+              effparam = b[p++];
+              hasEff = true;
+            }
+          } else {
+            note = first;
+            hasNoteByte = true;
+            ins = b[p++];
+            hasIns = true;
+            p++; // volume
+            efftype = b[p++];
+            effparam = b[p++];
+            hasEff = true;
+          }
+          let setSpeed = 0,
+            setTempo = 0;
+          if (hasEff && efftype === 0x0f) {
+            if (effparam < 0x20) setSpeed = effparam;
+            else setTempo = effparam;
+          }
+          const off = note === 97; // key off
+          const hasNote = hasNoteByte && note > 0 && note < 97;
+          let explicitSample = -1;
+          if (hasNote && hasIns && ins > 0 && ins <= nins) {
+            const map = insKeymap[ins - 1];
+            const local = map ? map[note - 1] : 0;
+            explicitSample = insFirst[ins - 1] + local;
+            if (explicitSample >= sFrames.length) explicitSample = -1;
+          }
+          const noteNum = hasNote ? note : 0;
+          if (hasNote || explicitSample >= 0 || off || setSpeed || setTempo)
+            events.push({ row, ch: c, explicitSample, hasNote, note: noteNum, off, setSpeed, setTempo });
         }
-        if (first & 0x02) {
-          ins = b[p++];
-          hasIns = true;
-        }
-        if (first & 0x04) p++; // volume
-        if (first & 0x08) p++; // effect type
-        if (first & 0x10) p++; // effect param
-      } else {
-        note = first;
-        hasNote = true;
-        ins = b[p++];
-        hasIns = true;
-        p += 3; // volume, effect type, effect param
-      }
-      if (hasIns && ins > 0) lastIns[c] = ins - 1;
-      if (hasNote && note > 0 && note < 97) {
-        const ii = hasIns && ins > 0 ? ins - 1 : lastIns[c];
-        if (ii >= 0 && ii < instSamples.length) for (const o of instSamples[ii]) used.add(o);
       }
     }
-  }
-  return seg0Only([...used]);
+    e = { rows: pi ? pi.rows : 64, events };
+    cache.set(pat, e);
+    return e;
+  };
+
+  return simulateTables({
+    orderPats,
+    speed0,
+    tempo0,
+    numChannels: numCh,
+    decode,
+    offsetOf: (s) => (s >= 0 && s < sOff.length ? sOff[s] : -1),
+    sampleSeconds: (s, note) => {
+      if (s < 0 || s >= sFrames.length || sFrames[s] === 0) return 0;
+      if (sLoops[s]) return Infinity;
+      const period = 7680 - (note - 1 + sRel[s]) * 64 - sFine[s] / 2; // XM linear
+      const rate = 8363 * Math.pow(2, (4608 - period) / 768);
+      return rate > 0 ? (sFrames[s] / rate) * DUR_PAD : Infinity;
+    },
+  });
 }
