@@ -38,6 +38,15 @@ export interface LibOpenMPT {
   _openmpt_module_get_num_patterns(mod: number): number;
   _openmpt_module_get_num_orders(mod: number): number;
   _openmpt_module_get_num_samples(mod: number): number;
+  // trackerstream streaming fork: patch decoded PCM into an immortal instance.
+  _openmpt_module_provide_sample(
+    mod: number, sampleIndex: number, data: number, frames: number,
+  ): number;
+  _openmpt_module_is_sample_pending(mod: number, sampleIndex: number): number;
+  // Debug/harness only: decoded ModSample buffer pointer + its byte size.
+  _openmpt_module_debug_sample_data(mod: number, sampleIndex: number): number;
+  _openmpt_module_debug_sample_bytes(mod: number, sampleIndex: number): number;
+  _openmpt_module_debug_sample_frames(mod: number, sampleIndex: number): number;
   _openmpt_module_get_num_channels(mod: number): number;
   _openmpt_module_get_num_instruments(mod: number): number;
   _openmpt_module_get_num_subsongs(mod: number): number;

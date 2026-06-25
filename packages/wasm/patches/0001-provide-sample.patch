@@ -1,0 +1,204 @@
+diff --git a/libopenmpt/libopenmpt.h b/libopenmpt/libopenmpt.h
+index f06e8ac..f7e2bfd 100644
+--- a/libopenmpt/libopenmpt.h
++++ b/libopenmpt/libopenmpt.h
+@@ -1305,6 +1305,52 @@ LIBOPENMPT_API int32_t openmpt_module_get_num_instruments( openmpt_module * mod
+  */
+ LIBOPENMPT_API int32_t openmpt_module_get_num_samples( openmpt_module * mod );
+ 
++/*! \brief Overwrite one sample's decoded PCM in place (trackerstream streaming fork)
++ *
++ * Copies \a frames frames of native-layout decoded PCM (matching the ModSample's
++ * bit depth / channel interleave exactly) over the already-allocated sample
++ * buffer of sample \a sample_index, then rebuilds that sample's loop /
++ * interpolation lookahead. The sample must already have been allocated at this
++ * exact length by the loader (the streaming "skeleton" declares uncompressed PCM
++ * of the decoded length). Must be called single-threaded with respect to
++ * rendering (e.g. from the worklet between process() quanta).
++ *
++ * \param mod The module handle to work on.
++ * \param sample_index The 1-based sample slot to patch.
++ * \param data Native-layout decoded PCM, \a frames frames long.
++ * \param frames Number of frames; must equal the sample's declared length.
++ * \return 1 on success, 0 on failure (bad index, unallocated slot, length mismatch).
++ */
++LIBOPENMPT_API int openmpt_module_provide_sample( openmpt_module * mod, int32_t sample_index, const void * data, size_t frames );
++/*! \brief Query whether a sample still needs its PCM provided (trackerstream fork)
++ *
++ * \param mod The module handle to work on.
++ * \param sample_index The 1-based sample slot to query.
++ * \return 1 if the sample has not yet been provided via openmpt_module_provide_sample, 0 otherwise.
++ */
++LIBOPENMPT_API int openmpt_module_is_sample_pending( openmpt_module * mod, int32_t sample_index );
++/*! \brief Debug/harness only: pointer to a sample's decoded PCM buffer (trackerstream fork)
++ *
++ * \param mod The module handle to work on.
++ * \param sample_index The 1-based sample slot.
++ * \return Pointer to the native-layout decoded PCM, or NULL on error.
++ */
++LIBOPENMPT_API const void * openmpt_module_debug_sample_data( openmpt_module * mod, int32_t sample_index );
++/*! \brief Debug/harness only: byte size of a sample's decoded PCM buffer (trackerstream fork)
++ *
++ * \param mod The module handle to work on.
++ * \param sample_index The 1-based sample slot.
++ * \return Number of bytes (frames * bytes-per-frame), or 0 on error.
++ */
++LIBOPENMPT_API size_t openmpt_module_debug_sample_bytes( openmpt_module * mod, int32_t sample_index );
++/*! \brief Debug/harness only: frame count (nLength) of a sample (trackerstream fork)
++ *
++ * \param mod The module handle to work on.
++ * \param sample_index The 1-based sample slot.
++ * \return Number of frames, or 0 on error.
++ */
++LIBOPENMPT_API size_t openmpt_module_debug_sample_frames( openmpt_module * mod, int32_t sample_index );
++
+ /*! \brief Get a sub-song name
+  *
+  * \param mod The module handle to work on.
+diff --git a/libopenmpt/libopenmpt_c.cpp b/libopenmpt/libopenmpt_c.cpp
+index 99a8580..f45ba1e 100644
+--- a/libopenmpt/libopenmpt_c.cpp
++++ b/libopenmpt/libopenmpt_c.cpp
+@@ -839,6 +839,51 @@ double openmpt_module_set_position_order_row( openmpt_module * mod, int32_t orde
+ 	return 0.0;
+ }
+ 
++int openmpt_module_provide_sample( openmpt_module * mod, int32_t sample_index, const void * data, size_t frames ) {
++	try {
++		openmpt::interface::check_soundfile( mod );
++		return mod->impl->provide_sample( sample_index, data, frames ) ? 1 : 0;
++	} catch ( ... ) {
++		openmpt::report_exception( __func__, mod );
++	}
++	return 0;
++}
++int openmpt_module_is_sample_pending( openmpt_module * mod, int32_t sample_index ) {
++	try {
++		openmpt::interface::check_soundfile( mod );
++		return mod->impl->is_sample_pending( sample_index ) ? 1 : 0;
++	} catch ( ... ) {
++		openmpt::report_exception( __func__, mod );
++	}
++	return 0;
++}
++const void * openmpt_module_debug_sample_data( openmpt_module * mod, int32_t sample_index ) {
++	try {
++		openmpt::interface::check_soundfile( mod );
++		return mod->impl->debug_sample_data( sample_index );
++	} catch ( ... ) {
++		openmpt::report_exception( __func__, mod );
++	}
++	return 0;
++}
++size_t openmpt_module_debug_sample_bytes( openmpt_module * mod, int32_t sample_index ) {
++	try {
++		openmpt::interface::check_soundfile( mod );
++		return mod->impl->debug_sample_bytes( sample_index );
++	} catch ( ... ) {
++		openmpt::report_exception( __func__, mod );
++	}
++	return 0;
++}
++size_t openmpt_module_debug_sample_frames( openmpt_module * mod, int32_t sample_index ) {
++	try {
++		openmpt::interface::check_soundfile( mod );
++		return mod->impl->debug_sample_frames( sample_index );
++	} catch ( ... ) {
++		openmpt::report_exception( __func__, mod );
++	}
++	return 0;
++}
+ int openmpt_module_get_render_param( openmpt_module * mod, int param, int32_t * value ) {
+ 	try {
+ 		openmpt::interface::check_soundfile( mod );
+diff --git a/libopenmpt/libopenmpt_impl.cpp b/libopenmpt/libopenmpt_impl.cpp
+index f959296..913b388 100644
+--- a/libopenmpt/libopenmpt_impl.cpp
++++ b/libopenmpt/libopenmpt_impl.cpp
+@@ -1425,6 +1425,56 @@ std::int32_t module_impl::get_num_instruments() const {
+ std::int32_t module_impl::get_num_samples() const {
+ 	return m_sndFile->GetNumSamples();
+ }
++bool module_impl::provide_sample( std::int32_t index, const void * data, std::size_t frames ) {
++	// trackerstream streaming fork: patch decoded PCM into an immortal instance.
++	if ( !data ) {
++		return false;
++	}
++	if ( index < 1 || index > m_sndFile->GetNumSamples() ) {
++		return false;
++	}
++	OpenMPT::ModSample & smp = m_sndFile->GetSample( static_cast<OpenMPT::SAMPLEINDEX>( index ) );
++	// The skeleton's stock load already allocated the full-length, guard-padded
++	// buffer; provide_sample must match that declared length exactly.
++	if ( smp.sampleb() == nullptr || smp.nLength == 0 ) {
++		return false;
++	}
++	if ( frames != static_cast<std::size_t>( smp.nLength ) ) {
++		return false;
++	}
++	std::memcpy( smp.sampleb(), data, smp.GetSampleSizeInBytes() );
++	// Rebuild the interpolation guard / loop wrap-around buffers for the new PCM.
++	smp.PrecomputeLoops( *m_sndFile, false );
++	if ( m_sample_provided.size() <= static_cast<std::size_t>( index ) ) {
++		m_sample_provided.resize( static_cast<std::size_t>( m_sndFile->GetNumSamples() ) + 1, false );
++	}
++	m_sample_provided[ index ] = true;
++	return true;
++}
++bool module_impl::is_sample_pending( std::int32_t index ) const {
++	if ( index < 1 || index > m_sndFile->GetNumSamples() ) {
++		return false;
++	}
++	return index >= static_cast<std::int32_t>( m_sample_provided.size() ) || !m_sample_provided[ index ];
++}
++const void * module_impl::debug_sample_data( std::int32_t index ) const {
++	if ( index < 1 || index > m_sndFile->GetNumSamples() ) {
++		return nullptr;
++	}
++	return m_sndFile->GetSample( static_cast<OpenMPT::SAMPLEINDEX>( index ) ).samplev();
++}
++std::size_t module_impl::debug_sample_bytes( std::int32_t index ) const {
++	if ( index < 1 || index > m_sndFile->GetNumSamples() ) {
++		return 0;
++	}
++	return m_sndFile->GetSample( static_cast<OpenMPT::SAMPLEINDEX>( index ) ).GetSampleSizeInBytes();
++}
++std::size_t module_impl::debug_sample_frames( std::int32_t index ) const {
++	if ( index < 1 || index > m_sndFile->GetNumSamples() ) {
++		return 0;
++	}
++	return m_sndFile->GetSample( static_cast<OpenMPT::SAMPLEINDEX>( index ) ).nLength;
++}
+ 
+ std::vector<std::string> module_impl::get_subsong_names() const {
+ 	std::vector<std::string> retval;
+diff --git a/libopenmpt/libopenmpt_impl.hpp b/libopenmpt/libopenmpt_impl.hpp
+index dab6981..ffb93a3 100644
+--- a/libopenmpt/libopenmpt_impl.hpp
++++ b/libopenmpt/libopenmpt_impl.hpp
+@@ -151,6 +151,8 @@ protected:
+ 	bool m_ctl_load_skip_subsongs_init;
+ 	bool m_ctl_seek_sync_samples;
+ 	std::vector<std::string> m_loaderMessages;
++	// trackerstream: per-sample "PCM has been provided" flags (1-indexed, lazily sized).
++	std::vector<bool> m_sample_provided;
+ public:
+ 	void PushToCSoundFileLog( const std::string & text ) const;
+ 	void PushToCSoundFileLog( int loglevel, const std::string & text ) const;
+@@ -244,6 +246,16 @@ public:
+ 	std::int32_t get_num_patterns() const;
+ 	std::int32_t get_num_instruments() const;
+ 	std::int32_t get_num_samples() const;
++	// trackerstream streaming fork: overwrite one sample's decoded PCM in place
++	// (memcpy into the already-allocated, guard-padded ModSample buffer + rebuild
++	// loop/interpolation lookahead). Single-threaded vs the mixer by contract.
++	bool provide_sample( std::int32_t index, const void * data, std::size_t frames );
++	bool is_sample_pending( std::int32_t index ) const;
++	// Debug/harness only: expose the decoded ModSample buffer + its byte size so a
++	// parity harness can dump native-layout PCM to re-provide it.
++	const void * debug_sample_data( std::int32_t index ) const;
++	std::size_t debug_sample_bytes( std::int32_t index ) const;
++	std::size_t debug_sample_frames( std::int32_t index ) const;
+ 	std::vector<std::string> get_subsong_names() const;
+ 	std::vector<std::string> get_channel_names() const;
+ 	std::vector<std::string> get_order_names() const;
