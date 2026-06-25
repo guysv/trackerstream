@@ -57,35 +57,43 @@ export class Fence {
     return true;
   }
 
-  private unionFrom(i: number, span: number): number[] {
+  // Union of checkpoint sample-sets over indices [start, end] (clamped to valid
+  // range). start may be -1 (before the first checkpoint) -> clamps to 0.
+  private unionRange(start: number, end: number): number[] {
     const set = new Set<number>();
-    const end = Math.min(i + span, this.cps.length - 1);
-    for (let k = i; k <= end; k++) for (const s of this.cps[k].samples) set.add(s);
+    const lo = Math.max(0, start);
+    const hi = Math.min(end, this.cps.length - 1);
+    for (let k = lo; k <= hi; k++) for (const s of this.cps[k].samples) set.add(s);
     return [...set];
   }
 
-  /** Sample slots that must be resident to play at `order` (the floor checkpoint). */
+  /**
+   * Sample slots that must be resident to play at `order`. A render quantum can
+   * cross ONE checkpoint boundary mid-buffer (e.g. a Cxx/Bxx pattern jump out of a
+   * silent setup pattern), so this is the floor checkpoint UNION the next one —
+   * which also covers the pre-first-checkpoint case (floor = -1 -> the first cp).
+   */
   requiredAt(order: number): number[] {
     const i = this.floorIdx(order);
-    return i < 0 ? [] : this.cps[i].samples;
+    return this.unionRange(i, i + 1);
   }
 
   /**
    * May playback proceed at `order`? Mutates internal stall state so the caller
-   * can detect transitions (buffering on/off). Before the first checkpoint, or
-   * with no checkpoints, returns true (nothing to gate — those samples ride in the
-   * skeleton / there is nothing to wait for).
+   * can detect transitions (buffering on/off). With no checkpoints (or none in
+   * range that need samples) returns true — nothing to gate.
    */
   ready(order: number): boolean {
     const i = this.floorIdx(order);
-    if (i < 0) return true;
+    const base = this.unionRange(i, i + 1); // floor + next (boundary crossing)
+    if (base.length === 0) return true;
     if (!this.stalled) {
-      if (this.allProvided(this.cps[i].samples)) return true;
+      if (this.allProvided(base)) return true;
       this.stalled = true;
       return false;
     }
-    // Stalled: resume only when this checkpoint AND the lookahead margin are in.
-    if (this.allProvided(this.unionFrom(i, this.lookahead))) {
+    // Stalled: resume only when floor+next AND the lookahead margin are resident.
+    if (this.allProvided(this.unionRange(i, i + 1 + this.lookahead))) {
       this.stalled = false;
       return true;
     }

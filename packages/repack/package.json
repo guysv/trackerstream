@@ -15,7 +15,8 @@
     "test": "node test/roundtrip-fixtures.ts",
     "test:corpus": "node test/roundtrip.ts",
     "test:v2": "node test/provide-v2.ts",
-    "test:seek": "node test/seek-diff.ts"
+    "test:seek": "node test/seek-diff.ts",
+    "test:sim": "node test/stream-sim.ts"
   },
   "dependencies": {
     "@ipld/dag-cbor": "^9.2.1",
