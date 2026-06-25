@@ -266,6 +266,18 @@ Layers:
 Manifest gets `v: 2`; clients dispatch on it (v1 keeps the recreate path).
 Schema draft is the first concrete deliverable of Phase 2 (lock before coding).
 
+> **Schema locked — see `STREAMING-PARITY-V2-SCHEMA.md`.** Key refinements from
+> this section after grounding in v1: (1) **one key everywhere** — the 1-based
+> libopenmpt sample slot replaces v1's file-offset + `samples[]`-index seam;
+> (2) checkpoints are **full resident sets per strided order, NOT deltas**
+> (residency is non-monotonic — a sample audible at order 5 can be gone by 50, so
+> additive deltas can't reconstruct the minimal set); (3) checkpoint computation
+> **extends to MOD/S3M/XM** (v1 had it for IT/MPTM only — required for a mid-track
+> fence on the ~94%-of-corpus non-IT formats); (4) `segment0` folds into
+> `checkpoints[0]`; (5) leaf CIDs **inline into the sample table** (the `pcmRoot`
+> indirection is dropped), spilling to a separate `indexRoot` object only above a
+> size threshold.
+
 ## 2.2 Client — immortal instance + provide-sample (`player.worklet.ts`)
 
 - Create once via `create_from_memory(skeleton)`. Never destroy/recreate.
@@ -387,9 +399,12 @@ Schema draft is the first concrete deliverable of Phase 2 (lock before coding).
 
 ## Decisions still open (pick before Phase 2 coding)
 
-- Exact v2 manifest schema (field names; pre-resolved leaf index inline vs
-  separate object).
-- Fence lookahead + rebuffer hysteresis threshold (orders vs seconds; default).
+- ~~Exact v2 manifest schema.~~ **Locked — `STREAMING-PARITY-V2-SCHEMA.md`**
+  (single sample-index key; full-resident-set checkpoints extended to all parsed
+  formats; inline index with size-threshold spill to `indexRoot`).
+- Fence lookahead + rebuffer hysteresis threshold (orders vs seconds; default
+  "next ~2–3 checkpoints resident"). Client-side tuning, not schema-blocking.
 - Small-module fast-path size cutoff.
+- `INDEX_SPILL_BYTES` final value (256 KiB provisional) — measure vs corpus.
 - ~~Patch-series vs vendored-source for the fork.~~ **Decided: patch-series**
   (`packages/wasm/patches/*.patch`, applied by `build.sh`).
