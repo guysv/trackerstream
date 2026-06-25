@@ -49,6 +49,16 @@ export class KuboRpc {
     await this.post(`pin/add?arg=${cid.toString()}&recursive=${recursive}`);
   }
 
+  /** Remove a recursive pin (used to drop a superseded root after a re-bake;
+   *  shared leaf blocks stay pinned under the new root). Tolerates "not pinned". */
+  async pinRm(cid: CID | string, recursive = true): Promise<void> {
+    try {
+      await this.post(`pin/rm?arg=${cid.toString()}&recursive=${recursive}`);
+    } catch (e) {
+      if (!String(e).includes("not pinned")) throw e; // already gone -> fine
+    }
+  }
+
   async swarmConnect(addr: string): Promise<void> {
     await this.post(`swarm/connect?arg=${encodeURIComponent(addr)}`);
   }
