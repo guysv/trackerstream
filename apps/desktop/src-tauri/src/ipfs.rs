@@ -29,6 +29,11 @@ const FETCH_CONCURRENCY: usize = 32;
 const MASTER_PEER_ID: &str = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL";
 
 fn master_provider() -> Option<PeerId> {
+    // TS_PROVIDER overrides the Bitswap provider hint (e.g. point the headless
+    // transport soak at a local kubo). Defaults to the always-on master.
+    if let Ok(s) = std::env::var("TS_PROVIDER") {
+        return s.parse().ok();
+    }
     MASTER_PEER_ID.parse().ok()
 }
 
