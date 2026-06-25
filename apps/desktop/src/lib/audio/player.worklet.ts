@@ -16,6 +16,13 @@ import {
   type ToWorklet,
 } from "./messages";
 
+// Crossfade length (frames) for recreate-on-grow during streaming. Each reload
+// destroys the module and recreates it from the larger buffer, then re-seeks to
+// the play position — the new module's channel/interpolation state isn't sample-
+// aligned with the old one, so a hard cut clicks. We render both across ~10ms and
+// equal-power crossfade, masking the discontinuity. Inaudible smear, no pop.
+const XFADE_FRAMES = 480; // ~10ms @ 48kHz
+
 // --- AudioWorkletGlobalScope ambient declarations ---
 declare const sampleRate: number;
 declare function registerProcessor(name: string, ctor: unknown): void;
@@ -73,6 +80,11 @@ class TrackerProcessor extends AudioWorkletProcessor {
   private numChannels = 0;
   private posCounter = 0;
   private pendingLoad: ArrayBuffer | null = null;
+  // Crossfade state for click-free recreate-on-grow (see XFADE_FRAMES).
+  private pendingMod = 0; // the freshly-recreated module being faded IN
+  private xfadePos = 0; // frames elapsed in the current crossfade
+  private xfL: Float32Array | null = null; // JS scratch for the outgoing render
+  private xfR: Float32Array | null = null;
 
   constructor() {
     super();
@@ -122,8 +134,12 @@ class TrackerProcessor extends AudioWorkletProcessor {
         else this.load(msg.bytes, false);
         break;
       case "reload":
-        // recreate-on-grow: swap in the larger buffer, keep playing where we are
-        if (lib && this.mod) this.load(msg.bytes, true);
+        // recreate-on-grow: while playing, crossfade the larger buffer in to
+        // avoid a click; otherwise (paused) just swap immediately.
+        if (lib && this.mod) {
+          if (this.playing) this.beginReload(msg.bytes);
+          else this.load(msg.bytes, true);
+        }
         break;
       case "play":
         this.playing = this.mod !== 0;
@@ -133,23 +149,23 @@ class TrackerProcessor extends AudioWorkletProcessor {
         break;
       case "stop":
         this.playing = false;
-        if (lib && this.mod) lib._openmpt_module_set_position_order_row(this.mod, 0, 0);
+        if (lib && this.cur()) lib._openmpt_module_set_position_order_row(this.cur(), 0, 0);
         break;
       case "seekOrderRow":
-        if (lib && this.mod) lib._openmpt_module_set_position_order_row(this.mod, msg.order, msg.row);
+        if (lib && this.cur()) lib._openmpt_module_set_position_order_row(this.cur(), msg.order, msg.row);
         break;
       case "seekSeconds":
-        if (lib && this.mod) lib._openmpt_module_set_position_seconds(this.mod, msg.seconds);
+        if (lib && this.cur()) lib._openmpt_module_set_position_seconds(this.cur(), msg.seconds);
         break;
       case "selectSubsong":
-        if (lib && this.mod) lib._openmpt_module_select_subsong(this.mod, msg.index);
+        if (lib && this.cur()) lib._openmpt_module_select_subsong(this.cur(), msg.index);
         break;
       case "setInterpolation":
-        if (lib && this.mod)
-          lib._openmpt_module_set_render_param(this.mod, RENDER_INTERPOLATIONFILTER_LENGTH, msg.value);
+        if (lib && this.cur())
+          lib._openmpt_module_set_render_param(this.cur(), RENDER_INTERPOLATIONFILTER_LENGTH, msg.value);
         break;
       case "setRepeat":
-        if (lib && this.mod) lib._openmpt_module_set_repeat_count(this.mod, msg.count);
+        if (lib && this.cur()) lib._openmpt_module_set_repeat_count(this.cur(), msg.count);
         break;
     }
   }
@@ -183,6 +199,61 @@ class TrackerProcessor extends AudioWorkletProcessor {
     this.send({ type: "loaded", info: this.info(mod) });
   }
 
+  // The module that control ops + position should target: the incoming one once
+  // a crossfade is in flight (that's where playback is headed), else the current.
+  private cur(): number {
+    return this.pendingMod || this.mod;
+  }
+
+  // Recreate-on-grow WITHOUT a click: build the larger module, seek it to the
+  // current play position, and stage it as `pendingMod`. process() then renders
+  // both and equal-power crossfades over XFADE_FRAMES before retiring the old one.
+  private beginReload(bytes: ArrayBuffer) {
+    const lib = this.lib!;
+    // If a previous crossfade hasn't finished, retire its old module now so we
+    // never juggle three at once (reloads are ~700ms apart, fades ~10ms).
+    if (this.pendingMod) {
+      lib._openmpt_module_destroy(this.mod);
+      this.mod = this.pendingMod;
+      this.pendingMod = 0;
+    }
+    const resumeSeconds = lib._openmpt_module_get_position_seconds(this.mod);
+    const arr = new Uint8Array(bytes);
+    const p = lib._malloc(arr.byteLength);
+    lib.HEAPU8.set(arr, p);
+    const mod = lib._openmpt_module_create_from_memory(p, arr.byteLength, 0, 0, 0);
+    lib._free(p);
+    if (!mod) {
+      this.send({ type: "error", message: "openmpt_module_create_from_memory failed" });
+      return;
+    }
+    lib._openmpt_module_set_render_param(mod, RENDER_INTERPOLATIONFILTER_LENGTH, SINC_INTERPOLATION);
+    lib._openmpt_module_set_repeat_count(mod, 0);
+    if (resumeSeconds > 0) lib._openmpt_module_set_position_seconds(mod, resumeSeconds);
+    this.numChannels = Math.max(this.numChannels, lib._openmpt_module_get_num_channels(mod));
+    this.pendingMod = mod;
+    this.xfadePos = 0;
+    this.send({ type: "loaded", info: this.info(mod) });
+  }
+
+  // Render `frames` of `mod` into the wasm scratch, copying to the given L/R JS
+  // buffers (zero-padded if the module returned fewer). Returns frames produced.
+  private renderInto(mod: number, frames: number, l: Float32Array, r: Float32Array): number {
+    const lib = this.lib!;
+    this.ensureBufs(frames);
+    const got = lib._openmpt_module_read_float_stereo(mod, sampleRate, frames, this.leftPtr, this.rightPtr);
+    if (got <= 0) return got;
+    const lh = this.leftPtr >> 2;
+    const rh = this.rightPtr >> 2;
+    l.set(lib.HEAPF32.subarray(lh, lh + got));
+    r.set(lib.HEAPF32.subarray(rh, rh + got), 0);
+    if (got < frames) {
+      l.fill(0, got);
+      r.fill(0, got);
+    }
+    return got;
+  }
+
   private info(mod: number): ModuleInfo {
     const lib = this.lib!;
     const tp = lib._openmpt_module_get_metadata(mod, this.cstr(lib, "type"));
@@ -212,24 +283,47 @@ class TrackerProcessor extends AudioWorkletProcessor {
       if (right !== left) right.fill(0);
       return true;
     }
-    this.ensureBufs(frames);
-    const got = lib._openmpt_module_read_float_stereo(
-      this.mod, sampleRate, frames, this.leftPtr, this.rightPtr,
-    );
-    if (got <= 0) {
-      left.fill(0);
-      if (right !== left) right.fill(0);
-      this.playing = false;
-      this.send({ type: "ended" });
-      return true;
-    }
-    const lh = this.leftPtr >> 2;
-    const rh = this.rightPtr >> 2;
-    left.set(lib.HEAPF32.subarray(lh, lh + got));
-    right.set(lib.HEAPF32.subarray(rh, rh + got));
-    if (got < frames) {
-      left.fill(0, got);
-      if (right !== left) right.fill(0, got);
+    if (this.pendingMod) {
+      // Crossfade: render outgoing into JS scratch, incoming into the output,
+      // then equal-power blend across XFADE_FRAMES. Masks the recreate click.
+      if (!this.xfL || this.xfL.length < frames) {
+        this.xfL = new Float32Array(frames);
+        this.xfR = new Float32Array(frames);
+      }
+      const gotOld = this.renderInto(this.mod, frames, this.xfL, this.xfR!);
+      const gotNew = this.renderInto(this.pendingMod, frames, left, right);
+      if (gotNew <= 0) {
+        left.fill(0);
+        if (right !== left) right.fill(0);
+        this.playing = false;
+        this.send({ type: "ended" });
+        return true;
+      }
+      for (let i = 0; i < frames; i++) {
+        let t = (this.xfadePos + i) / XFADE_FRAMES;
+        if (t > 1) t = 1;
+        const a = Math.cos((t * Math.PI) / 2); // outgoing gain
+        const b = Math.sin((t * Math.PI) / 2); // incoming gain
+        const ol = gotOld > 0 ? this.xfL[i] : 0;
+        const or = gotOld > 0 ? this.xfR![i] : 0;
+        left[i] = ol * a + left[i] * b;
+        if (right !== left) right[i] = or * a + right[i] * b;
+      }
+      this.xfadePos += frames;
+      if (this.xfadePos >= XFADE_FRAMES) {
+        lib._openmpt_module_destroy(this.mod);
+        this.mod = this.pendingMod;
+        this.pendingMod = 0;
+      }
+    } else {
+      const got = this.renderInto(this.mod, frames, left, right);
+      if (got <= 0) {
+        left.fill(0);
+        if (right !== left) right.fill(0);
+        this.playing = false;
+        this.send({ type: "ended" });
+        return true;
+      }
     }
     // Post position + VU ~45x/s (every ~4 quanta @128 frames/48kHz).
     if (++this.posCounter >= 4) {
@@ -241,7 +335,7 @@ class TrackerProcessor extends AudioWorkletProcessor {
 
   private position(): Position {
     const lib = this.lib!;
-    const mod = this.mod;
+    const mod = this.cur();
     const vu: number[] = new Array(this.numChannels);
     for (let i = 0; i < this.numChannels; i++)
       vu[i] = lib._openmpt_module_get_current_channel_vu_mono(mod, i);
