@@ -61,6 +61,11 @@ function listOuterZips(root: string): string[] {
   return out.sort();
 }
 
+// Sidecar/metadata files that ride alongside a module inside its inner zip (the
+// Mod Archive snapshot pairs each `name.ext` with a `name.ext.info` text file).
+// These are not modules — skip them so they never enter the ingest/stream path.
+const SIDECAR = /\.(info|txt|nfo|diz|readme|md|doc|jpg|jpeg|png|gif)$/i;
+
 export interface WalkOpts {
   formats?: string[]; // lowercase extensions to include (default: all)
   limit?: number; // stop after N modules (0 = no limit)
@@ -97,6 +102,7 @@ export async function forEachModule(
       }
       await walkZip(izf, async (me) => {
         if (me.fileName.endsWith("/")) return;
+        if (SIDECAR.test(me.fileName)) return; // skip .info etc. — not a module
         const bytes = await readEntry(izf, me);
         await cb({ source: `${outerRel}!${nm}!${me.fileName}`, name: me.fileName, bytes });
         count++;
