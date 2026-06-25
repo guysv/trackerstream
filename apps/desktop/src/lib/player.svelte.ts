@@ -4,11 +4,25 @@
 // rust-ipfs node); the control plane only hands us a root CID.
 import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
 import { ModPlayer } from "./audio/ModPlayer.svelte";
-import { connectPeer, startStream, getStreamBuffer } from "./p2p";
+import { connectPeer, startStream, getSkeleton, getSample, setPlayhead } from "./p2p";
 import { pushPresence } from "./social.svelte";
 import type { ModuleHit } from "./catalog";
 
 export const player = new ModPlayer();
+
+// Buffering UI is driven by the worklet fence (can appear mid-track now).
+player.onBuffering = (active) => {
+  nowPlaying.buffering = active;
+};
+// Closed-loop prefetch: push the live playhead order to the backend on change so
+// the fetch scheduler prioritizes the samples the playhead is approaching.
+let lastSentOrder = -1;
+player.onPos = (pos) => {
+  if (nowPlaying.hit && pos.order !== lastSentOrder) {
+    lastSentOrder = pos.order;
+    void setPlayhead(nowPlaying.hit.rootCid, pos.order);
+  }
+};
 
 export const nowPlaying = $state<{
   hit: ModuleHit | null;
@@ -107,38 +121,55 @@ async function ensureConnected() {
   /* none connected; will retry on next play (master may be momentarily unreachable) */
 }
 
-/** Stream + play a module, starting on the first (skeleton) blocks. */
+/**
+ * Stream + play a module on the immortal-instance path: init the worklet from the
+ * skeleton, start playback immediately (the fence holds at the opening until the
+ * first checkpoint's samples are resident), then feed each streamed sample via
+ * provideSample as it arrives. No recreate-on-grow, no opening-gate polling — the
+ * worklet fence owns buffering, which is now sample-accurate and can appear
+ * mid-track as an honest underrun.
+ */
 export async function playModule(hit: ModuleHit): Promise<void> {
   nowPlaying.hit = hit;
   nowPlaying.pct = 0;
   nowPlaying.streaming = true;
-  nowPlaying.buffering = true; // waiting for the first pattern's samples (B2)
+  nowPlaying.buffering = true; // fence will clear this once the opening is resident
   nowPlaying.error = "";
+  lastSentOrder = -1;
   pushPresence(hit); // presence: "now playing" (no-op when logged out)
   try {
     await player.init();
     await ensureConnected();
-    let started = false;
-    let lastReload = 0;
-    await startStream(hit.rootCid, async (p) => {
-      nowPlaying.pct = Math.round(p.pct);
+    let total = 0;
+    let got = 0;
+    await startStream(hit.rootCid, async (e) => {
       try {
-        // Hold playback until the backend reports the opening sample set is
-        // resident (`playable`). Starting earlier renders the first pattern with
-        // not-yet-arrived samples as silence — the chopped-opening bug.
-        if (!started && p.playable) {
-          started = true;
-          nowPlaying.buffering = false;
-          await player.load(await getStreamBuffer(hit.rootCid));
-          await player.play();
-        } else if (started && (p.complete || Date.now() - lastReload > 700)) {
-          lastReload = Date.now();
-          player.reload(await getStreamBuffer(hit.rootCid));
+        switch (e.type) {
+          case "skeleton": {
+            total = e.samples;
+            const skel = await getSkeleton(hit.rootCid);
+            await player.loadStream(skel, e.plan);
+            await player.play(); // fence holds at the opening until samples land
+            break;
+          }
+          case "sample": {
+            const pcm = await getSample(hit.rootCid, e.index);
+            player.provideSample(e.index, e.frames, pcm);
+            got++;
+            if (total > 0) nowPlaying.pct = Math.round((100 * got) / total);
+            break;
+          }
+          case "complete":
+            nowPlaying.streaming = false;
+            nowPlaying.pct = 100;
+            break;
+          case "error":
+            nowPlaying.error = e.message;
+            break;
         }
-      } catch (e) {
-        nowPlaying.error = String(e);
+      } catch (err) {
+        nowPlaying.error = String(err);
       }
-      if (p.complete) nowPlaying.streaming = false;
     });
   } catch (e) {
     nowPlaying.error = String(e);

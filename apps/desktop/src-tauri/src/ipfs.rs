@@ -10,7 +10,7 @@ use cid::Cid;
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use rust_ipfs::builder::IpfsBuilder;
 use rust_ipfs::{Ipfs, Keypair, Multiaddr, PeerId, Protocol};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -32,33 +32,9 @@ fn master_provider() -> Option<PeerId> {
     MASTER_PEER_ID.parse().ok()
 }
 
-/// The growing partial module buffer for a progressive (streaming) fetch.
-#[derive(Default)]
-pub struct StreamBuffer {
-    pub data: Vec<u8>,
-    pub version: u32,
-    pub complete: bool,
-}
-
-/// Progress tick emitted to the frontend during a streaming fetch.
-#[derive(Clone, Copy)]
-pub struct Progress {
-    pub version: u32,
-    pub pct: f32,
-    pub playable: bool,
-    pub complete: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct CdcConfig {
-    #[allow(dead_code)]
-    min: u64,
-    #[allow(dead_code)]
-    avg: u64,
-    #[allow(dead_code)]
-    max: u64,
-}
-
+// --- v1 manifest (byte-exact reassembly) — kept only for the v1 fallback path:
+// a not-yet-re-baked or flat (mo3) root is reassembled WHOLE and handed to the
+// worklet as a full-load skeleton. New roots are v2 (see ManifestV2 below).
 #[derive(Debug, Deserialize)]
 struct SampleEntry {
     offset: u64,
@@ -69,37 +45,11 @@ struct SampleEntry {
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
-    #[allow(dead_code)]
-    v: u8,
-    #[allow(dead_code)]
-    format: String,
     #[serde(rename = "originalLength")]
     original_length: u64,
-    #[allow(dead_code)]
-    cdc: CdcConfig,
     #[serde(rename = "skeletonChunks")]
     skeleton_chunks: Vec<Cid>,
     samples: Vec<SampleEntry>,
-    // Seek-support tables (MVP-FOLLOWUP B1/B2/B3); absent on older/flat manifests.
-    #[serde(default)]
-    segment0: Vec<u64>,
-    #[serde(default)]
-    seek: Option<SeekTable>,
-}
-
-// Per-order resident sample set (indices into samples[]) for a cold seek. We
-// ignore the manifest's `orderSeconds` here (the seek bar's time<->order map is
-// a UI concern); Rust seeks by order index, so only the checkpoints are needed.
-#[derive(Debug, Deserialize)]
-struct Checkpoint {
-    order: u32,
-    samples: Vec<u64>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct SeekTable {
-    #[serde(default)]
-    checkpoints: Vec<Checkpoint>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,35 +59,52 @@ struct PcmRoot {
     length: u64,
 }
 
-/// Fetch order for a streaming reassembly: segment0 (the first pattern's audible
-/// samples, B2) first, then by checkpoint appearance (earliest order a sample is
-/// resident — a static playback-order proxy, B3), then any remaining samples in
-/// file order. Returns indices into `manifest.samples`. Falls back to plain file
-/// order when there are no tables (older/flat manifests).
-fn stream_fetch_order(manifest: &Manifest) -> Vec<usize> {
-    let n = manifest.samples.len();
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    let mut seen = vec![false; n];
-    let push = |order: &mut Vec<usize>, seen: &mut Vec<bool>, i: usize| {
-        if i < seen.len() && !seen[i] {
-            seen[i] = true;
-            order.push(i);
-        }
-    };
-    for &i in &manifest.segment0 {
-        push(&mut order, &mut seen, i as usize);
-    }
-    if let Some(seek) = &manifest.seek {
-        for cp in &seek.checkpoints {
-            for &i in &cp.samples {
-                push(&mut order, &mut seen, i as usize);
-            }
-        }
-    }
-    for i in 0..n {
-        push(&mut order, &mut seen, i);
-    }
-    order
+// --- v2 manifest (immortal-instance streaming; STREAMING-PARITY-V2-SCHEMA.md) ---
+
+#[derive(Debug, Deserialize)]
+struct SampleV2 {
+    index: u32, // 1-based libopenmpt slot (== provide_sample arg)
+    frames: u32,
+    chunks: Vec<Cid>, // decoded native-layout PCM leaves
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct CheckpointV2 {
+    order: u32,
+    samples: Vec<u32>, // resident slot indices
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct PlanV2 {
+    #[serde(default, rename = "orderSeconds")]
+    order_seconds: Vec<OrderSeconds>,
+    #[serde(default)]
+    checkpoints: Vec<CheckpointV2>,
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize)]
+struct OrderSeconds {
+    order: u32,
+    seconds: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexV2 {
+    samples: Vec<SampleV2>,
+    #[serde(default)]
+    plan: PlanV2,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestV2 {
+    v: u8,
+    #[serde(rename = "skeletonChunks")]
+    skeleton_chunks: Vec<Cid>,
+    // Inline index, OR a pointer to a spilled index block (large modules).
+    #[serde(default)]
+    index: Option<IndexV2>,
+    #[serde(default, rename = "indexRoot")]
+    index_root: Option<Cid>,
 }
 
 /// The embedded node plus its identity.
@@ -351,187 +318,144 @@ pub async fn reassemble(ipfs: &Ipfs, root: Cid) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Splice the skeleton stream into the buffer's non-sample gaps.
-fn write_skeleton(out: &mut [u8], manifest: &Manifest, skel: &[u8]) {
-    let mut skel_cursor = 0usize;
-    let mut prev_end = 0usize;
-    for s in &manifest.samples {
-        let off = s.offset as usize;
-        let gap = off - prev_end;
-        out[prev_end..off].copy_from_slice(&skel[skel_cursor..skel_cursor + gap]);
-        skel_cursor += gap;
-        prev_end = off + s.length as usize;
-    }
-    out[prev_end..].copy_from_slice(&skel[skel_cursor..]);
+// --- v2 streaming: immortal instance + provide_sample + playhead prefetch ------
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Per-stream shared state: the assembled skeleton, decoded sample PCM as it
+/// arrives (pulled by the frontend per index), and the live playhead order the
+/// prefetch scheduler prioritizes around.
+pub struct StreamState {
+    pub skeleton: Mutex<Vec<u8>>,
+    pub samples: Mutex<HashMap<u32, Vec<u8>>>,
+    pub playhead: AtomicU32,
 }
 
-/// Progressive reassembly: write the skeleton first (a valid module that plays
-/// with not-yet-arrived samples as silence — lab/FINDINGS.md), then fill sample
-/// PCM in playback-ish order, bumping `buf.version` + emitting progress so the
-/// client can recreate-on-grow and start playing well before the full DAG lands.
-pub async fn stream_reassemble(
-    ipfs: &Ipfs,
-    root: Cid,
-    buf: Arc<Mutex<StreamBuffer>>,
-    progress: mpsc::UnboundedSender<Progress>,
-) -> Result<()> {
-    eprintln!("[stream] {root}: fetching manifest…");
-    let manifest: Manifest = serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, root).await?)?;
-    let total = manifest.original_length as usize;
-    eprintln!(
-        "[stream] {root}: manifest ok — {} samples, {} skeleton chunks, {} bytes",
-        manifest.samples.len(),
-        manifest.skeleton_chunks.len(),
-        total
-    );
-    {
-        let mut b = buf.lock().unwrap();
-        b.data = vec![0u8; total];
-        b.version = 0;
-        b.complete = false;
-    }
-    let sample_total: usize = manifest.samples.iter().map(|s| s.length as usize).sum();
-
-    // Skeleton (headers/orders/patterns) -> valid, playable module.
-    let skel_map = fetch_many(ipfs, &manifest.skeleton_chunks).await?;
-    let mut skel: Vec<u8> = Vec::new();
-    for c in &manifest.skeleton_chunks {
-        skel.extend_from_slice(skel_map.get(c).ok_or_else(|| anyhow!("missing skel {c}"))?);
-    }
-    // The first played pattern's audible sample set (B2). Playback must NOT start
-    // until every one of these is resident — otherwise the opening renders with
-    // them as silence (the chopped-opening bug) and they only "fill in" over the
-    // later reload ticks. The skeleton alone is NOT playable when we have a
-    // first-pattern set to wait for. When the manifest carries no segment0
-    // (flat/older manifests, or non-IT formats seek.ts doesn't cover) we can't
-    // know the opening set, so we keep the old behaviour: playable at skeleton.
-    let seg0: std::collections::HashSet<usize> = manifest
-        .segment0
-        .iter()
-        .map(|&i| i as usize)
-        .filter(|&i| i < manifest.samples.len())
-        .collect();
-    let seg0_count = seg0.len();
-
-    let v = {
-        let mut b = buf.lock().unwrap();
-        write_skeleton(&mut b.data, &manifest, &skel);
-        b.version += 1;
-        b.version
-    };
-    let _ = progress.send(Progress {
-        version: v,
-        pct: 5.0,
-        playable: seg0_count == 0, // nothing to wait for -> playable now
-        complete: false,
-    });
-
-    // Sample PCM in seek-table fetch order: segment0 (first pattern's audible
-    // samples, B2) first, then a static playback-order proxy (B3), then the rest.
-    // Falls back to file order when the manifest carries no tables. Because the
-    // segment0 indices are at the FRONT of this order, `seg0_done` reaches
-    // `seg0_count` exactly when the opening is fully resident — the moment we can
-    // start playback without a chopped opening.
-    let fetch_order = stream_fetch_order(&manifest);
-    eprintln!("[stream] {root}: skeleton done, fetching {} samples", fetch_order.len());
-    let mut done = 0usize;
-    let mut seg0_done = 0usize;
-    for (n, &si) in fetch_order.iter().enumerate() {
-        let s = &manifest.samples[si];
-        eprintln!(
-            "[stream] {root}: sample {}/{} (idx {si}, pcmRoot {})…",
-            n + 1,
-            fetch_order.len(),
-            s.pcm_root
-        );
-        let pcm_root: PcmRoot =
-            serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, s.pcm_root).await?)?;
-        let chunks = fetch_many(ipfs, &pcm_root.chunks).await?;
-        let v = {
-            let mut b = buf.lock().unwrap();
-            let mut w = s.offset as usize;
-            for c in &pcm_root.chunks {
-                let bytes = chunks.get(c).ok_or_else(|| anyhow!("missing chunk {c}"))?;
-                b.data[w..w + bytes.len()].copy_from_slice(bytes);
-                w += bytes.len();
-            }
-            b.version += 1;
-            b.version
-        };
-        done += s.length as usize;
-        if seg0.contains(&si) {
-            seg0_done += 1;
+impl Default for StreamState {
+    fn default() -> Self {
+        Self {
+            skeleton: Mutex::new(Vec::new()),
+            samples: Mutex::new(HashMap::new()),
+            playhead: AtomicU32::new(0),
         }
-        let pct = if sample_total > 0 {
-            5.0 + 95.0 * (done as f32 / sample_total as f32)
-        } else {
-            100.0
-        };
-        // Playable once the whole first-pattern set is resident (or there was
-        // none to wait for). Before that the client shows "buffering".
-        let playable = seg0_done >= seg0_count;
-        let _ = progress.send(Progress { version: v, pct, playable, complete: false });
     }
-
-    let v = {
-        let mut b = buf.lock().unwrap();
-        b.complete = true;
-        b.version += 1;
-        b.version
-    };
-    let _ = progress.send(Progress { version: v, pct: 100.0, playable: true, complete: true });
-    Ok(())
 }
 
-/// Cold seek (B1): resolve a module to a partial buffer playable at `target_order`,
-/// fetching ONLY the resident sample set for the nearest checkpoint <= target_order
-/// (plus the skeleton) instead of streaming the whole DAG — lab-measured ~3x faster
-/// time-to-playback (lab/SEEK.md). The result is a valid module: the skeleton makes
-/// it parse, the resident samples make the seek target audible, everything else is
-/// silent until normal streaming fills it. The frontend loads this and calls
-/// set_position(order). Falls back to a full reassemble when the module carries no
-/// seek table (older/flat manifests).
-pub async fn seek_module(ipfs: &Ipfs, root: Cid, target_order: u32) -> Result<Vec<u8>> {
-    let manifest: Manifest = serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, root).await?)?;
-    let checkpoints = match &manifest.seek {
-        Some(s) if !s.checkpoints.is_empty() => &s.checkpoints,
-        _ => return reassemble(ipfs, root).await, // no table -> full fetch
-    };
-    // Nearest checkpoint at or before the target (else the earliest checkpoint).
-    let cp = checkpoints
-        .iter()
-        .filter(|c| c.order <= target_order)
-        .max_by_key(|c| c.order)
-        .unwrap_or(&checkpoints[0]);
+/// Control events to the frontend during a v2 stream (binary skeleton / sample
+/// PCM are pulled separately via get_skeleton / get_sample to stay zero-copy).
+#[derive(Serialize, Clone)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum StreamEvent {
+    /// Skeleton assembled; here is the plan (the worklet fence's source of truth)
+    /// and the total streamed-sample count (for a progress indicator).
+    Skeleton { plan: PlanV2, samples: u32 },
+    /// One sample's decoded PCM is resident and ready to pull + provide.
+    Sample { index: u32, frames: u32 },
+    Complete,
+    Error { message: String },
+}
 
-    // Skeleton -> a valid, parseable module.
-    let skel_map = fetch_many(ipfs, &manifest.skeleton_chunks).await?;
-    let mut skel: Vec<u8> = Vec::new();
-    for c in &manifest.skeleton_chunks {
-        skel.extend_from_slice(skel_map.get(c).ok_or_else(|| anyhow!("missing skel {c}"))?);
-    }
-    let total = manifest.original_length as usize;
-    let mut out = vec![0u8; total];
-    write_skeleton(&mut out, &manifest, &skel);
-
-    // Only the samples resident at the seek target.
-    for &si in &cp.samples {
-        let si = si as usize;
-        if si >= manifest.samples.len() {
-            continue;
-        }
-        let s = &manifest.samples[si];
-        let pcm_root: PcmRoot =
-            serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, s.pcm_root).await?)?;
-        let chunks = fetch_many(ipfs, &pcm_root.chunks).await?;
-        let mut w = s.offset as usize;
-        for c in &pcm_root.chunks {
-            let bytes = chunks.get(c).ok_or_else(|| anyhow!("missing chunk {c}"))?;
-            out[w..w + bytes.len()].copy_from_slice(bytes);
-            w += bytes.len();
-        }
+/// Fetch + concatenate an ordered chunk list (skeleton or one sample's PCM).
+async fn assemble(ipfs: &Ipfs, chunks: &[Cid]) -> Result<Vec<u8>> {
+    let map = fetch_many(ipfs, chunks).await?;
+    let mut out = Vec::new();
+    for c in chunks {
+        out.extend_from_slice(map.get(c).ok_or_else(|| anyhow!("missing chunk {c}"))?);
     }
     Ok(out)
+}
+
+/// Prefetch priority for a sample: forward distance (orders) from the playhead to
+/// the nearest checkpoint that needs it; already-passed samples sort after all
+/// upcoming ones (still fetched, for backward seek); samples in no checkpoint last.
+fn need_key(orders: Option<&Vec<u32>>, ph: u32) -> u64 {
+    match orders {
+        Some(os) if !os.is_empty() => {
+            if let Some(fwd) = os.iter().copied().filter(|&o| o >= ph).min() {
+                (fwd - ph) as u64
+            } else {
+                let last = os.iter().copied().max().unwrap_or(0);
+                1_000_000_000 + ph.saturating_sub(last) as u64
+            }
+        }
+        _ => u64::MAX - 1,
+    }
+}
+
+/// Stream a v2 root onto the immortal-instance protocol: assemble + emit the
+/// skeleton + plan, then fetch each sample's decoded PCM in playhead-priority
+/// order, emitting a Sample event per arrival. A v1 (un-re-baked / flat) root is
+/// reassembled WHOLE and emitted as a full-load skeleton with an empty plan, so
+/// the v2-only worklet plays it without a v1 code path.
+pub async fn stream_v2(
+    ipfs: &Ipfs,
+    root: Cid,
+    state: Arc<StreamState>,
+    events: mpsc::UnboundedSender<StreamEvent>,
+) -> Result<()> {
+    let manifest: ManifestV2 = serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, root).await?)?;
+
+    if manifest.v != 2 {
+        eprintln!("[stream] {root}: v1 root -> full reassemble (no streaming)");
+        let bytes = reassemble(ipfs, root).await?;
+        *state.skeleton.lock().unwrap() = bytes;
+        let _ = events.send(StreamEvent::Skeleton { plan: PlanV2::default(), samples: 0 });
+        let _ = events.send(StreamEvent::Complete);
+        return Ok(());
+    }
+
+    let index = match manifest.index {
+        Some(ix) => ix,
+        None => {
+            let ir = manifest
+                .index_root
+                .ok_or_else(|| anyhow!("v2 manifest missing index + indexRoot"))?;
+            serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, ir).await?)?
+        }
+    };
+    let IndexV2 { samples, plan } = index;
+    eprintln!(
+        "[stream] {root}: v2 — {} streamed samples, {} checkpoints",
+        samples.len(),
+        plan.checkpoints.len()
+    );
+
+    // Skeleton first (a valid module; create_from_memory => all-pending samples).
+    let skel = assemble(ipfs, &manifest.skeleton_chunks).await?;
+    *state.skeleton.lock().unwrap() = skel;
+    let _ = events.send(StreamEvent::Skeleton { plan: plan.clone(), samples: samples.len() as u32 });
+
+    // Per-sample checkpoint orders, for playhead-priority prefetch.
+    let mut orders_for: HashMap<u32, Vec<u32>> = HashMap::new();
+    for cp in &plan.checkpoints {
+        for &s in &cp.samples {
+            orders_for.entry(s).or_default().push(cp.order);
+        }
+    }
+
+    // Fetch each sample in dynamic playhead-distance order (re-evaluated every step,
+    // so a seek that moves the playhead re-prioritizes the remaining queue).
+    let mut remaining: Vec<usize> = (0..samples.len()).collect();
+    while !remaining.is_empty() {
+        let ph = state.playhead.load(Ordering::Relaxed);
+        let mut best = 0usize;
+        let mut best_key = u64::MAX;
+        for (ri, &si) in remaining.iter().enumerate() {
+            let key = need_key(orders_for.get(&samples[si].index), ph);
+            if key < best_key {
+                best_key = key;
+                best = ri;
+            }
+        }
+        let si = remaining.swap_remove(best);
+        let s = &samples[si];
+        let pcm = assemble(ipfs, &s.chunks).await?;
+        state.samples.lock().unwrap().insert(s.index, pcm);
+        let _ = events.send(StreamEvent::Sample { index: s.index, frames: s.frames });
+    }
+
+    let _ = events.send(StreamEvent::Complete);
+    Ok(())
 }
 
 #[cfg(test)]
