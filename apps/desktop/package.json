@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-    "test": "node scripts/build-worklet.mjs && node test/worklet-harness.mjs",
+    "test": "node scripts/build-worklet.mjs && node test/worklet-harness.mjs && node test/crossfade-check.mjs",
     "tauri": "tauri"
   },
   "license": "AGPL-3.0-or-later",
