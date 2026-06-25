@@ -231,6 +231,40 @@ the same size class, and `smoke.mjs` / `reassembly.mjs` still pass.
 
 # Phase 2 — Format, client, seek, rollout
 
+> **Status: Phase 2 §2.1–2.5 + validation LANDED on `phase-2` branch; §2.6 (F:
+> corpus re-bake + rollout) is the one remaining, deliberately gated, step.**
+> Bake (repack `buildDagV2`/`fetchV2`, slot locator, full checkpoints for all
+> formats, server ingest), client (immortal-instance worklet + `fence.ts` +
+> `provideSample`), Rust v2 transport (`stream_v2` + playhead prefetch + new
+> get_skeleton/get_sample/set_playhead commands), unified seek, and fence-driven
+> buffering are all implemented. `cargo check` + `svelte-check` clean.
+>
+> **Validated bit-exact** vs full-load across MOD/S3M/IT/XM by four harnesses:
+> `provide-v2` (provide-all parity), `seek-diff` (per-checkpoint cold seek),
+> `stream-sim` (the integrated immortal-instance + fence + lazy-provide path —
+> bit-identical with stalls the only difference), and `fence-test` + the worklet
+> `worklet-harness` (real bundled artifact plays + fence stalls).
+>
+> **Refinements discovered while building (corrections to the design below):**
+> 1. **Held notes are duration-free.** A channel's last note-on is kept resident
+>    until cut/replaced — no per-sample duration model. Over-counting is safe and
+>    this removes all pitch/rate-reference risk (the prior source of mid-track
+>    under-counting → chops). Replaces the `sampleSeconds`/`c5` held check.
+> 2. **A checkpoint covers its WHOLE span,** not a 0.5s window: held-at-N ∪ every
+>    trigger in `[N, nextCheckpoint)`. The 0.5s window was a cold-seek structure;
+>    a continuous fence needs full-span coverage or a mid-order sample chops.
+> 3. **The fence gates on `checkpoint(floor) ∪ checkpoint(floor+1)`** — a 128-frame
+>    quantum can cross one checkpoint boundary mid-buffer (incl. a Cxx/Bxx jump out
+>    of a silent setup pattern), so the next span's samples must also be resident.
+>    Covers the `floor = -1` (pre-first-checkpoint) case too.
+> 4. **v1 / flat (mo3) roots bridge into the v2 protocol** by full reassembly sent
+>    as a no-fence skeleton, so the worklet is cleanly v2-only (no v1 code path).
+> 5. **Compressed-IT rides in the skeleton** (always resident, dropped from the
+>    plan), not streamed — sidesteps the header-rewrite risk with no regression.
+>    Streaming compressed-IT is a deferred refinement.
+> 6. **`orderSeconds` (seek-bar time↔order map) still ignores Cxx/Bxx** — a UI
+>    accuracy nit, orthogonal to fence correctness (the fence keys on order index).
+
 Depends only on Phase 1's `provide_sample`. Reshapes the wire format around
 planning + seeking and rewrites the client streaming path onto the immortal
 instance + client fence.
