@@ -20,16 +20,19 @@ struct IpfsState {
     peer_id: String,
 }
 
-/// In-flight progressive (streaming) fetches, keyed by root CID string.
+/// In-flight (or finished) v2 streams, keyed by root CID string. Each holds the
+/// assembled skeleton + decoded sample PCM as it arrives + the live playhead.
 #[derive(Default)]
-struct Streams(Mutex<HashMap<String, Arc<Mutex<ipfs::StreamBuffer>>>>);
+struct Streams(Mutex<HashMap<String, Arc<ipfs::StreamState>>>);
 
-#[derive(Serialize, Clone)]
-struct StreamProgress {
-    version: u32,
-    pct: f32,
-    playable: bool,
-    complete: bool,
+fn stream_for(streams: &State<'_, Streams>, root: &str) -> Result<Arc<ipfs::StreamState>, String> {
+    streams
+        .0
+        .lock()
+        .unwrap()
+        .get(root)
+        .cloned()
+        .ok_or_else(|| format!("no stream for {root}"))
 }
 
 #[derive(Serialize)]
@@ -72,62 +75,67 @@ async fn fetch_module(root: String, state: State<'_, IpfsState>) -> Result<Respo
     Ok(Response::new(bytes))
 }
 
-/// Begin a progressive (streaming) fetch: returns immediately, then ticks
-/// `on_progress` as the partial module buffer grows. The frontend pulls the
-/// current bytes with `get_stream_buffer` (recreate-on-grow in the worklet).
+/// Begin a v2 stream: returns immediately, then ticks `on_event` with control
+/// events (Skeleton{plan}, Sample{index,frames}, Complete). The frontend pulls
+/// the binary skeleton / sample PCM via get_skeleton / get_sample and feeds them
+/// to the immortal-instance worklet (init + provideSample).
 #[tauri::command]
 async fn start_stream(
     root: String,
-    on_progress: Channel<StreamProgress>,
+    on_event: Channel<ipfs::StreamEvent>,
     state: State<'_, IpfsState>,
     streams: State<'_, Streams>,
 ) -> Result<(), String> {
     let cid: Cid = root.parse().map_err(|e| format!("bad CID {root}: {e}"))?;
     let ipfs = state.ipfs.clone();
-    let buf = Arc::new(Mutex::new(ipfs::StreamBuffer::default()));
-    streams.0.lock().unwrap().insert(root.clone(), buf.clone());
+    let st = Arc::new(ipfs::StreamState::default());
+    streams.0.lock().unwrap().insert(root.clone(), st.clone());
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ipfs::Progress>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ipfs::StreamEvent>();
     tauri::async_runtime::spawn(async move {
-        while let Some(p) = rx.recv().await {
-            let _ = on_progress.send(StreamProgress {
-                version: p.version,
-                pct: p.pct,
-                playable: p.playable,
-                complete: p.complete,
-            });
+        while let Some(ev) = rx.recv().await {
+            let _ = on_event.send(ev);
         }
     });
+    let etx = tx.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = ipfs::stream_reassemble(&ipfs, cid, buf, tx).await;
+        if let Err(e) = ipfs::stream_v2(&ipfs, cid, st, tx).await {
+            let _ = etx.send(ipfs::StreamEvent::Error { message: e.to_string() });
+        }
     });
     Ok(())
 }
 
-/// Cold seek (B1): resolve a module to a partial buffer that is playable at
-/// `order` (skeleton + only that seek target's resident samples), far smaller
-/// than the whole DAG. The frontend loads these bytes and calls set_position;
-/// normal streaming then fills the remainder. Falls back to a full fetch when
-/// the module has no seek table.
+/// The assembled skeleton bytes for a stream (delivered to JS as an ArrayBuffer,
+/// then init'd as the immortal instance). Ready once the Skeleton event fired.
 #[tauri::command]
-async fn seek_module(root: String, order: u32, state: State<'_, IpfsState>) -> Result<Response, String> {
-    let cid: Cid = root.parse().map_err(|e| format!("bad CID {root}: {e}"))?;
-    let ipfs = state.ipfs.clone();
-    let bytes = ipfs::seek_module(&ipfs, cid, order)
-        .await
-        .map_err(|e| format!("seek_module {root}@{order} failed: {e}"))?;
-    Ok(Response::new(bytes))
+async fn get_skeleton(root: String, streams: State<'_, Streams>) -> Result<Response, String> {
+    let st = stream_for(&streams, &root)?;
+    let data = st.skeleton.lock().unwrap().clone();
+    Ok(Response::new(data))
 }
 
-/// Current bytes of an in-flight (or finished) streaming fetch.
+/// One streamed sample's decoded PCM bytes. Ready once its Sample event fired.
 #[tauri::command]
-async fn get_stream_buffer(root: String, streams: State<'_, Streams>) -> Result<Response, String> {
-    let buf = {
-        let map = streams.0.lock().unwrap();
-        map.get(&root).cloned().ok_or_else(|| format!("no stream for {root}"))?
-    };
-    let data = buf.lock().unwrap().data.clone();
+async fn get_sample(root: String, index: u32, streams: State<'_, Streams>) -> Result<Response, String> {
+    let st = stream_for(&streams, &root)?;
+    let data = st
+        .samples
+        .lock()
+        .unwrap()
+        .get(&index)
+        .cloned()
+        .ok_or_else(|| format!("sample {index} not ready for {root}"))?;
     Ok(Response::new(data))
+}
+
+/// Update the live playhead order so the prefetch scheduler reprioritizes around
+/// it (closed-loop; also how a seek reseeds the fetch queue).
+#[tauri::command]
+fn set_playhead(root: String, order: u32, streams: State<'_, Streams>) -> Result<(), String> {
+    let st = stream_for(&streams, &root)?;
+    st.playhead.store(order, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -167,8 +175,9 @@ pub fn run() {
             connect_peer,
             fetch_module,
             start_stream,
-            seek_module,
-            get_stream_buffer
+            get_skeleton,
+            get_sample,
+            set_playhead
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

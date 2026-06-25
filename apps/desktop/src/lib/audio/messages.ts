@@ -32,11 +32,19 @@ export interface Position {
   vu: number[]; // per-channel mono VU, length == numChannels
 }
 
-// main -> worklet
+// The v2 planning index the worklet fence needs (subset of repack PlanV2).
+export interface PlanData {
+  orderSeconds: { order: number; seconds: number }[];
+  checkpoints: { order: number; samples: number[] }[];
+}
+
+// main -> worklet (v2 immortal-instance protocol).
 export type ToWorklet =
-  | { type: "load"; bytes: ArrayBuffer }
-  // recreate from a grown buffer, preserving playback position (streaming)
-  | { type: "reload"; bytes: ArrayBuffer }
+  // Create the one immortal instance from the normalized skeleton + plan.
+  | { type: "init"; skeleton: ArrayBuffer; plan: PlanData }
+  // Patch one sample's decoded PCM into the instance in place (race-free: applied
+  // between process() quanta on the audio thread — Phase 1 safety contract).
+  | { type: "provideSample"; index: number; frames: number; pcm: ArrayBuffer }
   | { type: "play" }
   | { type: "pause" }
   | { type: "stop" }
@@ -51,5 +59,8 @@ export type FromWorklet =
   | { type: "ready"; version: string }
   | { type: "loaded"; info: ModuleInfo }
   | { type: "pos"; pos: Position }
+  // Fence state: playback is held (active=true) because order `order`'s samples
+  // are not yet resident, or resumed (active=false). Drives the buffering UI.
+  | { type: "buffering"; active: boolean; order: number }
   | { type: "ended" }
   | { type: "error"; message: string };

@@ -2,46 +2,45 @@
 // (src-tauri/src/ipfs.rs). Module bytes come from CID blocks over libp2p — the
 // frontend never fetches a module file over HTTP.
 import { Channel, invoke } from "@tauri-apps/api/core";
+import type { PlanData } from "./audio/messages";
 
 export interface NodeInfo {
   peer_id: string;
   listening: string[];
 }
 
-export interface StreamProgress {
-  version: number;
-  pct: number;
-  playable: boolean;
-  complete: boolean;
-}
+// Control events from a v2 stream (binary skeleton / sample PCM pulled separately
+// via getSkeleton / getSample). Mirrors ipfs::StreamEvent (serde tag "type").
+export type StreamEvent =
+  | { type: "skeleton"; plan: PlanData; samples: number }
+  | { type: "sample"; index: number; frames: number }
+  | { type: "complete" }
+  | { type: "error"; message: string };
 
 export const nodeInfo = (): Promise<NodeInfo> => invoke<NodeInfo>("node_info");
 
 export const connectPeer = (addr: string): Promise<void> => invoke("connect_peer", { addr });
 
-/** Resolve a module root CID -> exact module bytes (ArrayBuffer), 100% P2P. */
+/** Resolve a v1 root -> exact module bytes (ArrayBuffer). v2 roots stream instead. */
 export const fetchModule = (root: string): Promise<ArrayBuffer> =>
   invoke<ArrayBuffer>("fetch_module", { root });
 
-/** Begin a progressive fetch; `onProgress` ticks as the partial buffer grows. */
-export function startStream(root: string, onProgress: (p: StreamProgress) => void): Promise<void> {
-  const ch = new Channel<StreamProgress>();
-  ch.onmessage = onProgress;
-  return invoke("start_stream", { root, onProgress: ch });
+/** Begin a v2 stream; `onEvent` ticks Skeleton -> Sample… -> Complete. */
+export function startStream(root: string, onEvent: (e: StreamEvent) => void): Promise<void> {
+  const ch = new Channel<StreamEvent>();
+  ch.onmessage = onEvent;
+  return invoke("start_stream", { root, onEvent: ch });
 }
 
-/** Current bytes of an in-flight/finished streaming fetch. */
-export const getStreamBuffer = (root: string): Promise<ArrayBuffer> =>
-  invoke<ArrayBuffer>("get_stream_buffer", { root });
+/** Assembled skeleton bytes (init the immortal instance). Ready after Skeleton. */
+export const getSkeleton = (root: string): Promise<ArrayBuffer> =>
+  invoke<ArrayBuffer>("get_skeleton", { root });
 
-/**
- * Cold seek (B1): resolve a module to a partial buffer playable at `order` —
- * skeleton + only that seek target's resident sample set (far smaller than the
- * whole DAG, lab-measured ~3x faster time-to-playback). Load the returned bytes
- * and call set_position(order); normal streaming then fills the rest. Falls back
- * to a full fetch for modules without a seek table. UX wiring (mapping a seek-bar
- * position in seconds to an order via the manifest timing map, then a worklet
- * set_position) is the remaining integration step.
- */
-export const seekModule = (root: string, order: number): Promise<ArrayBuffer> =>
-  invoke<ArrayBuffer>("seek_module", { root, order });
+/** One streamed sample's decoded PCM. Ready after its Sample event. */
+export const getSample = (root: string, index: number): Promise<ArrayBuffer> =>
+  invoke<ArrayBuffer>("get_sample", { root, index });
+
+/** Push the live playhead order so the prefetch scheduler reprioritizes (closed
+ *  loop; also reseeds the queue on seek). Fire-and-forget. */
+export const setPlayhead = (root: string, order: number): Promise<void> =>
+  invoke("set_playhead", { root, order });

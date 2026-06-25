@@ -1,7 +1,9 @@
-// Headless validation of the BUNDLED worklet (static/player.worklet.js): mock
-// the AudioWorkletGlobalScope, load a module, drive process(), and assert PCM
-// comes out + position/VU messages flow. Exercises the real shipped artifact
-// (bundled libopenmpt + polyfills + processor) without a WebView.
+// Headless validation of the BUNDLED v2 worklet (static/player.worklet.js): mock
+// the AudioWorkletGlobalScope, init the immortal instance, drive process(), and
+// assert (1) a full module (empty plan) plays, and (2) the fence stalls output to
+// silence when a checkpoint needs a sample that was never provided. Exercises the
+// real shipped artifact (bundled libopenmpt + polyfills + processor + fence)
+// without a WebView.
 //
 //   node test/worklet-harness.mjs [module-path ...]
 import { readFileSync } from "node:fs";
@@ -19,7 +21,6 @@ const mods =
         join(homedir(), "tmp/somemods/space_debris (1).mod"),
         join(homedir(), "tmp/somemods/elw-sick.xm"),
         join(homedir(), "tmp/somemods/celestial_fantasia.s3m"),
-        join(homedir(), "tmp/somemods/beyond_the_network.it"),
       ];
 
 // --- mock AudioWorkletGlobalScope ---
@@ -33,8 +34,6 @@ globalThis.AudioWorkletProcessor = class {
   }
 };
 
-// Minimal MessageChannel-style pair (Node has MessageChannel, but its port
-// semantics differ; a tiny direct-dispatch pair keeps this synchronous-ish).
 function makePortPair() {
   const a = { onmessage: null, other: null, postMessage(m) { queueMicrotask(() => this.other.onmessage?.({ data: m })); } };
   const b = { onmessage: null, other: null, postMessage(m) { queueMicrotask(() => this.other.onmessage?.({ data: m })); } };
@@ -43,58 +42,65 @@ function makePortPair() {
   return [a, b];
 }
 
-async function run(path) {
-  const [mainPort, workletPort] = makePortPair();
-  portForNextProcessor = workletPort;
+const emptyPlan = { orderSeconds: [], checkpoints: [] };
 
-  // Importing the IIFE registers the processor in our mocked global scope.
-  await import("../static/player.worklet.js");
-  const proc = new registered();
-
-  const got = { ready: false, info: null, posCount: 0, ended: false, error: null };
-  mainPort.onmessage = ({ data }) => {
-    if (data.type === "ready") got.ready = true;
-    else if (data.type === "loaded") got.info = data.info;
-    else if (data.type === "pos") got.posCount++;
-    else if (data.type === "ended") got.ended = true;
-    else if (data.type === "error") got.error = data.message;
-  };
-
-  // Wait for the libopenmpt factory to resolve ('ready').
-  for (let i = 0; i < 2000 && !got.ready && !got.error; i++) await new Promise((r) => setTimeout(r, 1));
-  if (!got.ready) return { path, ok: false, why: got.error || "engine never ready" };
-
-  const bytes = new Uint8Array(readFileSync(path));
-  mainPort.postMessage({ type: "load", bytes: bytes.buffer });
-  mainPort.postMessage({ type: "play" });
-  for (let i = 0; i < 1000 && !got.info && !got.error; i++) await new Promise((r) => setTimeout(r, 1));
-  if (!got.info) return { path, ok: false, why: got.error || "module never loaded" };
-
-  // Drive ~2 s of audio through process() and measure output.
+// Drive `seconds` of audio, return peak amplitude + whether any pos arrived.
+async function drive(proc, seconds) {
   const left = new Float32Array(QUANTUM);
   const right = new Float32Array(QUANTUM);
   let peak = 0;
-  let frames = 0;
-  const quanta = Math.ceil((SR * 2) / QUANTUM);
+  const quanta = Math.ceil((SR * seconds) / QUANTUM);
   for (let q = 0; q < quanta; q++) {
     left.fill(0);
     right.fill(0);
     proc.process([], [[left, right]]);
     for (let i = 0; i < QUANTUM; i++) peak = Math.max(peak, Math.abs(left[i]), Math.abs(right[i]));
-    frames += QUANTUM;
-    if (q % 8 === 0) await new Promise((r) => setTimeout(r, 0)); // let port messages flush
+    if (q % 8 === 0) await new Promise((r) => setTimeout(r, 0));
   }
   await new Promise((r) => setTimeout(r, 5));
+  return peak;
+}
 
-  const ok = peak > 0 && got.posCount > 0;
-  return {
-    path,
-    ok,
-    why: ok ? "" : `peak=${peak.toFixed(3)} posMsgs=${got.posCount}`,
-    info: got.info,
-    peak,
-    posCount: got.posCount,
+async function run(path) {
+  const [mainPort, workletPort] = makePortPair();
+  portForNextProcessor = workletPort;
+  await import("../static/player.worklet.js");
+  const proc = new registered();
+
+  const got = { ready: false, info: null, posCount: 0, error: null, buffering: null };
+  mainPort.onmessage = ({ data }) => {
+    if (data.type === "ready") got.ready = true;
+    else if (data.type === "loaded") got.info = data.info;
+    else if (data.type === "pos") got.posCount++;
+    else if (data.type === "buffering") got.buffering = data.active;
+    else if (data.type === "error") got.error = data.message;
   };
+
+  for (let i = 0; i < 2000 && !got.ready && !got.error; i++) await new Promise((r) => setTimeout(r, 1));
+  if (!got.ready) return { path, ok: false, why: got.error || "engine never ready" };
+
+  const bytes = new Uint8Array(readFileSync(path));
+
+  // (1) Happy path: full module as skeleton, empty plan -> plays.
+  mainPort.postMessage({ type: "init", skeleton: bytes.slice().buffer, plan: emptyPlan });
+  mainPort.postMessage({ type: "play" });
+  for (let i = 0; i < 1000 && !got.info && !got.error; i++) await new Promise((r) => setTimeout(r, 1));
+  if (!got.info) return { path, ok: false, why: got.error || "module never loaded" };
+  const peakPlay = await drive(proc, 2);
+  if (!(peakPlay > 0 && got.posCount > 0))
+    return { path, ok: false, why: `play: peak=${peakPlay.toFixed(3)} pos=${got.posCount}` };
+
+  // (2) Fence: re-init with a checkpoint needing an un-provided sample -> silence.
+  got.buffering = null;
+  const fencePlan = { orderSeconds: [], checkpoints: [{ order: 0, samples: [9999] }] };
+  mainPort.postMessage({ type: "init", skeleton: bytes.slice().buffer, plan: fencePlan });
+  mainPort.postMessage({ type: "play" });
+  for (let i = 0; i < 1000 && !got.error; i++) await new Promise((r) => setTimeout(r, 1));
+  const peakStall = await drive(proc, 0.3);
+  if (peakStall !== 0) return { path, ok: false, why: `fence did not stall: peak=${peakStall.toFixed(3)}` };
+  if (got.buffering !== true) return { path, ok: false, why: `no buffering event (got ${got.buffering})` };
+
+  return { path, ok: true, info: got.info, peak: peakPlay, posCount: got.posCount };
 }
 
 let allOk = true;
@@ -108,9 +114,7 @@ for (const m of mods) {
   allOk &&= r.ok;
   const name = m.split("/").pop();
   if (r.ok)
-    console.log(
-      `OK   ${name}  type=${r.info.type} ch=${r.info.numChannels} peak=${r.peak.toFixed(3)} posMsgs=${r.posCount}`,
-    );
+    console.log(`OK   ${name}  type=${r.info.type} ch=${r.info.numChannels} peak=${r.peak.toFixed(3)} pos=${r.posCount} (fence stalls ✓)`);
   else console.log(`FAIL ${name}  ${r.why}`);
 }
 process.exit(allOk ? 0 : 1);

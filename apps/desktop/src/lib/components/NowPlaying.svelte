@@ -34,7 +34,7 @@
   <div class="center">
     <div class="track">
       <span class="name">{nowPlaying.hit?.title || nowPlaying.hit?.filename || "—"}</span>
-      {#if nowPlaying.buffering}<span class="buffering">buffering first pattern… {nowPlaying.pct}%</span>
+      {#if nowPlaying.buffering}<span class="buffering">buffering… {nowPlaying.pct}%</span>
       {:else if nowPlaying.streaming}<span class="streaming">streaming {nowPlaying.pct}%</span>{/if}
       {#if pos}<span class="pos">ord {String(pos.order).padStart(2, "0")}:{String(pos.row).padStart(2, "0")}</span>{/if}
     </div>

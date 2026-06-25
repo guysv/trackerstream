@@ -3,7 +3,7 @@
 // and translates method calls into worklet messages. All synthesis happens on the
 // audio thread (player.worklet.ts); this side never touches PCM.
 
-import type { FromWorklet, ModuleInfo, Position, ToWorklet } from "./messages";
+import type { FromWorklet, ModuleInfo, PlanData, Position, ToWorklet } from "./messages";
 
 const WORKLET_URL = "/player.worklet.js"; // pre-bundled by scripts/build-worklet.mjs
 const SAMPLE_RATE = 48000;
@@ -14,10 +14,17 @@ export class ModPlayer {
   info = $state<ModuleInfo | null>(null);
   pos = $state<Position | null>(null);
   playing = $state(false);
+  /** Fence-driven buffering: playback held until the current order's samples are
+   *  resident. Can appear mid-track (an honest underrun), unlike v1's opening gate. */
+  buffering = $state(false);
   error = $state<string | null>(null);
 
   /** Called when a track plays to its end (drives gapless auto-advance). */
   onEnded: (() => void) | null = null;
+  /** Fence buffering on/off (drives the buffering UI). */
+  onBuffering: ((active: boolean) => void) | null = null;
+  /** Position tick (drives the closed-loop playhead -> prefetch). */
+  onPos: ((pos: Position) => void) | null = null;
   volume = $state(1);
   interpolation = $state(8); // 8-tap sinc
 
@@ -56,6 +63,11 @@ export class ModPlayer {
         break;
       case "pos":
         this.pos = msg.pos;
+        this.onPos?.(msg.pos);
+        break;
+      case "buffering":
+        this.buffering = msg.active;
+        this.onBuffering?.(msg.active);
         break;
       case "ended":
         this.playing = false;
@@ -72,19 +84,27 @@ export class ModPlayer {
     this.node?.port.postMessage(msg, transfer);
   }
 
-  async load(bytes: ArrayBuffer): Promise<void> {
+  /** Create the immortal instance from the normalized skeleton + plan (v2). */
+  async loadStream(skeleton: ArrayBuffer, plan: PlanData): Promise<void> {
     await this.init();
     this.loading = true;
     this.info = null;
     this.pos = null;
     this.playing = false;
-    // Transfer the buffer to the audio thread (zero-copy).
-    this.send({ type: "load", bytes }, [bytes]);
+    this.buffering = false;
+    // Transfer the skeleton to the audio thread (zero-copy).
+    this.send({ type: "init", skeleton, plan }, [skeleton]);
   }
 
-  /** Recreate from a grown buffer mid-playback (streaming), preserving position. */
-  reload(bytes: ArrayBuffer): void {
-    this.send({ type: "reload", bytes }, [bytes]);
+  /** Patch one streamed sample's decoded PCM into the instance (zero-copy). */
+  provideSample(index: number, frames: number, pcm: ArrayBuffer): void {
+    this.send({ type: "provideSample", index, frames, pcm }, [pcm]);
+  }
+
+  /** Full-load convenience: play a complete module with no fence (everything is
+   *  "resident" in the skeleton). Used by the small-module fast path / local files. */
+  async load(bytes: ArrayBuffer): Promise<void> {
+    await this.loadStream(bytes, { orderSeconds: [], checkpoints: [] });
   }
 
   async play(): Promise<void> {
