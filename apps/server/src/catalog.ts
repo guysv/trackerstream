@@ -110,6 +110,27 @@ export class Catalog {
     }
   }
 
+  /** Existing row's id + root CID for a source (rebuild path). */
+  getSourceMeta(source: string): { id: number; rootCid: string } | undefined {
+    return this.db
+      .prepare("SELECT id, root_cid AS rootCid FROM modules WHERE source = ?")
+      .get(source) as { id: number; rootCid: string } | undefined;
+  }
+
+  /** Point a module (and any playlist items referencing it) at a new root CID —
+   *  used after a re-bake produces a new manifest. Returns the module id. */
+  updateRoot(source: string, rootCid: string, numBlocks: number): number | undefined {
+    const row = this.getSourceMeta(source);
+    if (!row) return undefined;
+    this.db
+      .prepare("UPDATE modules SET root_cid = ?, num_blocks = ? WHERE id = ?")
+      .run(rootCid, numBlocks, row.id);
+    this.db
+      .prepare("UPDATE playlist_items SET root_cid = ? WHERE module_id = ?")
+      .run(rootCid, row.id);
+    return row.id;
+  }
+
   search(query: string, limit = 50): SearchHit[] {
     // FTS5 MATCH over all columns; fall back to a prefix query for bare terms.
     const q = query.trim();

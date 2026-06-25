@@ -34,7 +34,8 @@
   <div class="center">
     <div class="track">
       <span class="name">{nowPlaying.hit?.title || nowPlaying.hit?.filename || "—"}</span>
-      {#if nowPlaying.streaming}<span class="streaming">streaming {nowPlaying.pct}%</span>{/if}
+      {#if nowPlaying.buffering}<span class="buffering">buffering first pattern… {nowPlaying.pct}%</span>
+      {:else if nowPlaying.streaming}<span class="streaming">streaming {nowPlaying.pct}%</span>{/if}
       {#if pos}<span class="pos">ord {String(pos.order).padStart(2, "0")}:{String(pos.row).padStart(2, "0")}</span>{/if}
     </div>
     <div class="seekrow">
@@ -134,6 +135,16 @@
   .streaming {
     color: var(--cyan);
     font-size: 11px;
+  }
+  .buffering {
+    color: var(--accent);
+    font-size: 11px;
+    animation: pulse 1s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    50% {
+      opacity: 0.45;
+    }
   }
   .pos {
     color: var(--accent);

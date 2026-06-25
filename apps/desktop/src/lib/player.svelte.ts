@@ -14,8 +14,12 @@ export const nowPlaying = $state<{
   hit: ModuleHit | null;
   pct: number;
   streaming: boolean;
+  /** Waiting for the first pattern's samples to arrive before playback starts
+   *  (B2) — true from the moment we begin streaming until the backend reports
+   *  the opening sample set is resident (`playable`). Drives the UI indicator. */
+  buffering: boolean;
   error: string;
-}>({ hit: null, pct: 0, streaming: false, error: "" });
+}>({ hit: null, pct: 0, streaming: false, buffering: false, error: "" });
 
 /** The play queue (Phase 6) — also drives next/prev + gapless auto-advance.
  *  Persisted locally so it survives restarts. */
@@ -108,6 +112,7 @@ export async function playModule(hit: ModuleHit): Promise<void> {
   nowPlaying.hit = hit;
   nowPlaying.pct = 0;
   nowPlaying.streaming = true;
+  nowPlaying.buffering = true; // waiting for the first pattern's samples (B2)
   nowPlaying.error = "";
   pushPresence(hit); // presence: "now playing" (no-op when logged out)
   try {
@@ -118,8 +123,12 @@ export async function playModule(hit: ModuleHit): Promise<void> {
     await startStream(hit.rootCid, async (p) => {
       nowPlaying.pct = Math.round(p.pct);
       try {
+        // Hold playback until the backend reports the opening sample set is
+        // resident (`playable`). Starting earlier renders the first pattern with
+        // not-yet-arrived samples as silence — the chopped-opening bug.
         if (!started && p.playable) {
           started = true;
+          nowPlaying.buffering = false;
           await player.load(await getStreamBuffer(hit.rootCid));
           await player.play();
         } else if (started && (p.complete || Date.now() - lastReload > 700)) {
@@ -134,5 +143,6 @@ export async function playModule(hit: ModuleHit): Promise<void> {
   } catch (e) {
     nowPlaying.error = String(e);
     nowPlaying.streaming = false;
+    nowPlaying.buffering = false;
   }
 }

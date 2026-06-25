@@ -335,20 +335,44 @@ pub async fn stream_reassemble(
     for c in &manifest.skeleton_chunks {
         skel.extend_from_slice(skel_map.get(c).ok_or_else(|| anyhow!("missing skel {c}"))?);
     }
+    // The first played pattern's audible sample set (B2). Playback must NOT start
+    // until every one of these is resident — otherwise the opening renders with
+    // them as silence (the chopped-opening bug) and they only "fill in" over the
+    // later reload ticks. The skeleton alone is NOT playable when we have a
+    // first-pattern set to wait for. When the manifest carries no segment0
+    // (flat/older manifests, or non-IT formats seek.ts doesn't cover) we can't
+    // know the opening set, so we keep the old behaviour: playable at skeleton.
+    let seg0: std::collections::HashSet<usize> = manifest
+        .segment0
+        .iter()
+        .map(|&i| i as usize)
+        .filter(|&i| i < manifest.samples.len())
+        .collect();
+    let seg0_count = seg0.len();
+
     let v = {
         let mut b = buf.lock().unwrap();
         write_skeleton(&mut b.data, &manifest, &skel);
         b.version += 1;
         b.version
     };
-    let _ = progress.send(Progress { version: v, pct: 5.0, playable: true, complete: false });
+    let _ = progress.send(Progress {
+        version: v,
+        pct: 5.0,
+        playable: seg0_count == 0, // nothing to wait for -> playable now
+        complete: false,
+    });
 
     // Sample PCM in seek-table fetch order: segment0 (first pattern's audible
     // samples, B2) first, then a static playback-order proxy (B3), then the rest.
-    // Falls back to file order when the manifest carries no tables.
+    // Falls back to file order when the manifest carries no tables. Because the
+    // segment0 indices are at the FRONT of this order, `seg0_done` reaches
+    // `seg0_count` exactly when the opening is fully resident — the moment we can
+    // start playback without a chopped opening.
     let fetch_order = stream_fetch_order(&manifest);
     eprintln!("[stream] {root}: skeleton done, fetching {} samples", fetch_order.len());
     let mut done = 0usize;
+    let mut seg0_done = 0usize;
     for (n, &si) in fetch_order.iter().enumerate() {
         let s = &manifest.samples[si];
         eprintln!(
@@ -372,12 +396,18 @@ pub async fn stream_reassemble(
             b.version
         };
         done += s.length as usize;
+        if seg0.contains(&si) {
+            seg0_done += 1;
+        }
         let pct = if sample_total > 0 {
             5.0 + 95.0 * (done as f32 / sample_total as f32)
         } else {
             100.0
         };
-        let _ = progress.send(Progress { version: v, pct, playable: true, complete: false });
+        // Playable once the whole first-pattern set is resident (or there was
+        // none to wait for). Before that the client shows "buffering".
+        let playable = seg0_done >= seg0_count;
+        let _ = progress.send(Progress { version: v, pct, playable, complete: false });
     }
 
     let v = {
