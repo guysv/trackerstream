@@ -15,7 +15,7 @@
   },
   "scripts": {
     "build": "bash build.sh",
-    "test": "node test/smoke.mjs && node test/reassembly.mjs",
+    "test": "node test/smoke.mjs && node test/reassembly.mjs && node test/provide-sample.mjs",
     "clean": "rm -rf build dist"
   }
 }

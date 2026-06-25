@@ -33,6 +33,14 @@ mkdir -p build && cd build
 if [ ! -d "$SRC" ]; then
   [ -f "$TARBALL" ] || { echo "downloading $TARBALL"; curl -fSL -O "$URL"; }
   tar xzf "$TARBALL"
+  # Apply trackerstream's libopenmpt patches (streaming sample-patch API) onto the
+  # pristine upstream extraction. Applied once, at extraction time, in order.
+  shopt -s nullglob
+  for p in ../patches/*.patch; do
+    echo "applying patch: $(basename "$p")"
+    patch -d "$SRC" -p1 < "$p"
+  done
+  shopt -u nullglob
 fi
 cd "$SRC"
 mkdir -p bin
@@ -64,6 +72,9 @@ _openmpt_module_set_render_param,_openmpt_module_get_render_param,\
 _openmpt_module_ctl_set,\
 _openmpt_module_get_metadata,_openmpt_module_get_metadata_keys,\
 _openmpt_free_string,\
+_openmpt_module_provide_sample,_openmpt_module_is_sample_pending,\
+_openmpt_module_debug_sample_data,_openmpt_module_debug_sample_bytes,\
+_openmpt_module_debug_sample_frames,\
 _openmpt_module_error_get_last,_openmpt_module_error_clear'
 
 RUNTIME='ccall,cwrap,UTF8ToString,stringToUTF8,lengthBytesUTF8,\
