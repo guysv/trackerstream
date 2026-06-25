@@ -16,7 +16,7 @@ import { CID } from "multiformats/cid";
 import { sha256 } from "multiformats/hashes/sha2";
 import * as dagCbor from "@ipld/dag-cbor";
 import { cdcChunks, DEFAULT_CDC, type CdcConfig } from "./cdc.ts";
-import { sampleRegions, type Format } from "./parse.ts";
+import { sampleRegions, sampleSlots, type Format } from "./parse.ts";
 import { computeSeekTables } from "./seek.ts";
 
 const RAW_CODE = 0x55;
@@ -222,6 +222,210 @@ async function buildFromRegions(
   };
 }
 
+// ===========================================================================
+// Repack v2 — the immortal-instance object tree (STREAMING-PARITY-V2-SCHEMA.md)
+//
+// v2 stops reconstructing the original file. It feeds DECODED PCM by libopenmpt
+// sample slot into one immortal instance via provide_sample, so the tree is
+// organized for planning + seeking, not byte-exact reassembly. The single key
+// everywhere is the 1-based libopenmpt sample slot.
+// ===========================================================================
+
+export const MANIFEST_V2 = 2;
+/** Above this encoded-manifest size the index spills to its own block. */
+export const INDEX_SPILL_BYTES = 256 * 1024;
+
+/** One streamed sample: decoded native-layout PCM, keyed by libopenmpt slot. */
+export interface SampleV2 {
+  index: number; // 1-based libopenmpt slot (== provide_sample arg)
+  frames: number; // decoded nLength (== provide_sample `frames` arg)
+  channels: number; // native interleave: 1 | 2
+  bitDepth: number; // native: 8 | 16  (byteLength = frames*channels*bitDepth/8)
+  chunks: CID[]; // ordered raw leaves of this sample's decoded PCM
+}
+
+/** Planning index — drives both the prefetch scheduler and the client fence. */
+export interface PlanV2 {
+  /** Cumulative seconds at the start of each valid order (T<->order seek map). */
+  orderSeconds: { order: number; seconds: number }[];
+  /** Full resident set (slot indices) per strided order — NOT delta-encoded. */
+  checkpoints: { order: number; samples: number[] }[];
+}
+
+export interface IndexV2 {
+  samples: SampleV2[];
+  plan: PlanV2;
+}
+
+export interface ManifestV2 {
+  v: number; // 2
+  format: Format;
+  cdc: CdcConfig;
+  skeletonChunks: CID[]; // normalized skeleton: streamed slots' PCM zeroed
+  index?: IndexV2; // inline (default)
+  indexRoot?: CID; // OR spilled to its own block (large modules)
+}
+
+/** Decoded native-layout PCM for one sample slot (the bake's libopenmpt dump). */
+export interface DecodedSample {
+  index: number; // 1-based slot (from the get_num_samples loop)
+  frames: number; // debug_sample_frames
+  data: Uint8Array; // debug_sample_data bytes (length == debug_sample_bytes)
+}
+
+export interface BuiltDagV2 {
+  root: CID;
+  manifest: ManifestV2;
+  blocks: Block[];
+  stats: {
+    format: Format;
+    skeletonBytes: number;
+    streamedSamples: number;
+    residentSamples: number; // rode in the skeleton (compressed/unlocatable)
+    sampleBytes: number;
+    numChunks: number;
+    uniqueChunks: number;
+    manifestBytes: number;
+    spilled: boolean;
+  };
+}
+
+/** Copy of `data` with each streamed slot's on-disk PCM zeroed (still a valid,
+ * loadable module — create_from_memory yields silent, all-pending samples). */
+function buildSkeletonV2(data: Uint8Array, streamed: { offset: number; length: number }[]): Uint8Array {
+  const sk = new Uint8Array(data); // full-size copy
+  for (const s of streamed) sk.fill(0, s.offset, s.offset + s.length);
+  return sk;
+}
+
+/**
+ * Build the v2 DAG for a parsed module. `decoded` is the per-slot native-layout
+ * PCM dumped from libopenmpt by the caller (debug_sample_* accessors). A slot is
+ * STREAMED only if we can locate its uncompressed on-disk region AND its length
+ * matches the decode; otherwise its real PCM rides in the skeleton (always
+ * resident, dropped from the plan) — never wrong audio, just less dedup.
+ * Throws if the format can't be parsed (caller falls back to v1 flat DAG).
+ */
+export async function buildDagV2(
+  data: Uint8Array,
+  decoded: DecodedSample[],
+  cdc: CdcConfig = DEFAULT_CDC,
+): Promise<BuiltDagV2> {
+  const parsed = sampleSlots(data);
+  if (!parsed) throw new Error("unparseable module (cannot locate sample slots)");
+  const { format, slots } = parsed;
+
+  const dumpByIndex = new Map<number, DecodedSample>();
+  for (const d of decoded) dumpByIndex.set(d.index, d);
+
+  // Decide streamed vs resident-in-skeleton, slot by slot.
+  const streamed: { slot: (typeof slots)[number]; dump: DecodedSample }[] = [];
+  for (const slot of slots) {
+    const dump = dumpByIndex.get(slot.index);
+    if (!dump || dump.data.length === 0) continue; // no PCM dumped -> rides in skeleton
+    if (dump.data.length !== slot.length) continue; // length disagree -> be safe, don't stream
+    streamed.push({ slot, dump });
+  }
+
+  const byCid = new Map<string, Block>();
+  const add = (b: Block) => {
+    const k = b.cid.toString();
+    if (!byCid.has(k)) byCid.set(k, b);
+    return b.cid;
+  };
+  let numChunks = 0;
+  const chunkToCids = async (buf: Uint8Array): Promise<CID[]> => {
+    const cids: CID[] = [];
+    for (const c of cdcChunks(buf, cdc)) {
+      numChunks++;
+      cids.push(add(await rawBlock(c.slice())));
+    }
+    return cids;
+  };
+
+  // Sample table (inline leaf CIDs — the pre-resolved index).
+  const samples: SampleV2[] = [];
+  let sampleBytes = 0;
+  for (const { slot, dump } of streamed) {
+    sampleBytes += dump.data.length;
+    const chunks = await chunkToCids(dump.data);
+    samples.push({
+      index: slot.index,
+      frames: dump.frames,
+      channels: slot.channels,
+      bitDepth: slot.bitDepth,
+      chunks,
+    });
+  }
+
+  // Normalized skeleton (streamed regions zeroed) -> chunks.
+  const skeleton = buildSkeletonV2(
+    data,
+    streamed.map((s) => s.slot),
+  );
+  const skeletonChunks = await chunkToCids(skeleton);
+
+  // Planning index. computeSeekTables works in PCM byte offsets; map those to
+  // the streamed slot indices (offsets that don't resolve to a streamed slot are
+  // dropped — they ride in the skeleton, always resident).
+  const idxByOffset = new Map<number, number>();
+  for (const { slot } of streamed) idxByOffset.set(slot.offset, slot.index);
+  const toSlots = (offs: number[]): number[] => {
+    const out: number[] = [];
+    for (const o of offs) {
+      const i = idxByOffset.get(o);
+      if (i !== undefined) out.push(i);
+    }
+    return out;
+  };
+
+  const plan: PlanV2 = { orderSeconds: [], checkpoints: [] };
+  const tables = computeSeekTables(data, format);
+  if (tables) {
+    plan.orderSeconds = tables.orderSeconds;
+    plan.checkpoints = tables.checkpoints
+      .map((c) => ({ order: c.order, samples: toSlots(c.residentOffsets) }))
+      .filter((c) => c.samples.length);
+    // Synthesize an opening checkpoint from segment0 when the format only gives
+    // segment0 (MOD/S3M/XM today; full checkpoints land with the seek extension).
+    if (!plan.checkpoints.length) {
+      const seg0 = toSlots(tables.segment0Offsets);
+      if (seg0.length) plan.checkpoints = [{ order: 0, samples: seg0 }];
+    }
+  }
+
+  // Inline the index; spill to its own block if the manifest gets too big.
+  const index: IndexV2 = { samples, plan };
+  let manifest: ManifestV2 = { v: MANIFEST_V2, format, cdc, skeletonChunks, index };
+  let manifestBlock = await cborBlock(manifest);
+  let spilled = false;
+  if (manifestBlock.bytes.length > INDEX_SPILL_BYTES) {
+    const indexBlock = await cborBlock(index);
+    add(indexBlock);
+    manifest = { v: MANIFEST_V2, format, cdc, skeletonChunks, indexRoot: indexBlock.cid };
+    manifestBlock = await cborBlock(manifest);
+    spilled = true;
+  }
+  add(manifestBlock);
+
+  return {
+    root: manifestBlock.cid,
+    manifest,
+    blocks: [...byCid.values()],
+    stats: {
+      format,
+      skeletonBytes: skeleton.length,
+      streamedSamples: streamed.length,
+      residentSamples: slots.length - streamed.length,
+      sampleBytes,
+      numChunks,
+      uniqueChunks: byCid.size,
+      manifestBytes: manifestBlock.bytes.length,
+      spilled,
+    },
+  };
+}
+
 export type BlockGetter = (cid: CID) => Promise<Uint8Array>;
 
 /**
@@ -257,6 +461,70 @@ export async function prefetch(
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, cids.length) }, worker));
   return out;
+}
+
+/** A streamed sample with its decoded PCM assembled from leaf chunks. */
+export interface FetchedSampleV2 {
+  index: number;
+  frames: number;
+  channels: number;
+  bitDepth: number;
+  pcm: Uint8Array;
+}
+
+/**
+ * Fetch a v2 root into the pieces a client needs: the skeleton bytes (for
+ * create_from_memory), each streamed sample's assembled decoded PCM (for
+ * provide_sample), and the plan. The reference path for the parity harness and
+ * headless validation; the shipped client streams these incrementally instead.
+ */
+export async function fetchV2(
+  root: CID,
+  get: BlockGetter,
+  opts: { verify?: boolean } = {},
+): Promise<{ manifest: ManifestV2; skeleton: Uint8Array; samples: FetchedSampleV2[]; plan: PlanV2 }> {
+  const verify = opts.verify ?? true;
+  const manifest = dagCbor.decode<ManifestV2>(await fetchVerified(root, get, verify));
+  if (manifest.v !== MANIFEST_V2) throw new Error(`not a v2 manifest (v=${manifest.v})`);
+  const index =
+    manifest.index ??
+    dagCbor.decode<IndexV2>(await fetchVerified(manifest.indexRoot!, get, verify));
+
+  // Skeleton.
+  const parts: Uint8Array[] = [];
+  let skelLen = 0;
+  for (const cid of manifest.skeletonChunks) {
+    const part = await fetchVerified(cid, get, verify);
+    parts.push(part);
+    skelLen += part.length;
+  }
+  const skeleton = new Uint8Array(skelLen);
+  let w = 0;
+  for (const p of parts) {
+    skeleton.set(p, w);
+    w += p.length;
+  }
+
+  // Per-sample PCM.
+  const samples: FetchedSampleV2[] = [];
+  for (const s of index.samples) {
+    const chunks: Uint8Array[] = [];
+    let len = 0;
+    for (const cid of s.chunks) {
+      const c = await fetchVerified(cid, get, verify);
+      chunks.push(c);
+      len += c.length;
+    }
+    const pcm = new Uint8Array(len);
+    let o = 0;
+    for (const c of chunks) {
+      pcm.set(c, o);
+      o += c.length;
+    }
+    samples.push({ index: s.index, frames: s.frames, channels: s.channels, bitDepth: s.bitDepth, pcm });
+  }
+
+  return { manifest, skeleton, samples, plan: index.plan };
 }
 
 /** Recompute the multihash of `bytes` and confirm it matches `cid`. */

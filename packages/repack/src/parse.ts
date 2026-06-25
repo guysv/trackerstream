@@ -183,6 +183,169 @@ function extractXM(b: Uint8Array): SampleRegion[] | null {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// v2 slot-indexed locator (STREAMING-PARITY-V2-SCHEMA.md)
+//
+// v1's sampleRegions() sorts by file offset and drops the slot association — it
+// only needs to carve a byte partition. v2 keys everything on the *libopenmpt
+// sample slot* (the provide_sample index, the slot debug_sample_data reads), so
+// it needs each region tagged with its 1-based slot plus the native PCM layout
+// (bit depth / channels) so the bake can cross-check the decoded dump and the
+// client can size the provide buffer.
+//
+// A slot appears here only if it has a locatable UNCOMPRESSED on-disk PCM region.
+// Compressed (IT flag 0x08) / empty slots are simply absent: the bake leaves
+// their real PCM in the skeleton (always resident, never streamed), exactly as
+// v1 drops them. Never guessed — a parse surprise just omits the slot.
+export interface SampleSlot {
+  index: number; // 1-based libopenmpt sample slot (== provide_sample arg)
+  offset: number; // on-disk PCM byte offset
+  length: number; // on-disk PCM byte length (== decoded byte length for uncompressed)
+  bitDepth: number; // 8 | 16
+  channels: number; // 1 | 2
+}
+
+function modSlots(b: Uint8Array): SampleSlot[] {
+  const ch = modChannels(tag4(b, 1080));
+  if (!ch) return [];
+  const lens: number[] = [];
+  for (let i = 0; i < 31; i++) lens.push(u16be(b, 20 + i * 30 + 22) * 2);
+  const orders = b.subarray(952, 952 + 128);
+  let maxPat = 0;
+  for (let i = 0; i < 128; i++) if (orders[i] > maxPat) maxPat = orders[i];
+  let off = 1084 + (maxPat + 1) * 64 * ch * 4;
+  const out: SampleSlot[] = [];
+  for (let i = 0; i < 31; i++) {
+    const n = lens[i];
+    if (n <= 2) continue; // empty slot — libopenmpt still numbers it, but no PCM
+    const length = off + n > b.length ? b.length - off : n;
+    if (length > 0) out.push({ index: i + 1, offset: off, length, bitDepth: 8, channels: 1 });
+    if (off + n > b.length) break;
+    off += n;
+  }
+  return out;
+}
+
+// IT/MPTM: 1-based slot = header order. Skips compressed (flag 0x08) slots.
+function itLikeSlots(b: Uint8Array): SampleSlot[] {
+  const ordNum = u16le(b, 0x20),
+    insNum = u16le(b, 0x22),
+    smpNum = u16le(b, 0x24);
+  const base = 0xc0 + ordNum + insNum * 4;
+  const out: SampleSlot[] = [];
+  for (let i = 0; i < smpNum; i++) {
+    const so = u32le(b, base + i * 4);
+    if (!so || so + 0x50 > b.length) continue;
+    const flg = b[so + 0x12],
+      len = u32le(b, so + 0x30),
+      ptr = u32le(b, so + 0x48);
+    if (!(flg & 1) || !len || !ptr) continue;
+    if (flg & 8) continue; // compressed — rides in the skeleton
+    const bitDepth = flg & 2 ? 16 : 8,
+      channels = flg & 4 ? 2 : 1;
+    const bytes = Math.min(len * (bitDepth / 8) * channels, b.length - ptr);
+    if (bytes > 0) out.push({ index: i + 1, offset: ptr, length: bytes, bitDepth, channels });
+  }
+  return out;
+}
+
+function s3mSlots(b: Uint8Array): SampleSlot[] {
+  const ordNum = u16le(b, 0x20),
+    insNum = u16le(b, 0x22);
+  const paraBase = 0x60 + ordNum;
+  const out: SampleSlot[] = [];
+  for (let i = 0; i < insNum; i++) {
+    const pp = u16le(b, paraBase + i * 2);
+    if (!pp) continue;
+    const off = pp * 16;
+    if (off + 0x50 > b.length || b[off] !== 1) continue; // type 1 = PCM
+    const ptr = ((b[off + 0x0d] << 16) | u16le(b, off + 0x0e)) * 16;
+    const len = u32le(b, off + 0x10);
+    const flg = b[off + 0x1f];
+    if (!len || !ptr) continue;
+    const bitDepth = flg & 4 ? 16 : 8,
+      channels = flg & 2 ? 2 : 1;
+    const bytes = Math.min(len * (bitDepth / 8) * channels, b.length - ptr);
+    if (bytes > 0 && ptr < b.length)
+      out.push({ index: i + 1, offset: ptr, length: bytes, bitDepth, channels });
+  }
+  return out;
+}
+
+// XM: samples are numbered sequentially across instruments in load order — the
+// running global counter IS the libopenmpt slot index.
+function xmSlots(b: Uint8Array): SampleSlot[] {
+  const headerSize = u32le(b, 60);
+  const npat = u16le(b, 70),
+    nins = u16le(b, 72);
+  let pos = 60 + headerSize;
+  for (let p = 0; p < npat; p++) {
+    if (pos + 9 > b.length) return [];
+    const phLen = u32le(b, pos),
+      packed = u16le(b, pos + 7);
+    pos += phLen + packed;
+  }
+  const out: SampleSlot[] = [];
+  let slot = 0; // running global sample index (1-based after ++)
+  for (let ins = 0; ins < nins; ins++) {
+    if (pos + 29 > b.length) break;
+    const instStart = pos;
+    const instSize = u32le(b, pos);
+    const numSamp = u16le(b, pos + 27);
+    if (numSamp === 0) {
+      pos = instStart + instSize;
+      continue;
+    }
+    const shSize = u32le(b, pos + 29);
+    let hdr = instStart + instSize;
+    const meta: { length: number; bitDepth: number }[] = [];
+    for (let s = 0; s < numSamp; s++) {
+      if (hdr + 18 > b.length) break;
+      const length = u32le(b, hdr); // XM length is in BYTES
+      const typ = b[hdr + 14];
+      meta.push({ length, bitDepth: typ & 0x10 ? 16 : 8 }); // XM samples are mono
+      hdr += shSize;
+    }
+    let data = hdr;
+    for (let s = 0; s < meta.length; s++) {
+      slot++;
+      const { length, bitDepth } = meta[s];
+      if (length > 0 && data + length <= b.length)
+        out.push({ index: slot, offset: data, length, bitDepth, channels: 1 });
+      data += length;
+    }
+    pos = data;
+  }
+  return out;
+}
+
+const SLOT_EXTRACTORS: Record<Format, (b: Uint8Array) => SampleSlot[]> = {
+  mod: modSlots,
+  it: itLikeSlots,
+  mptm: itLikeSlots,
+  s3m: s3mSlots,
+  xm: xmSlots,
+  mo3: () => [],
+};
+
+/**
+ * Locate each sample slot's uncompressed on-disk PCM region, keyed by the
+ * 1-based libopenmpt slot index (v2). Unlike sampleRegions() this does NOT sort
+ * or drop overlaps — the slot index is load-bearing. Returns null only for
+ * formats/files we can't confidently parse.
+ */
+export function sampleSlots(
+  b: Uint8Array,
+  fmtHint?: Format,
+): { format: Format; slots: SampleSlot[] } | null {
+  const format = fmtHint ?? detectFormat(b);
+  if (!format) return null;
+  const slots = SLOT_EXTRACTORS[format](b).filter(
+    (s) => s.length > 0 && s.offset >= 0 && s.offset + s.length <= b.length,
+  );
+  return { format, slots };
+}
+
 const EXTRACTORS: Record<Format, (b: Uint8Array) => SampleRegion[] | null> = {
   mod: extractMOD,
   it: extractIT,

@@ -13,7 +13,8 @@
   },
   "scripts": {
     "test": "node test/roundtrip-fixtures.ts",
-    "test:corpus": "node test/roundtrip.ts"
+    "test:corpus": "node test/roundtrip.ts",
+    "test:v2": "node test/provide-v2.ts"
   },
   "dependencies": {
     "@ipld/dag-cbor": "^9.2.1",
