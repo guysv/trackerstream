@@ -48,8 +48,63 @@ function name(fn: "sample" | "instrument", mod: number, i: number): string {
   return s;
 }
 
+/** Decoded native-layout PCM for one sample slot (v2 bake input). */
+export interface DecodedSample {
+  index: number; // 1-based libopenmpt slot
+  frames: number; // debug_sample_frames (nLength)
+  data: Uint8Array; // debug_sample_data bytes (== debug_sample_bytes)
+}
+
+function metaFrom(mod: number): ModuleMeta {
+  const numSamples = M!._openmpt_module_get_num_samples(mod);
+  const numInstruments = M!._openmpt_module_get_num_instruments(mod);
+  const names: string[] = [];
+  for (let i = 0; i < numInstruments; i++) {
+    const n = name("instrument", mod, i).trim();
+    if (n) names.push(n);
+  }
+  for (let i = 0; i < numSamples; i++) {
+    const n = name("sample", mod, i).trim();
+    if (n) names.push(n);
+  }
+  return {
+    type: meta(mod, "type"),
+    title: meta(mod, "title").trim(),
+    duration: M!._openmpt_module_get_duration_seconds(mod),
+    channels: M!._openmpt_module_get_num_channels(mod),
+    numSamples,
+    numInstruments,
+    numSubsongs: M!._openmpt_module_get_num_subsongs(mod),
+    instruments: names.join(" "),
+    comment: meta(mod, "message").trim(),
+  };
+}
+
+/** Dump every slot's native decoded PCM. .slice() copies out of the heap before
+ * destroy / any later malloc relocates it. */
+function dumpSamples(mod: number): DecodedSample[] {
+  const n = M!._openmpt_module_get_num_samples(mod);
+  const out: DecodedSample[] = [];
+  for (let i = 1; i <= n; i++) {
+    const frames = M!._openmpt_module_debug_sample_frames(mod, i);
+    const bytes = M!._openmpt_module_debug_sample_bytes(mod, i);
+    const ptr = M!._openmpt_module_debug_sample_data(mod, i);
+    if (frames > 0 && bytes > 0 && ptr) out.push({ index: i, frames, data: M!.HEAPU8.slice(ptr, ptr + bytes) });
+  }
+  return out;
+}
+
 /** Extract metadata; returns null if libopenmpt can't open the buffer. */
 export function extractMeta(bytes: Uint8Array): ModuleMeta | null {
+  const m = extractModule(bytes);
+  return m ? m.meta : null;
+}
+
+/**
+ * Load a module ONCE and extract both metadata and the per-slot decoded PCM the
+ * v2 bake needs (buildDagV2). Returns null if libopenmpt can't open the buffer.
+ */
+export function extractModule(bytes: Uint8Array): { meta: ModuleMeta; decoded: DecodedSample[] } | null {
   if (!M) throw new Error("call initMeta() first");
   const p = M._malloc(bytes.length);
   M.HEAPU8.set(bytes, p);
@@ -57,28 +112,7 @@ export function extractMeta(bytes: Uint8Array): ModuleMeta | null {
   M._free(p);
   if (!mod) return null;
   try {
-    const numSamples = M._openmpt_module_get_num_samples(mod);
-    const numInstruments = M._openmpt_module_get_num_instruments(mod);
-    const names: string[] = [];
-    for (let i = 0; i < numInstruments; i++) {
-      const n = name("instrument", mod, i).trim();
-      if (n) names.push(n);
-    }
-    for (let i = 0; i < numSamples; i++) {
-      const n = name("sample", mod, i).trim();
-      if (n) names.push(n);
-    }
-    return {
-      type: meta(mod, "type"),
-      title: meta(mod, "title").trim(),
-      duration: M._openmpt_module_get_duration_seconds(mod),
-      channels: M._openmpt_module_get_num_channels(mod),
-      numSamples,
-      numInstruments,
-      numSubsongs: M._openmpt_module_get_num_subsongs(mod),
-      instruments: names.join(" "),
-      comment: meta(mod, "message").trim(),
-    };
+    return { meta: metaFrom(mod), decoded: dumpSamples(mod) };
   } finally {
     M._openmpt_module_destroy(mod);
   }

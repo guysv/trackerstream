@@ -2,9 +2,9 @@
 // formats the parsers don't cover) -> block-put + recursive pin on the master
 // kubo node (shared chunks stored once) -> libopenmpt metadata -> SQLite/FTS5
 // catalog row carrying the root CID. Incremental + re-runnable (skips by source).
-import { buildDag, buildFlatDag, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
+import { buildDagV2, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
 import { Catalog } from "./catalog.ts";
-import { initMeta, extractMeta } from "./meta.ts";
+import { initMeta, extractModule, type ModuleMeta } from "./meta.ts";
 import { forEachModule } from "./corpus.ts";
 
 export interface IngestOpts {
@@ -60,11 +60,22 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
       const bytes = new Uint8Array(m.bytes);
       const ext = m.name.split(".").pop()?.toLowerCase() ?? "";
 
+      // Single libopenmpt load -> metadata + decoded per-slot PCM (v2 input).
+      const mod = extractModule(bytes);
+      const meta: ModuleMeta | null = mod ? mod.meta : null;
+      const fmt = detectFormat(bytes);
+
       let dag;
       let isFlat = false;
-      try {
-        dag = await buildDag(bytes);
-      } catch {
+      // v2 bake for parsed+decodable formats; mo3/unparseable -> v1 flat DAG.
+      if (mod && fmt && fmt !== "mo3") {
+        try {
+          dag = await buildDagV2(bytes, mod.decoded);
+        } catch {
+          /* fall through to flat */
+        }
+      }
+      if (!dag) {
         try {
           dag = await buildFlatDag(bytes, ext);
           isFlat = true;
@@ -118,7 +129,6 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
         return;
       }
 
-      const meta = extractMeta(bytes);
       if (!meta) {
         failed++;
         return;
