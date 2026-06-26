@@ -4,21 +4,50 @@
 // rust-ipfs node); the control plane only hands us a root CID.
 import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
 import { ModPlayer } from "./audio/ModPlayer.svelte";
+import { Fence } from "./audio/fence";
 import { connectPeer, startStream, getSkeleton, getSample, setPlayhead } from "./p2p";
 import { pushPresence } from "./social.svelte";
+import { dbg } from "./debug";
 import type { ModuleHit } from "./catalog";
 
 export const player = new ModPlayer();
 
 // Buffering UI is driven by the worklet fence (can appear mid-track now).
 player.onBuffering = (active) => {
+  dbg("fence.buffering", { active, pct: nowPlaying.pct, streaming: nowPlaying.streaming });
   nowPlaying.buffering = active;
 };
+// Monotonic play token. Bumped on every playModule() so a superseded track's
+// still-running stream callback can detect it's stale and stop touching the
+// shared worklet / nowPlaying state (the worklet is a singleton; a stale provide
+// would patch samples into the WRONG instance — the cross-track contamination
+// that left tracks stuck buffering).
+let playEpoch = 0;
+
+// Main-thread mirror of the worklet's fence, fed the same provideSample indices,
+// so the UI can compute how much of the SONG TIMELINE is actually playable
+// (fence-resident) — the real buffered region the seek bar fills, as opposed to
+// raw % of samples downloaded. Same Fence logic that gates audio => the bar
+// matches what you hear.
+let bufferFence: Fence | null = null;
+let planOrderSeconds: { order: number; seconds: number }[] = [];
+function recomputeBuffered(): void {
+  if (!bufferFence) return;
+  const dur =
+    player.info?.durationSeconds ||
+    (planOrderSeconds.length ? planOrderSeconds[planOrderSeconds.length - 1].seconds : 0);
+  nowPlaying.bufferedSeconds = bufferFence.playableSeconds(planOrderSeconds, dur);
+}
+
 // Closed-loop prefetch: push the live playhead order to the backend on change so
 // the fetch scheduler prioritizes the samples the playhead is approaching.
 let lastSentOrder = -1;
 player.onPos = (pos) => {
+  // Refresh the buffered edge against the now-known duration (info loads after the
+  // first samples may already have arrived).
+  recomputeBuffered();
   if (nowPlaying.hit && pos.order !== lastSentOrder) {
+    dbg("pos.order", { order: pos.order, row: pos.row, seconds: +pos.seconds.toFixed(2) });
     lastSentOrder = pos.order;
     void setPlayhead(nowPlaying.hit.rootCid, pos.order);
   }
@@ -32,8 +61,12 @@ export const nowPlaying = $state<{
    *  (B2) — true from the moment we begin streaming until the backend reports
    *  the opening sample set is resident (`playable`). Drives the UI indicator. */
   buffering: boolean;
+  /** How many seconds of the SONG TIMELINE are contiguously playable from the
+   *  start given the samples resident so far (fence-accurate). Drives the seek-bar
+   *  buffered fill — the real buffered region, not raw % of samples downloaded. */
+  bufferedSeconds: number;
   error: string;
-}>({ hit: null, pct: 0, streaming: false, buffering: false, error: "" });
+}>({ hit: null, pct: 0, streaming: false, buffering: false, bufferedSeconds: 0, error: "" });
 
 /** The play queue (Phase 6) — also drives next/prev + gapless auto-advance.
  *  Persisted locally so it survives restarts. */
@@ -130,48 +163,88 @@ async function ensureConnected() {
  * mid-track as an honest underrun.
  */
 export async function playModule(hit: ModuleHit): Promise<void> {
+  dbg("playModule.start", { cid: hit.rootCid, title: hit.title ?? hit.filename });
   nowPlaying.hit = hit;
   nowPlaying.pct = 0;
   nowPlaying.streaming = true;
   nowPlaying.buffering = true; // fence will clear this once the opening is resident
+  nowPlaying.bufferedSeconds = 0;
   nowPlaying.error = "";
   lastSentOrder = -1;
+  bufferFence = null;
+  planOrderSeconds = [];
+  const epoch = ++playEpoch; // this track's token; stale callbacks bail on mismatch
   pushPresence(hit); // presence: "now playing" (no-op when logged out)
   try {
     await player.init();
     await ensureConnected();
     let total = 0;
     let got = 0;
+    // The instance must be init'd before any sample is patched in: provideSample
+    // and init are separate postMessages, and the skeleton handler has more awaits
+    // than the sample handler, so without this barrier a sample can reach the
+    // worklet BEFORE init and be applied to the wrong/old instance (lost) — the
+    // race that left tracks silently stuck at the opening. Sample handlers await
+    // this; it resolves once init has been posted for this track.
+    let markInited!: () => void;
+    const inited = new Promise<void>((r) => (markInited = r));
     await startStream(hit.rootCid, async (e) => {
+      if (epoch !== playEpoch) return; // superseded by a newer track
       try {
         switch (e.type) {
           case "skeleton": {
             total = e.samples;
+            dbg("ev.skeleton", { samples: total, checkpoints: e.plan.checkpoints?.length ?? 0 });
+            // Mirror the worklet fence on the main thread for the buffered-timeline bar.
+            bufferFence = new Fence(e.plan);
+            planOrderSeconds = e.plan.orderSeconds ?? [];
             const skel = await getSkeleton(hit.rootCid);
+            if (epoch !== playEpoch) return;
             await player.loadStream(skel, e.plan);
             await player.play(); // fence holds at the opening until samples land
+            markInited();
             break;
           }
           case "sample": {
             const pcm = await getSample(hit.rootCid, e.index);
+            await inited; // never provide a sample before the instance exists
+            if (epoch !== playEpoch) return; // a newer track owns the worklet now
             player.provideSample(e.index, e.frames, pcm);
+            bufferFence?.provide(e.index);
+            recomputeBuffered(); // grow the buffered-timeline bar as samples land
             got++;
-            if (total > 0) nowPlaying.pct = Math.round((100 * got) / total);
+            // Monotonic: the synchronous `complete` handler can run (and set 100)
+            // before these async sample handlers resume, so guard against pct
+            // regressing 100 -> low -> 100 (a visible flicker on slower paths).
+            if (total > 0)
+              nowPlaying.pct = Math.max(nowPlaying.pct, Math.round((100 * got) / total));
+            // Log first/last + every 25% so we can see pct vs. buffering coherence.
+            if (got === 1 || got === total || nowPlaying.pct % 25 === 0)
+              dbg("ev.sample", { index: e.index, got, total, pct: nowPlaying.pct });
             break;
           }
           case "complete":
+            dbg("ev.complete", {
+              got,
+              total,
+              pctWas: nowPlaying.pct,
+              bufferingStuck: nowPlaying.buffering,
+            });
             nowPlaying.streaming = false;
             nowPlaying.pct = 100;
             break;
           case "error":
+            dbg("ev.error", { message: e.message });
             nowPlaying.error = e.message;
             break;
         }
       } catch (err) {
-        nowPlaying.error = String(err);
+        dbg("ev.exception", { err: String(err) });
+        if (epoch === playEpoch) nowPlaying.error = String(err);
       }
     });
   } catch (e) {
+    dbg("playModule.catch", { err: String(e) });
     nowPlaying.error = String(e);
     nowPlaying.streaming = false;
     nowPlaying.buffering = false;

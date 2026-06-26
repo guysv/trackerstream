@@ -79,6 +79,33 @@ export class Fence {
   }
 
   /**
+   * Seconds-from-start that are contiguously playable with the currently-resident
+   * samples: the start time of the earliest order whose required samples are not
+   * all resident, or `duration` if the whole song is covered. Pure (no stall-state
+   * mutation) — drives the seek-bar buffered fill so it shows real playable
+   * timeline, not raw download %. `requiredAt` only changes at checkpoint orders
+   * (plus the pre-first-checkpoint region at order 0), so those are the only
+   * candidate stall points to test.
+   */
+  playableSeconds(orderSeconds: { order: number; seconds: number }[], duration: number): number {
+    if (this.cps.length === 0) return duration; // nothing gates -> fully playable
+    if (!this.allProvided(this.requiredAt(0))) return this.secondsForOrder(orderSeconds, 0);
+    for (const cp of this.cps) {
+      if (!this.allProvided(this.requiredAt(cp.order)))
+        return this.secondsForOrder(orderSeconds, cp.order);
+    }
+    return duration;
+  }
+
+  // Start time of `order` from the baked order->seconds map: the latest mapped
+  // order at or before `order` (seconds are monotonic with order). 0 if unmapped.
+  private secondsForOrder(orderSeconds: { order: number; seconds: number }[], order: number): number {
+    let best = 0;
+    for (const os of orderSeconds) if (os.order <= order && os.seconds > best) best = os.seconds;
+    return best;
+  }
+
+  /**
    * May playback proceed at `order`? Mutates internal stall state so the caller
    * can detect transitions (buffering on/off). With no checkpoints (or none in
    * range that need samples) returns true — nothing to gate.

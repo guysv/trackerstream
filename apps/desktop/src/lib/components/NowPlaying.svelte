@@ -42,7 +42,14 @@
       <span class="t">{fmtTime(pos?.seconds ?? 0)}</span>
       <div class="seek" onclick={seek} onkeydown={seekKey} role="slider" aria-label="seek" tabindex="0" aria-valuenow={pos?.seconds ?? 0}>
         {#if nowPlaying.streaming}
-          <div class="buf" style="width:{nowPlaying.pct}%"></div>
+          <!-- Real buffered timeline: how far into the SONG playback can proceed
+               without stalling (fence-resident), not raw % of samples downloaded. -->
+          <div
+            class="buf"
+            style="width:{info?.durationSeconds
+              ? Math.min(100, (nowPlaying.bufferedSeconds / info.durationSeconds) * 100)
+              : 0}%"
+          ></div>
         {/if}
         <div
           class="played"

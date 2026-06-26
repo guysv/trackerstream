@@ -129,6 +129,15 @@ async fn get_sample(root: String, index: u32, streams: State<'_, Streams>) -> Re
     Ok(Response::new(data))
 }
 
+/// Frontend debug bridge: the webview console isn't visible in the dev terminal,
+/// so the UI streaming-state tracer (lib/debug.ts) forwards transitions here and
+/// we print them to stderr alongside the RUST_LOG tracing. Gated on the frontend
+/// (DEBUG flag) so it's a no-op in normal runs.
+#[tauri::command]
+fn debug_log(line: String) {
+    eprintln!("[UIDBG] {line}");
+}
+
 /// Update the live playhead order so the prefetch scheduler reprioritizes around
 /// it (closed-loop; also how a seek reseeds the fetch queue).
 #[tauri::command]
@@ -177,7 +186,8 @@ pub fn run() {
             start_stream,
             get_skeleton,
             get_sample,
-            set_playhead
+            set_playhead,
+            debug_log
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
