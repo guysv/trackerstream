@@ -1,9 +1,67 @@
 # Beating full-load TTFP for compressed-sample IT modules with streaming
 
-Status: **research proposal** · Author: design discussion 2026-06-26 ·
-Baseline branch: `research/compressed-it-streaming` · Depends on the v2
-immortal-instance + fence (see `STREAMING-PARITY.md`,
+Status: **RESOLVED — streaming now beats full-load**, shipped to prod 2026-06-26
+(branch `feat/compressed-it-streaming`). The original negative result below stands
+as the analysis that led here; the **Resolution** section records what actually
+won. Depends on the v2 immortal-instance + fence (see `STREAMING-PARITY.md`,
 `STREAMING-PARITY-V2-SCHEMA.md`).
+
+## Resolution (2026-06-26): streaming wins
+
+Three changes — two predicted here (H1, H5/skeleton) plus a no-regression gate —
+flip the result. Validated cold against the prod master (real Bitswap, fresh node
+per track), oracle parity `0.00e+0` across IT/MOD/S3M/XM:
+
+| module (full-load KB) | OLD full-load TTFP | NEW streaming TTFP |
+|---|---|---|
+| ctf.it (494) | 976 / 979 / 1047 ms | **899 / 832 / 749 ms** |
+| energ.it (1064) | 1980 / 1969 / 1840 ms | **917 / 893 / 994 ms** (≈50% faster) |
+| e-u_azom.it (441) | 934 / 828 / 832 ms | **922 / 763 / 764 ms** |
+
+What did it:
+
+1. **H1 — single-batch order-0 prefetch** (`ipfs::stream_v2`). One Bitswap want-list
+   over skeleton chunks ∪ all `required_at(0)` sample leaves, then assemble the
+   skeleton + order-0 samples from that warm batch before the per-sample loop. The
+   order-0 PCM pipelines on the same cold session instead of paying N serial
+   round-trips — exactly the `r`→1 collapse predicted. (ctf: order-0 samples now
+   land at the *same* wall-clock as the skeleton; `ready_ms == skeleton_ms`.)
+
+2. **Zero-fill skeleton recipe** (bake, the decisive byte lever). The normalized
+   skeleton is mostly zeros (orphaned compressed bytes + zeroed PCM + the appended
+   decoded-length tail). Those zeros do **not** dedup — FastCDC (8 KB min) straddles
+   each hole and each hole's remainder is a unique-length zero block — so they
+   *bloated the skeleton past the original file* (the real reason naïve streaming
+   lost: skeleton distinct, not just B0). Fix: don't transfer zeros at all. Encode
+   zero runs as length directives in a new `skeletonLayout` (run-length
+   `[nContentChunks, zeroBytes, …]`); only structure is fetched, zeros are
+   synthesized client-side. Skeleton bytes unchanged → parity bit-exact. ctf skeleton
+   fetch 300 KB → ~90 KB structure. This is H5 taken to its conclusion (the
+   irreducible part is just headers/patterns/sample-headers).
+
+3. **No-regression gate** (bake). Stream a module's compressed samples only when the
+   first-playable saving (full-load − streaming warm set, deduped) ≥ **128 KB**.
+   Below it the module sits at the cold round-trip floor (~0.5 s) where full-load
+   already wins; demote compressed to resident (prior full-load behavior, never
+   worse). Measured crossover ~50–120 KB. **107 of 183 compressed ITs** clear the
+   gate and stream; the rest stay full-load. 165/183 shrink first-playable bytes,
+   but only the 107 clear the floor overhead.
+
+H4 (stream compressed bytes + client IT215 decode) was **not needed**: zero-fill +
+H1 already win for the gated class. H4 remains the path to the ~18 compressed ITs
+whose order-0 *decoded* set is itself larger than the whole file (negative saving).
+
+Shipped: full prod REBUILD (1433 roots re-baked, 0 failed; pinset intact, every
+catalog root pinned). Manifest schema gained `skeletonLayout` — a **breaking**
+change for the skeleton reconstruction, so the desktop client must ship the
+matching `assemble_skeleton` (it does on this branch). No live clients at rollout.
+
+---
+
+## Original research proposal (negative result — superseded above)
+
+Author: design discussion 2026-06-26 · Baseline branch:
+`research/compressed-it-streaming`.
 
 ## Abstract
 
