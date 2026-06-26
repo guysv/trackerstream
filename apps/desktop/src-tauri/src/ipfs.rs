@@ -902,4 +902,59 @@ mod tests {
         .unwrap();
         assert_eq!(got.data(), payload.as_slice());
     }
+
+    // The REAL brittleness guard for ping capture: two live nodes ping each other
+    // and we assert pinglog's map gets populated — i.e. connexa STILL logs ping
+    // RTTs in the shape our tracing layer parses. If connexa changes its log
+    // wording/level (or ping stops firing), this fails. Slow (~libp2p ping interval,
+    // ~15s) and installs a process-global subscriber, so it's #[ignore]'d:
+    //   cargo test --lib ping_capture_from_real_nodes -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "slow (~15s, waits for a real libp2p ping) + sets a global tracing subscriber"]
+    async fn ping_capture_from_real_nodes() {
+        use tracing_subscriber::prelude::*;
+        // Cross-thread (swarm task) events need a GLOBAL default subscriber.
+        let sub = tracing_subscriber::registry().with(
+            crate::pinglog::PingLayer
+                .with_filter(tracing_subscriber::EnvFilter::new(crate::pinglog::PING_DIRECTIVE)),
+        );
+        let _ = tracing::subscriber::set_global_default(sub);
+
+        let a = start(None).await.unwrap();
+        let b = start(None).await.unwrap();
+        let port = a
+            .ipfs
+            .listening_addresses()
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|m| {
+                m.iter().find_map(|p| match p {
+                    Protocol::Tcp(port) => Some(port),
+                    _ => None,
+                })
+            })
+            .expect("A should have a TCP listener");
+        connect(&b.ipfs, &format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", a.peer_id))
+            .await
+            .unwrap();
+
+        // Poll until a ping RTT is captured (either direction populates the map).
+        let waited = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                if crate::pinglog::ping_rtt(&a.peer_id).is_some()
+                    || crate::pinglog::ping_rtt(&b.peer_id).is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "no ping RTT captured in 40s — connexa's ping log format likely changed \
+             (pinglog parse broke), or ping didn't fire"
+        );
+    }
 }

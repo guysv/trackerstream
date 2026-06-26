@@ -1,11 +1,22 @@
 <script lang="ts">
-  import { peers } from "$lib/peers.svelte";
+  import { peers, selection, selectPeer } from "$lib/peers.svelte";
   import { fmtBytes } from "$lib/format";
+  import PeerDetail from "./PeerDetail.svelte";
 
   const rate = (n: number): string => `${fmtBytes(n)}/s`;
   const short = (id: string): string => (id.length > 16 ? `${id.slice(0, 6)}…${id.slice(-6)}` : id);
+
+  function rowKey(e: KeyboardEvent, id: string): void {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      selectPeer(id);
+    }
+  }
 </script>
 
+{#if selection.id}
+  <PeerDetail peerId={selection.id} />
+{:else}
 <div class="peers">
   <div class="phead">
     <span>peers · {peers.connected} connected</span>
@@ -31,7 +42,15 @@
 
   <div class="plist">
     {#each peers.rows as p (p.id)}
-      <div class="prow" class:off={!p.connected}>
+      <div
+        class="prow"
+        class:off={!p.connected}
+        role="button"
+        tabindex="0"
+        onclick={() => selectPeer(p.id)}
+        onkeydown={(e) => rowKey(e, p.id)}
+        title="view peer details"
+      >
         <span
           class="dot"
           class:master={p.role === "master"}
@@ -50,6 +69,7 @@
     {#if !peers.rows.length}<div class="empty">no peers yet</div>{/if}
   </div>
 </div>
+{/if}
 
 <style>
   .peers {
@@ -110,6 +130,15 @@
     padding: 0.35rem 0.8rem;
     font-size: 12px;
     border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+    cursor: pointer;
+    text-align: left;
+  }
+  .prow:hover {
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
+  }
+  .prow:focus-visible {
+    outline: 1px solid var(--cyan);
+    outline-offset: -1px;
   }
   .prow.off {
     opacity: 0.4;

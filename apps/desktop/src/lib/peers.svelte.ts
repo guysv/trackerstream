@@ -33,6 +33,21 @@ let timer: ReturnType<typeof setInterval> | null = null;
 let prev = new Map<string, { down: number; up: number }>();
 let lastT = 0;
 
+// --- peer-detail support (peers-pane single-peer view) ---
+// Which peer the pane is focused on (null = list view).
+export const selection = $state<{ id: string | null }>({ id: null });
+export const selectPeer = (id: string): void => void (selection.id = id);
+export const clearSelection = (): void => void (selection.id = null);
+
+// Per-peer rolling download-speed samples (for the detail sparkline) + the time
+// each peer first appeared connected (approx "connected since"). Maintained by the
+// same 1 Hz tick that feeds the list.
+const HISTORY_LEN = 60;
+const speedHist = new Map<string, number[]>();
+const firstConnected = new Map<string, number>();
+export const speedHistory = (id: string): number[] => speedHist.get(id) ?? [];
+export const connectedSince = (id: string): number | null => firstConnected.get(id) ?? null;
+
 async function tick(): Promise<void> {
   try {
     const s = await peerStats();
@@ -53,6 +68,16 @@ async function tick(): Promise<void> {
       aggDown += speedDown;
       aggUp += speedUp;
       if (p.role !== "master") offloadDown += p.down;
+      // Sparkline history + connected-since bookkeeping.
+      const hist = speedHist.get(p.id) ?? [];
+      hist.push(speedDown);
+      if (hist.length > HISTORY_LEN) hist.shift();
+      speedHist.set(p.id, hist);
+      if (p.connected) {
+        if (!firstConnected.has(p.id)) firstConnected.set(p.id, now);
+      } else {
+        firstConnected.delete(p.id); // reset so reconnect restarts the clock
+      }
       return {
         id: p.id,
         down: p.down,
