@@ -64,21 +64,6 @@ export class Catalog {
         title, filename, instruments, comment,
         content='', tokenize='unicode61'
       );
-      CREATE TABLE IF NOT EXISTS playlists (
-        id INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        is_public INTEGER NOT NULL DEFAULT 0,
-        owner TEXT,
-        created_at INTEGER,
-        updated_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS playlist_items (
-        playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-        position INTEGER NOT NULL,
-        module_id INTEGER NOT NULL,
-        root_cid TEXT NOT NULL,
-        PRIMARY KEY (playlist_id, position)
-      );
     `);
     this.insertStmt = this.db.prepare(`
       INSERT INTO modules
@@ -117,17 +102,14 @@ export class Catalog {
       .get(source) as { id: number; rootCid: string } | undefined;
   }
 
-  /** Point a module (and any playlist items referencing it) at a new root CID —
-   *  used after a re-bake produces a new manifest. Returns the module id. */
+  /** Point a module at a new root CID — used after a re-bake produces a new
+   *  manifest. Returns the module id. */
   updateRoot(source: string, rootCid: string, numBlocks: number): number | undefined {
     const row = this.getSourceMeta(source);
     if (!row) return undefined;
     this.db
       .prepare("UPDATE modules SET root_cid = ?, num_blocks = ? WHERE id = ?")
       .run(rootCid, numBlocks, row.id);
-    this.db
-      .prepare("UPDATE playlist_items SET root_cid = ? WHERE module_id = ?")
-      .run(rootCid, row.id);
     return row.id;
   }
 
@@ -184,69 +166,6 @@ export class Catalog {
 
   count(): number {
     return (this.db.prepare("SELECT COUNT(*) AS n FROM modules").get() as { n: number }).n;
-  }
-
-  playlistCount(): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM playlists").get() as { n: number }).n;
-  }
-
-  // --- playlists (control plane; never on the P2P plane) ---
-
-  createPlaylist(name: string, isPublic: boolean, owner: string | null): number {
-    const now = Date.now();
-    const res = this.db
-      .prepare("INSERT INTO playlists (name, is_public, owner, created_at, updated_at) VALUES (?,?,?,?,?)")
-      .run(name, isPublic ? 1 : 0, owner, now, now);
-    return res.lastInsertRowid as number;
-  }
-
-  listPlaylists(owner?: string): Array<{ id: number; name: string; isPublic: boolean; count: number }> {
-    const where = owner ? "WHERE p.owner = ? OR p.is_public = 1" : "";
-    const rows = this.db
-      .prepare(`
-        SELECT p.id, p.name, p.is_public AS isPublic,
-               (SELECT COUNT(*) FROM playlist_items pi WHERE pi.playlist_id = p.id) AS count
-        FROM playlists p ${where} ORDER BY p.updated_at DESC
-      `)
-      .all(...(owner ? [owner] : [])) as Array<{ id: number; name: string; isPublic: number; count: number }>;
-    return rows.map((r) => ({ ...r, isPublic: !!r.isPublic }));
-  }
-
-  getPlaylist(id: number): { id: number; name: string; isPublic: boolean; owner: string | null; items: SearchHit[] } | undefined {
-    const p = this.db
-      .prepare("SELECT id, name, is_public AS isPublic, owner FROM playlists WHERE id = ?")
-      .get(id) as { id: number; name: string; isPublic: number; owner: string | null } | undefined;
-    if (!p) return undefined;
-    const items = this.db
-      .prepare(`
-        SELECT m.id, m.filename, m.format, m.title, m.duration, m.channels, m.root_cid AS rootCid
-        FROM playlist_items pi JOIN modules m ON m.id = pi.module_id
-        WHERE pi.playlist_id = ? ORDER BY pi.position
-      `)
-      .all(id) as unknown as SearchHit[];
-    return { id: p.id, name: p.name, isPublic: !!p.isPublic, owner: p.owner, items };
-  }
-
-  setPlaylistItems(id: number, moduleIds: number[]): void {
-    this.db.prepare("DELETE FROM playlist_items WHERE playlist_id = ?").run(id);
-    const ins = this.db.prepare(
-      "INSERT INTO playlist_items (playlist_id, position, module_id, root_cid) " +
-        "SELECT ?, ?, id, root_cid FROM modules WHERE id = ?",
-    );
-    moduleIds.forEach((mid, pos) => ins.run(id, pos, mid));
-    this.db.prepare("UPDATE playlists SET updated_at = ? WHERE id = ?").run(Date.now(), id);
-  }
-
-  updatePlaylistMeta(id: number, name?: string, isPublic?: boolean): void {
-    if (name !== undefined) this.db.prepare("UPDATE playlists SET name = ? WHERE id = ?").run(name, id);
-    if (isPublic !== undefined)
-      this.db.prepare("UPDATE playlists SET is_public = ? WHERE id = ?").run(isPublic ? 1 : 0, id);
-    this.db.prepare("UPDATE playlists SET updated_at = ? WHERE id = ?").run(Date.now(), id);
-  }
-
-  deletePlaylist(id: number): void {
-    this.db.prepare("DELETE FROM playlist_items WHERE playlist_id = ?").run(id);
-    this.db.prepare("DELETE FROM playlists WHERE id = ?").run(id);
   }
 
   close(): void {

@@ -6,7 +6,6 @@ import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
 import { ModPlayer } from "./audio/ModPlayer.svelte";
 import { Fence } from "./audio/fence";
 import { connectPeer, startStream, getSkeleton, getSample, setPlayhead } from "./p2p";
-import { pushPresence } from "./social.svelte";
 import { dbg } from "./debug";
 import type { ModuleHit } from "./catalog";
 
@@ -174,7 +173,6 @@ export async function playModule(hit: ModuleHit): Promise<void> {
   bufferFence = null;
   planOrderSeconds = [];
   const epoch = ++playEpoch; // this track's token; stale callbacks bail on mismatch
-  pushPresence(hit); // presence: "now playing" (no-op when logged out)
   try {
     await player.init();
     await ensureConnected();

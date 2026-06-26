@@ -5,41 +5,17 @@
   import DetailPanel from "$lib/components/DetailPanel.svelte";
   import NowPlaying from "$lib/components/NowPlaying.svelte";
   import QueuePanel from "$lib/components/QueuePanel.svelte";
-  import SocialPanel from "$lib/components/SocialPanel.svelte";
-  import { auth } from "$lib/social.svelte";
   import {
     search,
     listModules,
     getFormats,
-    listPlaylists,
-    getPlaylist,
     type ModuleHit,
     type FormatCount,
-    type PlaylistSummary,
   } from "$lib/catalog";
   import { playList, playNext, playPrev, player, nowPlaying, queue } from "$lib/player.svelte";
   import { initDeepLinks } from "$lib/deeplink";
 
-  let playlists = $state<PlaylistSummary[]>([]);
-  let rightView = $state<"detail" | "queue" | "social">("detail");
-
-  async function refreshPlaylists() {
-    try {
-      playlists = await listPlaylists();
-    } catch {
-      /* offline */
-    }
-  }
-
-  async function openPlaylist(id: number) {
-    try {
-      const pl = await getPlaylist(id);
-      rows = pl.items;
-      selectedId = pl.items[0]?.id ?? null;
-    } catch {
-      /* offline */
-    }
-  }
+  let rightView = $state<"detail" | "queue">("detail");
 
   function play(h: ModuleHit) {
     playList(
@@ -93,9 +69,8 @@
     getFormats()
       .then((f) => ((formats = f.formats), (total = f.total)))
       .catch(() => (apiError = true));
-    void refreshPlaylists();
-    // E2: trackerstream://share/<code> links open straight onto the shared module.
-    void initDeepLinks({ onPlaylist: (id) => void openPlaylist(id) });
+    // E2: register the trackerstream:// scheme (handlers land with P2P sharing).
+    void initDeepLinks();
     window.addEventListener("keydown", globalKeys);
     return () => window.removeEventListener("keydown", globalKeys);
   });
@@ -143,22 +118,17 @@
     <button class="qtoggle" class:on={rightView === "queue"} onclick={() => (rightView = rightView === "queue" ? "detail" : "queue")}>
       queue · {queue.items.length}
     </button>
-    <button class="qtoggle" class:on={rightView === "social"} onclick={() => (rightView = rightView === "social" ? "detail" : "social")}>
-      {auth.email ? auth.email.split("@")[0] : "account"}
-    </button>
     <span class="engine">{player.ready ? "engine ●" : "engine ○"}</span>
   </header>
 
   <main>
-    <Sidebar {formats} {total} {playlists} bind:format bind:sort onPlaylist={openPlaylist} />
+    <Sidebar {formats} {total} bind:format bind:sort />
     <section class="results">
       <ResultsTable {rows} bind:selectedId onplay={play} />
     </section>
     <aside class="detail">
       {#if rightView === "queue"}
         <QueuePanel />
-      {:else if rightView === "social"}
-        <SocialPanel />
       {:else}
         <DetailPanel id={selectedId} onplay={play} />
       {/if}
