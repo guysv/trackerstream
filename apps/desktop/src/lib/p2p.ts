@@ -39,6 +39,27 @@ export interface PeerStats {
 /** Snapshot of per-peer cumulative up/down bytes + connected state (peers pane). */
 export const peerStats = (): Promise<PeerStats> => invoke<PeerStats>("peer_stats");
 
+/** Rich, on-demand info for one peer (the peers-pane detail view). Heavier than
+ *  peerStats — fetched only while a peer is selected. All local-node sourced. */
+export interface PeerDetail {
+  id: string;
+  connected: boolean;
+  role: PeerRole;
+  warm_reason: string[]; // root CID(s) or "roster"; empty if not warm
+  down: number;
+  up: number;
+  addrs: string[]; // live connected multiaddrs
+  relayed: boolean; // every connection is via the master's circuit relay
+  transport: string; // quic | tcp | relay | direct | unknown
+  agent: string | null; // identify user-agent
+  protocols: string[];
+  observed_addr: string | null;
+  rtt_ms: number | null; // latest ping RTT, if observed
+}
+
+export const peerDetail = (id: string): Promise<PeerDetail> =>
+  invoke<PeerDetail>("peer_detail", { peerId: id });
+
 export const connectPeer = (addr: string): Promise<void> => invoke("connect_peer", { addr });
 
 /** Queue-driven pre-connection: ask the tracker who holds `root` and warm-connect

@@ -5,6 +5,7 @@
 
 pub mod ipfs;
 pub mod ipns;
+pub mod pinglog;
 pub mod tracker;
 
 use cid::Cid;
@@ -105,6 +106,17 @@ impl WarmSet {
     /// Currently-warm peers — for the peers-pane `role` tag (B6 telemetry).
     fn members(&self) -> HashSet<PeerId> {
         self.0.lock().unwrap().keys().copied().collect()
+    }
+
+    /// Why this peer is warm: the root CID(s) that pulled it in, or "roster".
+    /// Empty if it isn't in the warm set. For the peer-detail view.
+    fn reason(&self, pid: &PeerId) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(pid)
+            .map(|e| e.roots.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Remove + return the LRU peers above `WARM_CAP` so the caller can disconnect
@@ -217,6 +229,108 @@ async fn peer_stats(
         })
         .collect();
     Ok(PeerStats { connected: connected.len(), peers })
+}
+
+/// Rich, on-demand per-peer info for the peers-pane detail view. Heavier than
+/// peer_stats (live connection addrs + an identify lookup), so it's fetched only
+/// while a peer is selected, not in the 1 Hz list poll. All fields are sourced
+/// from the local node (Bucket A) — no tracker call.
+#[derive(Serialize)]
+struct PeerDetail {
+    id: String,
+    connected: bool,
+    role: &'static str,
+    /// Root CID(s) that warmed this peer, or "roster"; empty if not warm.
+    warm_reason: Vec<String>,
+    down: u64,
+    up: u64,
+    /// Live connected multiaddr(s) for this peer (the actual endpoints).
+    addrs: Vec<String>,
+    /// True when every live connection is over the master's circuit relay — i.e.
+    /// bytes still flow through the master (a non-offload). The §5 relay trap, surfaced.
+    relayed: bool,
+    /// "quic" | "tcp" | "relay" | "direct" | "unknown".
+    transport: String,
+    /// identify: peer's user-agent (e.g. trackerstream vs kubo), protocols, and the
+    /// address it observes us at.
+    agent: Option<String>,
+    protocols: Vec<String>,
+    observed_addr: Option<String>,
+    /// Latest ping RTT in milliseconds, if one has been observed yet.
+    rtt_ms: Option<f64>,
+}
+
+/// (all-relayed?, transport label) from the live connection addrs.
+fn classify_transport(addrs: &[String]) -> (bool, String) {
+    if addrs.is_empty() {
+        return (false, "unknown".into());
+    }
+    let direct: Vec<&String> = addrs.iter().filter(|a| !a.contains("/p2p-circuit")).collect();
+    match direct.first() {
+        Some(a) if a.contains("/quic") => (false, "quic".into()),
+        Some(a) if a.contains("/tcp") => (false, "tcp".into()),
+        Some(_) => (false, "direct".into()),
+        None => (true, "relay".into()), // every connection is /p2p-circuit
+    }
+}
+
+#[tauri::command]
+async fn peer_detail(
+    peer_id: String,
+    state: State<'_, IpfsState>,
+    warm: State<'_, Arc<WarmSet>>,
+) -> Result<PeerDetail, String> {
+    let pid: PeerId = peer_id.parse().map_err(|e| format!("bad peer id {peer_id}: {e}"))?;
+    let connected = state.ipfs.is_connected(pid).await.unwrap_or(false);
+    let (down, up) = ipfs::peer_bandwidth().get(&pid).copied().unwrap_or((0, 0));
+    let role = if ipfs::master_peer_id() == Some(pid) {
+        "master"
+    } else if warm.members().contains(&pid) {
+        "warm"
+    } else {
+        "other"
+    };
+    let warm_reason = warm.reason(&pid);
+    let addrs: Vec<String> = state
+        .ipfs
+        .addrs()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(p, _)| *p == pid)
+        .map(|(_, a)| a.iter().map(|m| m.to_string()).collect())
+        .unwrap_or_default();
+    let (relayed, transport) = classify_transport(&addrs);
+    // identify can stall for a peer mid-handshake; cap it so the command stays snappy.
+    let (agent, protocols, observed_addr) = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        state.ipfs.identity(Some(pid)),
+    )
+    .await
+    {
+        Ok(Ok(info)) => (
+            Some(info.agent_version),
+            info.protocols.iter().map(|p| p.to_string()).collect(),
+            info.observed_addr.map(|a| a.to_string()),
+        ),
+        _ => (None, vec![], None),
+    };
+    let rtt_ms = pinglog::ping_rtt(&peer_id).map(|d| d.as_secs_f64() * 1000.0);
+    Ok(PeerDetail {
+        id: peer_id,
+        connected,
+        role,
+        warm_reason,
+        down,
+        up,
+        addrs,
+        relayed,
+        transport,
+        agent,
+        protocols,
+        observed_addr,
+        rtt_ms,
+    })
 }
 
 #[tauri::command]
@@ -400,11 +514,21 @@ fn set_playhead(root: String, order: u32, streams: State<'_, Streams>) -> Result
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // RUST_LOG-driven tracing (rust-ipfs/libp2p/bitswap + our own spans). No-op
-    // unless RUST_LOG is set, so release runs stay quiet.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
+    // RUST_LOG-driven tracing (rust-ipfs/libp2p/bitswap + our own spans), plus a
+    // dedicated layer that captures connexa's ping-RTT log line into pinglog's map
+    // for the peers pane. The ping layer has its OWN filter so it works even when
+    // RUST_LOG is unset (release runs stay otherwise quiet — fmt is off by default).
+    {
+        use tracing_subscriber::prelude::*;
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+        let ping_layer = pinglog::PingLayer
+            .with_filter(tracing_subscriber::EnvFilter::new(pinglog::PING_DIRECTIVE));
+        let _ = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(ping_layer)
+            .try_init();
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // Deep links: trackerstream://share/<code> (E2). The frontend handles the
@@ -463,6 +587,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             node_info,
             peer_stats,
+            peer_detail,
             connect_peer,
             keepalive_master,
             warm_root,
