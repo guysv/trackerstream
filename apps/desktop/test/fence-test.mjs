@@ -78,6 +78,29 @@ const plan = {
   ok(f.ready(2) === true, "hysteresis: resumes once the lookahead margin is resident");
 }
 
+// playableSeconds: contiguous playable timeline (seek-bar buffered fill). Same
+// plan, with a time map; duration 40s. The buffered edge is the start time of the
+// first checkpoint order whose required samples aren't all resident.
+{
+  const os = [
+    { order: 0, seconds: 0 },
+    { order: 2, seconds: 10 },
+    { order: 4, seconds: 20 },
+    { order: 6, seconds: 30 },
+  ];
+  const f = new Fence(plan);
+  ok(f.playableSeconds(os, 40) === 0, "buffered: 0s with nothing resident (order 0 stalls)");
+  f.provide(1);
+  f.provide(2); // requiredAt(0)=[1,2] satisfied; next gap is order 2 (needs 3)
+  ok(f.playableSeconds(os, 40) === 10, "buffered: 10s once order 0's set is resident");
+  f.provide(3);
+  ok(f.playableSeconds(os, 40) === 20, "buffered: 20s once order 2's set is resident");
+  f.provide(4);
+  ok(f.playableSeconds(os, 40) === 40, "buffered: full duration once all resident");
+  // No checkpoints => nothing gates => fully playable (degrades like ready()).
+  ok(new Fence({ checkpoints: [] }).playableSeconds(os, 40) === 40, "buffered: empty plan = full");
+}
+
 if (fails) {
   console.log(`\n${fails} fence assertion(s) failed`);
   process.exit(1);

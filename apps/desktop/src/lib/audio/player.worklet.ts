@@ -84,6 +84,11 @@ class TrackerProcessor extends AudioWorkletProcessor {
   private numChannels = 0;
   private posCounter = 0;
   private wasBuffering = false;
+  // Whether we've emitted an authoritative buffering state for the current
+  // instance yet. The main thread shows buffering optimistically at track start;
+  // if the opening is already resident the fence never stalls, so we must still
+  // emit one explicit buffering:false to clear that UI (else it sticks on).
+  private bufferingReported = false;
   // Buffered until the wasm runtime / instance exists (Rust sends init before any
   // provideSample, but guard against arrival before libopenmpt finished loading).
   private pendingInit: PendingInit | null = null;
@@ -179,6 +184,7 @@ class TrackerProcessor extends AudioWorkletProcessor {
     }
     this.playing = false;
     this.wasBuffering = false;
+    this.bufferingReported = false;
     const arr = new Uint8Array(skeleton);
     const p = lib._malloc(arr.byteLength);
     lib.HEAPU8.set(arr, p);
@@ -267,14 +273,19 @@ class TrackerProcessor extends AudioWorkletProcessor {
     if (this.fence && !this.fence.ready(order)) {
       if (!this.wasBuffering) {
         this.wasBuffering = true;
+        this.bufferingReported = true;
         this.send({ type: "buffering", active: true, order });
       }
       left.fill(0);
       if (right !== left) right.fill(0);
       return true;
     }
-    if (this.wasBuffering) {
+    // Emit buffering:false when leaving a stall OR on the first playable frame
+    // (bufferingReported still false), so the UI's optimistic "buffering" always
+    // gets an explicit clear even when the opening never had to stall.
+    if (this.wasBuffering || !this.bufferingReported) {
       this.wasBuffering = false;
+      this.bufferingReported = true;
       this.send({ type: "buffering", active: false, order });
     }
 

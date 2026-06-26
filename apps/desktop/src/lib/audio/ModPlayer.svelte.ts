@@ -4,6 +4,7 @@
 // audio thread (player.worklet.ts); this side never touches PCM.
 
 import type { FromWorklet, ModuleInfo, PlanData, Position, ToWorklet } from "./messages";
+import { dbg } from "../debug";
 
 const WORKLET_URL = "/player.worklet.js"; // pre-bundled by scripts/build-worklet.mjs
 const SAMPLE_RATE = 48000;
@@ -54,9 +55,16 @@ export class ModPlayer {
   private onMessage(msg: FromWorklet) {
     switch (msg.type) {
       case "ready":
+        dbg("worklet.ready", { version: msg.version });
         this.ready = true;
         break;
       case "loaded":
+        dbg("worklet.loaded", {
+          type: msg.info.type,
+          dur: +msg.info.durationSeconds.toFixed(1),
+          orders: msg.info.numOrders,
+          samples: msg.info.numSamples,
+        });
         this.info = msg.info;
         this.loading = false;
         this.error = null;
@@ -66,14 +74,17 @@ export class ModPlayer {
         this.onPos?.(msg.pos);
         break;
       case "buffering":
+        dbg("worklet.buffering", { active: msg.active, order: msg.order });
         this.buffering = msg.active;
         this.onBuffering?.(msg.active);
         break;
       case "ended":
+        dbg("worklet.ended");
         this.playing = false;
         this.onEnded?.();
         break;
       case "error":
+        dbg("worklet.error", { message: msg.message });
         this.error = msg.message;
         this.loading = false;
         break;
@@ -129,6 +140,7 @@ export class ModPlayer {
   }
 
   seekSeconds(seconds: number): void {
+    dbg("user.seekSeconds", { seconds: +seconds.toFixed(2), fromOrder: this.pos?.order });
     this.send({ type: "seekSeconds", seconds });
   }
 
