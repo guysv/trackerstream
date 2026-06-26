@@ -464,6 +464,20 @@ export async function buildDagV2(
       (!opts.noCompressedStream && covered.has(c.slot.index)),
   );
 
+  // The plan may only reference slots we actually STREAM. The no-regression re-bake
+  // (noCompressedStream) demotes every compressed slot to resident-in-skeleton, so a
+  // fully-compressed module bakes to zero streamed samples — yet its checkpoints were
+  // computed from `candidates` and still name those (now-resident) slots. A client
+  // fence would then wait forever for samples that never arrive (buffering stuck at
+  // 100%) even though the skeleton already holds the full audio. Tighten the plan to
+  // the streamed set and drop emptied checkpoints; an empty plan tells the fence there
+  // is nothing to gate, so the all-resident skeleton plays immediately. (No-op for the
+  // normal path: there `streamed` already ⊇ every checkpointed slot.)
+  const streamedIdx = new Set(streamed.map((s) => s.slot.index));
+  plan.checkpoints = plan.checkpoints
+    .map((c) => ({ order: c.order, samples: c.samples.filter((s) => streamedIdx.has(s)) }))
+    .filter((c) => c.samples.length);
+
   const byCid = new Map<string, Block>();
   const add = (b: Block) => {
     const k = b.cid.toString();
