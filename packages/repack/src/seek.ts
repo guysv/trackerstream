@@ -206,8 +206,10 @@ function sampleInfos(b: Uint8Array, h: ItHeader): SmpInfo[] {
       ptr = u32(b, so + 0x48),
       c5 = u32(b, so + 0x3c) || 8363;
     const loops = !!(flg & 0x10) || !!(flg & 0x20);
-    // hasPcm mirrors extractITLike: associated (1), has len+ptr, NOT compressed (8).
-    const hasPcm = !!(flg & 1) && !!len && !!ptr && !(flg & 8);
+    // hasPcm mirrors itLikeSlots: associated (1), has len+ptr. Compressed (8) slots
+    // ARE streamed now (decoded PCM), so they must appear in checkpoints too — keyed
+    // by the same `ptr` offset the bake uses as its join key (idxByOffset).
+    const hasPcm = !!(flg & 1) && !!len && !!ptr;
     out.push({ offset: hasPcm ? ptr : -1, len, c5, loops, hasPcm });
   }
   return out;

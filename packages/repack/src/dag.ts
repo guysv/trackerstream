@@ -261,7 +261,8 @@ export interface ManifestV2 {
   v: number; // 2
   format: Format;
   cdc: CdcConfig;
-  skeletonChunks: CID[]; // normalized skeleton: streamed slots' PCM zeroed
+  skeletonChunks: CID[]; // structure content chunks of the normalized skeleton (zeros excluded)
+  skeletonLayout: number[]; // run-length recipe [nContentChunks, zeroBytes, ...]; zeros synthesized client-side
   index?: IndexV2; // inline (default)
   indexRoot?: CID; // OR spilled to its own block (large modules)
 }
@@ -291,11 +292,94 @@ export interface BuiltDagV2 {
 }
 
 /** Copy of `data` with each streamed slot's on-disk PCM zeroed (still a valid,
- * loadable module — create_from_memory yields silent, all-pending samples). */
-function buildSkeletonV2(data: Uint8Array, streamed: { offset: number; length: number }[]): Uint8Array {
-  const sk = new Uint8Array(data); // full-size copy
-  for (const s of streamed) sk.fill(0, s.offset, s.offset + s.length);
-  return sk;
+ * loadable module — create_from_memory yields silent, all-pending samples).
+ *
+ * Returns the skeleton bytes AND the byte ranges that are now all-zero (orphaned
+ * compressed regions, zeroed uncompressed regions, and the appended zero-fill
+ * tail). The caller splits the skeleton at those zero-span edges into structure
+ * segments (transferred as content chunks) and zero runs (encoded as length
+ * directives in `skeletonLayout`, synthesized client-side, never transferred).
+ * Otherwise FastCDC's 8 KB-min chunks straddle each hole and per-hole remainders
+ * are unique-length zero blocks — bloating the skeleton past the original file
+ * (the dominant TTFP loss for small compressed ITs). */
+function buildSkeletonV2(
+  data: Uint8Array,
+  streamed: {
+    offset: number;
+    length: number;
+    compressed?: boolean;
+    headerOffset?: number;
+    compressedBytes?: number;
+  }[],
+): { skeleton: Uint8Array; zeroSpans: Array<[number, number]> } {
+  // Uncompressed slots: zero their on-disk region in place (the header already
+  // describes an uncompressed buffer of exactly `length`). Compressed slots: the
+  // on-disk bytes are compressed and shorter than the decoded PCM, so we can't zero
+  // in place — append an uncompressed zero-fill region of the decoded `length` at
+  // EOF, repoint the sample's data pointer (IT header +0x48) there, and clear the IT
+  // compression flag (+0x12 bit 0x08). create_from_memory then allocates a decoded-
+  // length SILENT buffer that provide_sample overwrites bit-exactly. The orphaned
+  // compressed region is ZEROED (when its span is known) so it dedups to a zero block
+  // instead of transferring as dead weight — otherwise the skeleton would carry both
+  // the compressed source AND the streamed PCM.
+  const raw = streamed.filter((s) => !s.compressed);
+  const comp = streamed.filter((s) => s.compressed);
+  const extra = comp.reduce((n, s) => n + s.length, 0);
+  const sk = new Uint8Array(data.length + extra); // tail is zero-initialized
+  sk.set(data);
+  const zeroSpans: Array<[number, number]> = [];
+  for (const s of raw) {
+    sk.fill(0, s.offset, s.offset + s.length);
+    zeroSpans.push([s.offset, s.offset + s.length]);
+  }
+  let cursor = data.length;
+  for (const s of comp) {
+    const ho = s.headerOffset!;
+    if (s.compressedBytes) {
+      sk.fill(0, s.offset, s.offset + s.compressedBytes); // orphan -> zeros
+      zeroSpans.push([s.offset, s.offset + s.compressedBytes]);
+    }
+    sk[ho + 0x12] &= ~0x08; // clear "compressed" flag -> raw PCM
+    sk[ho + 0x48] = cursor & 0xff; // repoint data pointer (u32le) to the appended zero region
+    sk[ho + 0x49] = (cursor >>> 8) & 0xff;
+    sk[ho + 0x4a] = (cursor >>> 16) & 0xff;
+    sk[ho + 0x4b] = (cursor >>> 24) & 0xff;
+    cursor += s.length; // region already zero from the fresh allocation
+  }
+  if (extra > 0) zeroSpans.push([data.length, sk.length]); // appended zero-fill tail
+  return { skeleton: sk, zeroSpans };
+}
+
+/** Sort + merge zero spans into disjoint, ascending [start,end) ranges clamped to
+ * [0,len], coalescing overlapping/adjacent ones. The skeleton recipe walks these
+ * to split structure (content chunks) from zero runs (length directives). */
+function mergeSpans(spans: Array<[number, number]>, len: number): Array<[number, number]> {
+  const norm = spans
+    .map(([a, b]) => [Math.max(0, Math.min(a, len)), Math.max(0, Math.min(b, len))] as [number, number])
+    .filter(([a, b]) => b > a)
+    .sort((x, y) => x[0] - y[0]);
+  const out: Array<[number, number]> = [];
+  for (const [a, b] of norm) {
+    const last = out[out.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+    else out.push([a, b]);
+  }
+  return out;
+}
+
+/** Slot indices that must be resident to start playback at order 0 — the floor
+ * checkpoint at order 0 UNION the next one (mirrors PlanV2::required_at(0) in the
+ * client/fence). Used by the bake's compressed-streaming gate to size the warm set. */
+function requiredAtZero(plan: PlanV2): Set<number> {
+  const cps = [...plan.checkpoints].sort((a, b) => a.order - b.order);
+  if (!cps.length) return new Set();
+  let floor = -1;
+  for (let i = 0; i < cps.length; i++) if (cps[i].order <= 0) floor = i;
+  const lo = Math.max(floor, 0);
+  const hi = Math.min(Math.max(floor + 1, 0), cps.length - 1);
+  const set = new Set<number>();
+  for (let k = lo; k <= hi; k++) for (const s of cps[k].samples) set.add(s);
+  return set;
 }
 
 /**
@@ -306,10 +390,20 @@ function buildSkeletonV2(data: Uint8Array, streamed: { offset: number; length: n
  * resident, dropped from the plan) — never wrong audio, just less dedup.
  * Throws if the format can't be parsed (caller falls back to v1 flat DAG).
  */
+/** Minimum first-playable byte saving (full-load − streaming warm set) for which we
+ * stream a module's COMPRESSED samples. Below it the module is small enough that
+ * full-load TTFP already sits at the cold round-trip floor (~0.5 s) and streaming's
+ * per-sample coordination loses; measured crossover is ~50–120 KB, so 128 KB is a
+ * safe no-regression gate. Uncompressed-sample streaming is unaffected (it carves
+ * raw regions with no decoded-PCM inflation, and the zero-fill skeleton only shrinks
+ * the fetch). See STREAMING-COMPRESSED-IT-RESEARCH.md. */
+const COMPRESSED_STREAM_MIN_SAVING = 128 * 1024;
+
 export async function buildDagV2(
   data: Uint8Array,
   decoded: DecodedSample[],
   cdc: CdcConfig = DEFAULT_CDC,
+  opts: { noCompressedStream?: boolean } = {},
 ): Promise<BuiltDagV2> {
   const parsed = sampleSlots(data);
   if (!parsed) throw new Error("unparseable module (cannot locate sample slots)");
@@ -318,58 +412,20 @@ export async function buildDagV2(
   const dumpByIndex = new Map<number, DecodedSample>();
   for (const d of decoded) dumpByIndex.set(d.index, d);
 
-  // Decide streamed vs resident-in-skeleton, slot by slot.
-  const streamed: { slot: (typeof slots)[number]; dump: DecodedSample }[] = [];
+  // Candidate streamed slots: a locatable decoded region whose length matches the
+  // dump. (Compressed slots carry the decoded byte length + a skeleton-synth tag.)
+  const candidates: { slot: (typeof slots)[number]; dump: DecodedSample }[] = [];
   for (const slot of slots) {
     const dump = dumpByIndex.get(slot.index);
     if (!dump || dump.data.length === 0) continue; // no PCM dumped -> rides in skeleton
     if (dump.data.length !== slot.length) continue; // length disagree -> be safe, don't stream
-    streamed.push({ slot, dump });
+    candidates.push({ slot, dump });
   }
 
-  const byCid = new Map<string, Block>();
-  const add = (b: Block) => {
-    const k = b.cid.toString();
-    if (!byCid.has(k)) byCid.set(k, b);
-    return b.cid;
-  };
-  let numChunks = 0;
-  const chunkToCids = async (buf: Uint8Array): Promise<CID[]> => {
-    const cids: CID[] = [];
-    for (const c of cdcChunks(buf, cdc)) {
-      numChunks++;
-      cids.push(add(await rawBlock(c.slice())));
-    }
-    return cids;
-  };
-
-  // Sample table (inline leaf CIDs — the pre-resolved index).
-  const samples: SampleV2[] = [];
-  let sampleBytes = 0;
-  for (const { slot, dump } of streamed) {
-    sampleBytes += dump.data.length;
-    const chunks = await chunkToCids(dump.data);
-    samples.push({
-      index: slot.index,
-      frames: dump.frames,
-      channels: slot.channels,
-      bitDepth: slot.bitDepth,
-      chunks,
-    });
-  }
-
-  // Normalized skeleton (streamed regions zeroed) -> chunks.
-  const skeleton = buildSkeletonV2(
-    data,
-    streamed.map((s) => s.slot),
-  );
-  const skeletonChunks = await chunkToCids(skeleton);
-
-  // Planning index. computeSeekTables works in PCM byte offsets; map those to
-  // the streamed slot indices (offsets that don't resolve to a streamed slot are
-  // dropped — they ride in the skeleton, always resident).
+  // Plan FIRST: we may only stream what the fence can gate. computeSeekTables works
+  // in PCM byte offsets; map those to candidate slot indices via the on-disk offset.
   const idxByOffset = new Map<number, number>();
-  for (const { slot } of streamed) idxByOffset.set(slot.offset, slot.index);
+  for (const { slot } of candidates) idxByOffset.set(slot.offset, slot.index);
   const toSlots = (offs: number[]): number[] => {
     const out: number[] = [];
     for (const o of offs) {
@@ -394,15 +450,110 @@ export async function buildDagV2(
     }
   }
 
+  // A COMPRESSED slot is streamed only if the plan covers it: its decoded PCM rides
+  // in a synthesized (uncompressed, zero-filled) skeleton region, so if the fence
+  // can't gate it (absent from every checkpoint) it could sound before it arrives —
+  // demote to resident (leave the original compressed bytes in the skeleton, exactly
+  // as before). Uncompressed slots are unaffected, so non-compressed modules bake to
+  // byte-identical roots (no needless re-bake).
+  const covered = new Set<number>();
+  for (const c of plan.checkpoints) for (const s of c.samples) covered.add(s);
+  const streamed = candidates.filter(
+    (c) =>
+      !c.slot.compressed ||
+      (!opts.noCompressedStream && covered.has(c.slot.index)),
+  );
+
+  const byCid = new Map<string, Block>();
+  const add = (b: Block) => {
+    const k = b.cid.toString();
+    if (!byCid.has(k)) byCid.set(k, b);
+    return b.cid;
+  };
+  let numChunks = 0;
+  const chunkToCids = async (buf: Uint8Array): Promise<CID[]> => {
+    const cids: CID[] = [];
+    for (const c of cdcChunks(buf, cdc)) {
+      numChunks++;
+      cids.push(add(await rawBlock(c.slice())));
+    }
+    return cids;
+  };
+  // Sample table (inline leaf CIDs — the pre-resolved index).
+  const samples: SampleV2[] = [];
+  let sampleBytes = 0;
+  for (const { slot, dump } of streamed) {
+    sampleBytes += dump.data.length;
+    const chunks = await chunkToCids(dump.data);
+    samples.push({
+      index: slot.index,
+      frames: dump.frames,
+      channels: slot.channels,
+      bitDepth: slot.bitDepth,
+      chunks,
+    });
+  }
+
+  // Normalized skeleton (streamed regions zeroed / compressed regions synthesized).
+  const { skeleton, zeroSpans } = buildSkeletonV2(
+    data,
+    streamed.map((s) => s.slot),
+  );
+  // Zero-fill recipe: the skeleton is structure interspersed with large all-zero
+  // regions (orphaned compressed bytes, zeroed PCM, the appended decoded-length
+  // tail). Transferring those zeros dominates cold TTFP for compressed ITs — and
+  // they DON'T dedup (FastCDC straddles each hole, and per-hole remainders are
+  // unique-length zero blocks). So we don't transfer them at all: only the
+  // structure segments become content chunks (`skeletonChunks`); the zero runs
+  // become length directives in `skeletonLayout` that the client synthesizes.
+  // Layout is a flat run-length recipe [nContentChunks, zeroBytes, ...]; the
+  // skeleton bytes are unchanged, so parity is bit-exact.
+  const skeletonChunks: CID[] = [];
+  const skeletonLayout: number[] = [];
+  {
+    const spans = mergeSpans(zeroSpans, skeleton.length);
+    let pos = 0;
+    for (const [a, b] of spans) {
+      let nc = 0;
+      if (a > pos) for (const cid of await chunkToCids(skeleton.subarray(pos, a))) (skeletonChunks.push(cid), nc++);
+      skeletonLayout.push(nc, b - a);
+      pos = b;
+    }
+    if (pos < skeleton.length) {
+      let nc = 0;
+      for (const cid of await chunkToCids(skeleton.subarray(pos))) (skeletonChunks.push(cid), nc++);
+      skeletonLayout.push(nc, 0);
+    }
+  }
+
+  // No-regression gate for COMPRESSED streaming: a compressed sample streams its
+  // (larger) decoded PCM, so if the module is too small the streamed warm set
+  // doesn't undercut full-load by enough to beat the round-trip floor. Measure the
+  // first-playable saving (full-load bytes − streaming warm: structure chunks ∪
+  // required-at-0 sample chunks, deduped) and, if a compressed slot was streamed
+  // but the saving is below the gate, re-bake with compressed demoted to resident
+  // (full-load for those samples — exactly the prior behavior, never worse).
+  if (!opts.noCompressedStream && streamed.some((s) => s.slot.compressed)) {
+    const warm = new Set<string>(skeletonChunks.map((c) => c.toString()));
+    const req = requiredAtZero(plan);
+    const byIndex = new Map(samples.map((s) => [s.index, s]));
+    for (const ix of req)
+      for (const c of byIndex.get(ix)?.chunks ?? []) warm.add(c.toString());
+    let warmBytes = 0;
+    for (const k of warm) warmBytes += byCid.get(k)?.bytes.length ?? 0;
+    if (data.length - warmBytes < COMPRESSED_STREAM_MIN_SAVING)
+      return buildDagV2(data, decoded, cdc, { ...opts, noCompressedStream: true });
+  }
+
   // Inline the index; spill to its own block if the manifest gets too big.
   const index: IndexV2 = { samples, plan };
-  let manifest: ManifestV2 = { v: MANIFEST_V2, format, cdc, skeletonChunks, index };
+  let manifest: ManifestV2 = { v: MANIFEST_V2, format, cdc, skeletonChunks, skeletonLayout, index };
   let manifestBlock = await cborBlock(manifest);
   let spilled = false;
   if (manifestBlock.bytes.length > INDEX_SPILL_BYTES) {
     const indexBlock = await cborBlock(index);
     add(indexBlock);
-    manifest = { v: MANIFEST_V2, format, cdc, skeletonChunks, indexRoot: indexBlock.cid };
+    manifest = { v: MANIFEST_V2, format, cdc, skeletonChunks, skeletonLayout, indexRoot: indexBlock.cid };
     manifestBlock = await cborBlock(manifest);
     spilled = true;
   }
@@ -463,6 +614,42 @@ export async function prefetch(
   return out;
 }
 
+/** Reconstruct the normalized skeleton from its structure content chunks + the
+ * zero-fill layout recipe `[nContentChunks, zeroBytes, ...]`. A fresh Uint8Array
+ * is zero-initialized, so zero runs are free (no transfer, no copy). Falls back to
+ * a plain concat when no layout is present (older manifests). */
+export function assembleSkeletonV2(parts: Uint8Array[], layout?: number[]): Uint8Array {
+  if (!layout || layout.length === 0) {
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let w = 0;
+    for (const p of parts) (out.set(p, w), (w += p.length));
+    return out;
+  }
+  let total = 0;
+  let ci = 0;
+  for (let i = 0; i < layout.length; i += 2) {
+    const nc = layout[i] ?? 0;
+    const z = layout[i + 1] ?? 0;
+    for (let k = 0; k < nc; k++) total += parts[ci++]?.length ?? 0;
+    total += z;
+  }
+  const out = new Uint8Array(total);
+  let w = 0;
+  ci = 0;
+  for (let i = 0; i < layout.length; i += 2) {
+    const nc = layout[i] ?? 0;
+    const z = layout[i + 1] ?? 0;
+    for (let k = 0; k < nc; k++) {
+      const p = parts[ci++];
+      out.set(p, w);
+      w += p.length;
+    }
+    w += z; // zero run — already zero from allocation
+  }
+  return out;
+}
+
 /** A streamed sample with its decoded PCM assembled from leaf chunks. */
 export interface FetchedSampleV2 {
   index: number;
@@ -490,20 +677,11 @@ export async function fetchV2(
     manifest.index ??
     dagCbor.decode<IndexV2>(await fetchVerified(manifest.indexRoot!, get, verify));
 
-  // Skeleton.
+  // Skeleton: fetch the structure content chunks, then reconstruct by interleaving
+  // synthesized zero runs per the layout recipe (zeros were never transferred).
   const parts: Uint8Array[] = [];
-  let skelLen = 0;
-  for (const cid of manifest.skeletonChunks) {
-    const part = await fetchVerified(cid, get, verify);
-    parts.push(part);
-    skelLen += part.length;
-  }
-  const skeleton = new Uint8Array(skelLen);
-  let w = 0;
-  for (const p of parts) {
-    skeleton.set(p, w);
-    w += p.length;
-  }
+  for (const cid of manifest.skeletonChunks) parts.push(await fetchVerified(cid, get, verify));
+  const skeleton = assembleSkeletonV2(parts, manifest.skeletonLayout);
 
   // Per-sample PCM.
   const samples: FetchedSampleV2[] = [];

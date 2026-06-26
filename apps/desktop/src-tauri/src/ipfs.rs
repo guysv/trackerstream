@@ -183,6 +183,12 @@ struct ManifestV2 {
     v: u8,
     #[serde(rename = "skeletonChunks")]
     skeleton_chunks: Vec<Cid>,
+    // Run-length recipe [nContentChunks, zeroBytes, ...] interleaving the structure
+    // content chunks above with synthesized zero runs (orphaned compressed bytes,
+    // zeroed PCM, appended decoded-length tail) that are never transferred. Empty
+    // for older manifests -> skeleton is a plain concat of skeleton_chunks.
+    #[serde(default, rename = "skeletonLayout")]
+    skeleton_layout: Vec<u64>,
     // Inline index, OR a pointer to a spilled index block (large modules).
     #[serde(default)]
     index: Option<IndexV2>,
@@ -448,6 +454,35 @@ async fn assemble(ipfs: &Ipfs, chunks: &[Cid]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Reconstruct the normalized skeleton from its structure content chunks (already
+/// fetched into `blocks`) plus the zero-fill `layout` recipe [nContentChunks,
+/// zeroBytes, ...]: emit each content chunk, then a run of zero bytes, repeating.
+/// An empty layout means a plain concat (older manifests with no zero-fill).
+fn assemble_skeleton(chunks: &[Cid], layout: &[u64], blocks: &HashMap<Cid, Vec<u8>>) -> Result<Vec<u8>> {
+    let get = |c: &Cid| -> Result<&Vec<u8>> {
+        blocks.get(c).ok_or_else(|| anyhow!("missing skeleton chunk {c}"))
+    };
+    let mut out = Vec::new();
+    if layout.is_empty() {
+        for c in chunks {
+            out.extend_from_slice(get(c)?);
+        }
+        return Ok(out);
+    }
+    let mut ci = 0usize;
+    for pair in layout.chunks(2) {
+        let nc = pair[0] as usize;
+        let z = pair.get(1).copied().unwrap_or(0) as usize;
+        for _ in 0..nc {
+            let c = chunks.get(ci).ok_or_else(|| anyhow!("skeleton layout overruns chunk list"))?;
+            out.extend_from_slice(get(c)?);
+            ci += 1;
+        }
+        out.resize(out.len() + z, 0); // synthesized zero run — never transferred
+    }
+    Ok(out)
+}
+
 /// Prefetch priority for a sample: forward distance (orders) from the playhead to
 /// the nearest checkpoint that needs it; already-passed samples sort after all
 /// upcoming ones (still fetched, for backward seek); samples in no checkpoint last.
@@ -503,11 +538,6 @@ pub async fn stream_v2(
         plan.checkpoints.len()
     );
 
-    // Skeleton first (a valid module; create_from_memory => all-pending samples).
-    let skel = assemble(ipfs, &manifest.skeleton_chunks).await?;
-    *state.skeleton.lock().unwrap() = skel;
-    let _ = events.send(StreamEvent::Skeleton { plan: plan.clone(), samples: samples.len() as u32 });
-
     // Per-sample checkpoint orders, for playhead-priority prefetch.
     let mut orders_for: HashMap<u32, Vec<u32>> = HashMap::new();
     for cp in &plan.checkpoints {
@@ -516,9 +546,54 @@ pub async fn stream_v2(
         }
     }
 
-    // Fetch each sample in dynamic playhead-distance order (re-evaluated every step,
-    // so a seek that moves the playhead re-prioritizes the remaining queue).
-    let mut remaining: Vec<usize> = (0..samples.len()).collect();
+    // H1 — single-batch order-0 prefetch. The cold-TTFP fence needs the skeleton AND
+    // every required-at-0 sample. The old path fetched the skeleton, then each order-0
+    // sample in its own serial round-trip (N+1 cold Bitswap batches) — the dominant
+    // cost in the compressed-IT streaming experiment (sequential `r` round-trips, not
+    // bytes). Every leaf CID is known up-front from the index, so we issue ONE want-list
+    // over skeleton chunks ∪ all required-at-0 sample leaves: the order-0 PCM pipelines
+    // alongside the skeleton on the same cold session instead of paying a fresh handshake
+    // each. This is the lever that lets streaming beat full-load TTFP.
+    let required0: std::collections::HashSet<u32> = plan.required_at_zero().into_iter().collect();
+    let mut warm_cids: Vec<Cid> = manifest.skeleton_chunks.clone();
+    for s in &samples {
+        if required0.contains(&s.index) {
+            warm_cids.extend_from_slice(&s.chunks);
+        }
+    }
+    let warm = fetch_many(ipfs, &warm_cids).await?;
+
+    // Skeleton from the warm batch (a valid module; create_from_memory => all-pending).
+    // Interleave the structure content chunks with synthesized zero runs per the
+    // layout recipe — the zeros were never transferred (the bulk of a compressed
+    // IT's skeleton is zero), so this is where streaming claws back its byte win.
+    let skel = assemble_skeleton(&manifest.skeleton_chunks, &manifest.skeleton_layout, &warm)?;
+    *state.skeleton.lock().unwrap() = skel;
+    let _ = events.send(StreamEvent::Skeleton { plan: plan.clone(), samples: samples.len() as u32 });
+
+    // Required-at-0 samples are already in hand from the warm batch — concatenate and
+    // emit them immediately, opening the fence in a single cold round-trip. Emitting
+    // them before any non-required sample preserves the playhead-priority invariant the
+    // bench relies on (every required-at-0 slot resident before the first non-required).
+    let mut delivered: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for s in &samples {
+        if !required0.contains(&s.index) {
+            continue;
+        }
+        let mut pcm = Vec::new();
+        for c in &s.chunks {
+            pcm.extend_from_slice(warm.get(c).ok_or_else(|| anyhow!("missing sample chunk {c}"))?);
+        }
+        state.samples.lock().unwrap().insert(s.index, pcm);
+        let _ = events.send(StreamEvent::Sample { index: s.index, frames: s.frames });
+        delivered.insert(s.index);
+    }
+
+    // Remaining (post-fence) samples: dynamic playhead-distance order (re-evaluated every
+    // step, so a seek that moves the playhead re-prioritizes the queue). Their leaves were
+    // not in the warm batch, so they fetch cold here — but the fence is already open.
+    let mut remaining: Vec<usize> =
+        (0..samples.len()).filter(|&i| !delivered.contains(&samples[i].index)).collect();
     while !remaining.is_empty() {
         let ph = state.playhead.load(Ordering::Relaxed);
         let mut best = 0usize;

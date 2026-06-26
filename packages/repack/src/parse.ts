@@ -193,16 +193,23 @@ function extractXM(b: Uint8Array): SampleRegion[] | null {
 // (bit depth / channels) so the bake can cross-check the decoded dump and the
 // client can size the provide buffer.
 //
-// A slot appears here only if it has a locatable UNCOMPRESSED on-disk PCM region.
-// Compressed (IT flag 0x08) / empty slots are simply absent: the bake leaves
-// their real PCM in the skeleton (always resident, never streamed), exactly as
-// v1 drops them. Never guessed — a parse surprise just omits the slot.
+// A slot appears here if its decoded PCM can be streamed. Uncompressed samples
+// carry their on-disk region directly; COMPRESSED (IT flag 0x08) samples carry the
+// decoded byte length instead (the on-disk bytes are compressed, so there is no raw
+// region to carve) and are tagged `compressed` so the skeleton builder appends an
+// uncompressed zero-fill region of that length and repoints the header. Empty /
+// unparseable slots are still absent (ride in the skeleton). Never guessed — the
+// bake's `dump.data.length === slot.length` check drops any slot whose decoded
+// length disagrees, so a parse surprise degrades to resident, never to wrong audio.
 export interface SampleSlot {
   index: number; // 1-based libopenmpt sample slot (== provide_sample arg)
-  offset: number; // on-disk PCM byte offset
-  length: number; // on-disk PCM byte length (== decoded byte length for uncompressed)
+  offset: number; // on-disk PCM byte offset (the bake-time join key to the seek table)
+  length: number; // decoded PCM byte length (== on-disk length for uncompressed)
   bitDepth: number; // 8 | 16
   channels: number; // 1 | 2
+  compressed?: boolean; // IT 0x08 — decoded PCM streamed, skeleton region synthesized
+  headerOffset?: number; // IT sample-header start (so) — where skeleton clears 0x08 + repoints
+  compressedBytes?: number; // on-disk compressed span — skeleton zeroes it (dedups away)
 }
 
 function modSlots(b: Uint8Array): SampleSlot[] {
@@ -226,7 +233,32 @@ function modSlots(b: Uint8Array): SampleSlot[] {
   return out;
 }
 
-// IT/MPTM: 1-based slot = header order. Skips compressed (flag 0x08) slots.
+// On-disk byte span of an IT215/214-compressed sample, WITHOUT decompressing: the
+// data is a series of length-prefixed blocks — uint16 LE compressed-byte count, then
+// that many bytes — each decoding to a fixed sample count (0x8000 for 8-bit, 0x4000
+// for 16-bit) per channel (stereo = full left channel's blocks then full right).
+// Lets the skeleton ZERO the orphaned compressed region (-> dedups to a zero block,
+// ~free over the wire) instead of leaving it as transferred dead weight. Returns -1
+// if the block walk runs past EOF (corrupt/unknown layout) -> caller leaves it intact.
+function itCompressedSpan(b: Uint8Array, ptr: number, frames: number, bitDepth: number, channels: number): number {
+  const perBlock = bitDepth === 16 ? 0x4000 : 0x8000;
+  let off = ptr;
+  for (let ch = 0; ch < channels; ch++) {
+    let remaining = frames;
+    while (remaining > 0) {
+      if (off + 2 > b.length) return -1;
+      const blockLen = u16le(b, off);
+      off += 2 + blockLen;
+      if (off > b.length) return -1;
+      remaining -= Math.min(perBlock, remaining);
+    }
+  }
+  return off - ptr;
+}
+
+// IT/MPTM: 1-based slot = header order. Uncompressed samples carve their on-disk
+// region; compressed (flag 0x08) samples stream their DECODED PCM with a synthesized
+// skeleton region (the on-disk bytes are compressed, not raw PCM).
 function itLikeSlots(b: Uint8Array): SampleSlot[] {
   const ordNum = u16le(b, 0x20),
     insNum = u16le(b, 0x22),
@@ -240,10 +272,23 @@ function itLikeSlots(b: Uint8Array): SampleSlot[] {
       len = u32le(b, so + 0x30),
       ptr = u32le(b, so + 0x48);
     if (!(flg & 1) || !len || !ptr) continue;
-    if (flg & 8) continue; // compressed — rides in the skeleton
     const bitDepth = flg & 2 ? 16 : 8,
       channels = flg & 4 ? 2 : 1;
-    const bytes = Math.min(len * (bitDepth / 8) * channels, b.length - ptr);
+    const decodedBytes = len * (bitDepth / 8) * channels; // header len is in frames
+    if (flg & 8) {
+      // Compressed: stream the decoded PCM (length = decoded bytes). The skeleton
+      // appends a zero-fill region of this size + clears 0x08 + repoints `so`, and
+      // zeroes the orphaned on-disk compressed span so it dedups away (not dead weight).
+      if (decodedBytes > 0) {
+        const span = itCompressedSpan(b, ptr, len, bitDepth, channels);
+        out.push({
+          index: i + 1, offset: ptr, length: decodedBytes, bitDepth, channels,
+          compressed: true, headerOffset: so, compressedBytes: span > 0 ? span : undefined,
+        });
+      }
+      continue;
+    }
+    const bytes = Math.min(decodedBytes, b.length - ptr);
     if (bytes > 0) out.push({ index: i + 1, offset: ptr, length: bytes, bitDepth, channels });
   }
   return out;
