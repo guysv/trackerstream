@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "build:worklet": "node scripts/build-worklet.mjs",
-    "predev": "node scripts/build-worklet.mjs",
+    "prepare:ipfs": "bash src-tauri/scripts/prepare-ipfs.sh",
+    "predev": "pnpm prepare:ipfs && node scripts/build-worklet.mjs",
     "dev": "vite dev",
-    "prebuild": "node scripts/build-worklet.mjs",
+    "prebuild": "pnpm prepare:ipfs && node scripts/build-worklet.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
