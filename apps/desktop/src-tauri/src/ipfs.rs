@@ -271,6 +271,13 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
         .add_listening_addr("/ip4/0.0.0.0/tcp/0".parse()?)
         .with_relay(true) // relay client + DCUtR hole punching
         .with_autonat()
+        // libp2p defaults idle_connection_timeout to 0 — a connection with no
+        // keepalive reason closes the instant it goes idle. For peer-assist that
+        // means a holder drops the requester the moment a download finishes (we
+        // only keepalive from the *requesting* side). Hold idle connections ~60s
+        // so they survive between blocks/tracks and long enough for the roster
+        // warm loop to make the link symmetric (both ends keepalive). See lib.rs.
+        .set_idle_connection_timeout(60)
         .fd_limit(rust_ipfs::FDLimit::Max)
         .with_custom_behaviour(|_| Ok(rust_ipfs::swarm::dummy::Behaviour));
     if let Some(dir) = data_dir {

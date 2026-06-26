@@ -243,6 +243,38 @@ async fn keepalive_master(addrs: Vec<String>, state: State<'_, IpfsState>) -> Re
 /// wants the blocks, they broadcast to already-connected peers and the master is
 /// bypassed (no query-then-dial latency on the critical path). Best-effort: on any
 /// tracker/dial failure we simply fall back to the master. See PEER-ASSIST.md §2.4.
+/// Dial + keepalive a batch of tracker peers into the warm set, then evict LRU
+/// overflow. Skips ourselves and the master (the master is kept alive separately by
+/// keepalive_master). Shared by queue-driven pre-connection (warm_root) and the
+/// roster backbone loop — both need the same dial/record/evict, and keepalive on
+/// BOTH ends is what stops a holder dropping us when a download finishes.
+async fn warm_into_set(
+    ipfs: &Ipfs,
+    warm: &WarmSet,
+    peers: Vec<tracker::PeerRef>,
+    tag: &str,
+    self_peer: &str,
+) {
+    let master = ipfs::master_peer_id();
+    for h in peers {
+        if h.peer_id == self_peer {
+            continue;
+        }
+        let Ok(pid) = h.peer_id.parse::<PeerId>() else { continue };
+        if Some(pid) == master {
+            continue;
+        }
+        match ipfs::warm_connect(ipfs, &h.peer_id, &h.addrs).await {
+            Ok(()) => warm.record(pid, tag),
+            Err(e) => eprintln!("[warm] {} failed: {e}", h.peer_id),
+        }
+    }
+    for victim in warm.take_overflow() {
+        let _ = ipfs.disconnect(victim).await;
+        let _ = ipfs.remove_peer(victim).await;
+    }
+}
+
 #[tauri::command]
 async fn warm_root(
     root: String,
@@ -252,22 +284,7 @@ async fn warm_root(
     // Validate the CID but don't fetch — this only pre-connects.
     let _: Cid = root.parse().map_err(|e| format!("bad CID {root}: {e}"))?;
     let holders = tracker::query_peers(&state.peer_id, &root).await;
-    let ipfs = state.ipfs.clone();
-    for h in holders {
-        match ipfs::warm_connect(&ipfs, &h.peer_id, &h.addrs).await {
-            Ok(()) => {
-                if let Ok(pid) = h.peer_id.parse::<PeerId>() {
-                    warm.record(pid, &root);
-                }
-            }
-            Err(e) => eprintln!("[warm] {} failed: {e}", h.peer_id),
-        }
-    }
-    // Enforce the warm-set cap (LRU eviction) — disconnect + drop keepalive.
-    for victim in warm.take_overflow() {
-        let _ = ipfs.disconnect(victim).await;
-        let _ = ipfs.remove_peer(victim).await;
-    }
+    warm_into_set(&state.ipfs, warm.inner(), holders, &root, &state.peer_id).await;
     Ok(())
 }
 
@@ -408,22 +425,39 @@ pub fn run() {
             // Start the (non-Send) builder once here, off the command path.
             let node =
                 tauri::async_runtime::block_on(ipfs::start(dir)).map_err(|e| e.to_string())?;
-            // Clone the handle + identity for the background announce loop before
-            // the node moves into managed state.
+            // Clone handles + identity for the background loops before the node
+            // moves into managed state.
             let announce_ipfs = node.ipfs.clone();
+            let roster_ipfs = node.ipfs.clone();
             let announce_pid = node.peer_id.parse::<PeerId>().ok();
+            let self_peer = node.peer_id.clone();
+            let warm = Arc::new(WarmSet::default());
             app.manage(IpfsState {
                 ipfs: node.ipfs,
                 peer_id: node.peer_id,
             });
             app.manage(Streams::default());
             app.manage(held.clone());
-            app.manage(Arc::new(WarmSet::default()));
+            app.manage(warm.clone());
             // Peer-assist tracker: announce presence + held roots every ~30s (also
             // the presence heartbeat). Skipped only if our PeerId failed to parse.
             if let Some(pid) = announce_pid {
                 tracker::spawn_announce_loop(announce_ipfs, pid, held);
             }
+            // Roster backbone: periodically warm a bounded set of ONLINE peers
+            // (content-independent), so warm connections are symmetric — both ends
+            // keepalive, so a holder no longer drops us when a download finishes —
+            // and the presence backbone forms. Bounded + LRU-evicted by WARM_CAP.
+            tauri::async_runtime::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    tick.tick().await;
+                    let roster = tracker::query_roster(&self_peer).await;
+                    if !roster.is_empty() {
+                        warm_into_set(&roster_ipfs, &warm, roster, "roster", &self_peer).await;
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
