@@ -5249,8 +5249,6 @@ dependencies = [
 [[package]]
 name = "rust-ipfs"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e15c7ceb8b934c120bd396813c8a1882ce5db276d733864e7bebc2c9fce330"
 dependencies = [
  "anyhow",
  "async-rt",

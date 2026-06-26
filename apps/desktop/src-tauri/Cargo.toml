@@ -33,3 +33,10 @@ serde_ipld_dagcbor = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1"
 
+# Patched rust-ipfs (per-peer bitswap byte attribution — see patches/). The source
+# is materialized to vendor/rust-ipfs by scripts/prepare-ipfs.sh, which MUST run
+# before cargo (wired into tauri's beforeDev/BuildCommand; run it by hand for a
+# bare `cargo build`). Mirrors the libopenmpt vendor-patch workflow.
+[patch.crates-io]
+rust-ipfs = { path = "vendor/rust-ipfs" }
+
