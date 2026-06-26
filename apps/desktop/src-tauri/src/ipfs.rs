@@ -571,11 +571,30 @@ pub async fn stream_v2(
             serde_ipld_dagcbor::from_slice(&fetch_bytes(ipfs, ir).await?)?
         }
     };
-    let IndexV2 { samples, plan } = index;
+    let IndexV2 { samples, mut plan } = index;
+
+    // Guard against manifests whose plan references slots that are not actually
+    // streamed (samples[]). The bake's no-regression re-bake once demoted every
+    // compressed slot to resident-in-skeleton without pruning the checkpoints, so a
+    // fully-compressed module baked to zero streamed samples yet a non-empty plan —
+    // the fence then waits forever for samples that never arrive (buffering stuck at
+    // 100%) even though the skeleton already holds the full audio. Drop checkpoints
+    // referencing absent slots (and any emptied checkpoint); an empty plan tells the
+    // fence there is nothing to gate, so the all-resident skeleton plays at once. The
+    // bake now prunes too, but this keeps already-baked corpus roots playable.
+    let streamed_idx: std::collections::HashSet<u32> = samples.iter().map(|s| s.index).collect();
+    let dropped = plan.checkpoints.len();
+    plan.checkpoints.retain_mut(|c| {
+        c.samples.retain(|s| streamed_idx.contains(s));
+        !c.samples.is_empty()
+    });
+    let dropped = dropped - plan.checkpoints.len();
+
     eprintln!(
-        "[stream] {root}: v2 — {} streamed samples, {} checkpoints",
+        "[stream] {root}: v2 — {} streamed samples, {} checkpoints{}",
         samples.len(),
-        plan.checkpoints.len()
+        plan.checkpoints.len(),
+        if dropped > 0 { format!(" ({dropped} checkpoint(s) pruned — referenced un-streamed slots)") } else { String::new() }
     );
 
     // Per-sample checkpoint orders, for playhead-priority prefetch.
