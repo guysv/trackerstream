@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { MASTER_PEER_ID } from "@trackerstream/config";
   import { peers } from "$lib/peers.svelte";
   import { fmtBytes } from "$lib/format";
 
@@ -10,6 +9,11 @@
 <div class="peers">
   <div class="phead">
     <span>peers · {peers.connected} connected</span>
+    {#if peers.offloadDown > 0}
+      <span class="offload" title="cumulative download from non-master peers (offload)">
+        offload {fmtBytes(peers.offloadDown)}
+      </span>
+    {/if}
   </div>
 
   <div class="bw">
@@ -28,10 +32,16 @@
   <div class="plist">
     {#each peers.rows as p (p.id)}
       <div class="prow" class:off={!p.connected}>
-        <span class="dot" class:master={p.id === MASTER_PEER_ID} class:on={p.connected}></span>
+        <span
+          class="dot"
+          class:master={p.role === "master"}
+          class:warm={p.role === "warm"}
+          class:on={p.connected}
+        ></span>
         <span class="pid">
           {short(p.id)}
-          {#if p.id === MASTER_PEER_ID}<span class="tag">master</span>{/if}
+          {#if p.role === "master"}<span class="tag">master</span>{/if}
+          {#if p.role === "warm"}<span class="tag warm">warm</span>{/if}
         </span>
         <span class="pbw" title="download from this peer">↓ {rate(p.speedDown)}<small>{fmtBytes(p.down)} total</small></span>
         <span class="pbw" title="upload to this peer">↑ {rate(p.speedUp)}<small>{fmtBytes(p.up)} total</small></span>
@@ -53,6 +63,14 @@
     border-bottom: 1px solid var(--border);
     text-transform: uppercase;
     font-size: 11px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.5rem;
+  }
+  .offload {
+    color: var(--green, #7dcfa0);
+    font-size: 10px;
   }
   .bw {
     display: grid;
@@ -109,6 +127,9 @@
   .dot.master {
     background: var(--amber);
   }
+  .dot.warm {
+    background: var(--green, #7dcfa0);
+  }
   .pid {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -121,6 +142,9 @@
     font-size: 10px;
     text-transform: uppercase;
     margin-left: 0.3rem;
+  }
+  .tag.warm {
+    color: var(--green, #7dcfa0);
   }
   .pbw {
     display: flex;

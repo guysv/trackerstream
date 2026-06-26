@@ -5,7 +5,7 @@
 import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
 import { ModPlayer } from "./audio/ModPlayer.svelte";
 import { Fence } from "./audio/fence";
-import { connectPeer, startStream, getSkeleton, getSample, setPlayhead } from "./p2p";
+import { connectPeer, warmRoot, startStream, getSkeleton, getSample, setPlayhead } from "./p2p";
 import { dbg } from "./debug";
 import type { ModuleHit } from "./catalog";
 
@@ -96,7 +96,10 @@ export function playList(items: ModuleHit[], index: number): void {
   queue.index = index;
   saveQueue();
   const hit = items[index];
-  if (hit) void playModule(hit);
+  if (hit) {
+    void warmRoot(hit.rootCid); // pre-connect holders for the track we're about to play
+    void playModule(hit);
+  }
 }
 
 export function clearQueue(): void {
@@ -133,7 +136,11 @@ export function enqueue(hit: ModuleHit, next = false): void {
   if (next && queue.index >= 0) queue.items.splice(queue.index + 1, 0, hit);
   else queue.items.push(hit);
   saveQueue();
+  // Queue-driven pre-connection (PEER-ASSIST.md §2.4): warm holders for this root
+  // the moment it enters the queue, before playback reaches it. playList (the
+  // empty-queue auto-play below) warms the playing item itself.
   if (queue.index < 0) playList(queue.items, 0);
+  else void warmRoot(hit.rootCid);
 }
 
 let connected = false;

@@ -19,11 +19,16 @@ export type StreamEvent =
 
 export const nodeInfo = (): Promise<NodeInfo> => invoke<NodeInfo>("node_info");
 
+/** Offload role from the backend: "master" (always-on seed), "warm" (a peer-assist
+ *  holder we pre-connected), or "other". Lets the peers pane prove offload. */
+export type PeerRole = "master" | "warm" | "other";
+
 export interface PeerEntry {
   id: string;
   down: number; // cumulative Bitswap bytes down from this peer
   up: number; // cumulative Bitswap bytes up to this peer
   connected: boolean;
+  role: PeerRole;
 }
 
 export interface PeerStats {
@@ -35,6 +40,12 @@ export interface PeerStats {
 export const peerStats = (): Promise<PeerStats> => invoke<PeerStats>("peer_stats");
 
 export const connectPeer = (addr: string): Promise<void> => invoke("connect_peer", { addr });
+
+/** Queue-driven pre-connection: ask the tracker who holds `root` and warm-connect
+ *  them BEFORE playback reaches it, so Bitswap finds the blocks on already-connected
+ *  peers and the master is bypassed. Fire-and-forget; degrades to the master on any
+ *  failure. Call when a root ENTERS the queue (not when it plays). */
+export const warmRoot = (root: string): Promise<void> => invoke("warm_root", { root });
 
 /** Pin a persistent, auto-reconnecting connection to the master (call once at
  *  startup with the bootstrap addrs) so it isn't dialed lazily + pruned when idle. */

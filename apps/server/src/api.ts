@@ -4,12 +4,26 @@
 // rebuilt on the P2P plane and no longer lives here. CORS-open.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Catalog } from "./catalog.ts";
+import { Tracker } from "./tracker.ts";
+import { IpnsStore } from "./ipns.ts";
 
 type Handler = (
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: { url: URL; body: unknown; catalog: Catalog },
+  ctx: { url: URL; body: unknown; catalog: Catalog; tracker: Tracker; ipns: IpnsStore },
 ) => void | Promise<void>;
+
+// Hand-validate an announce body (no validation lib; raw node:http).
+function parseAnnounce(
+  body: unknown,
+): { peerId: string; addrs: string[]; heldRoots: string[] } | null {
+  if (!body || typeof body !== "object") return null;
+  const b = body as Record<string, unknown>;
+  const strArr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  if (typeof b.peerId !== "string" || !b.peerId) return null;
+  return { peerId: b.peerId, addrs: strArr(b.addrs), heldRoots: strArr(b.heldRoots) };
+}
 
 function readBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve) => {
@@ -33,7 +47,11 @@ const send = (res: ServerResponse, code: number, body: unknown) => {
   res.end(JSON.stringify(body));
 };
 
-export function createApi(catalog: Catalog): Server {
+// Optional shared secret for the IPNS publish hook. When TS_IPNS_TOKEN is set,
+// POST /ipns requires `Authorization: Bearer <token>`; unset = open (dev only).
+const IPNS_TOKEN = process.env.TS_IPNS_TOKEN;
+
+export function createApi(catalog: Catalog, tracker: Tracker, ipns: IpnsStore): Server {
   const routes: Array<{ method: string; pattern: RegExp; handler: Handler }> = [
     {
       method: "GET",
@@ -42,6 +60,7 @@ export function createApi(catalog: Catalog): Server {
         send(res, 200, {
           ok: true,
           modules: catalog.count(),
+          tracker: tracker.stats(),
           uptimeSeconds: Math.round(process.uptime()),
         }),
     },
@@ -79,6 +98,58 @@ export function createApi(catalog: Catalog): Server {
         hit ? send(res, 200, hit) : send(res, 404, { error: "not found" });
       },
     },
+    // --- Peer-assist tracker (PEER-ASSIST.md §2.2) ---
+    {
+      method: "POST",
+      pattern: /^\/announce$/,
+      handler: (_q, res, { body, tracker }) => {
+        const a = parseAnnounce(body);
+        if (!a) return send(res, 400, { error: "bad announce" });
+        tracker.announce(a.peerId, a.addrs, a.heldRoots);
+        send(res, 200, { ok: true });
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/peers$/,
+      handler: (_q, res, { url, tracker }) => {
+        const root = url.searchParams.get("root") ?? "";
+        if (!root) return send(res, 400, { error: "missing root" });
+        const limit = Math.min(50, Math.max(1, +(url.searchParams.get("limit") ?? 50)));
+        const self = url.searchParams.get("self") ?? undefined;
+        send(res, 200, { root, peers: tracker.peers(root, limit, self) });
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/roster$/,
+      handler: (_q, res, { tracker }) => send(res, 200, { peers: tracker.roster() }),
+    },
+    // --- IPNS record cache (PEER-ASSIST.md §9; inert until catalog migrates) ---
+    {
+      method: "GET",
+      pattern: /^\/ipns\/([^/]+)$/,
+      handler: (_q, res, { url, ipns }) => {
+        const key = decodeURIComponent(url.pathname.split("/")[2]);
+        const record = ipns.get(key);
+        record ? send(res, 200, { key, record }) : send(res, 404, { error: "no record" });
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/ipns$/,
+      handler: (req, res, { body, ipns }) => {
+        if (IPNS_TOKEN && req.headers.authorization !== `Bearer ${IPNS_TOKEN}`) {
+          return send(res, 401, { error: "unauthorized" });
+        }
+        const b = (body ?? {}) as Record<string, unknown>;
+        if (typeof b.key !== "string" || typeof b.record !== "string") {
+          return send(res, 400, { error: "key + record (base64) required" });
+        }
+        ipns.set(b.key, b.record);
+        send(res, 200, { ok: true });
+      },
+    },
   ];
 
   return createServer(async (req, res) => {
@@ -92,7 +163,7 @@ export function createApi(catalog: Catalog): Server {
     if (!route) return send(res, 404, { error: "no such route" });
     try {
       const body = req.method === "POST" || req.method === "PUT" ? await readBody(req) : undefined;
-      await route.handler(req, res, { url, body, catalog });
+      await route.handler(req, res, { url, body, catalog, tracker, ipns });
     } catch (e) {
       send(res, 500, { error: String(e) });
     }
