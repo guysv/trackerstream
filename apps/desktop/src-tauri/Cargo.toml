@@ -38,7 +38,12 @@ sha2 = "0.11.0"
 futures = "0.3.32"
 anyhow = "1.0.102"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Trust the SYSTEM store (native-roots), not bundled Mozilla roots: users may sit
+# behind a TLS-inspecting proxy (corporate/security networks re-sign with their own
+# root, which lives in the OS store). Bare rustls-tls / webpki-roots reject that with
+# "invalid peer certificate: UnknownIssuer" even though curl/the browser accept it.
+# rustls-native-certs reads the OS trust store (no OpenSSL link).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 cid = { version = "0.11", features = ["serde"] }
 serde_ipld_dagcbor = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
