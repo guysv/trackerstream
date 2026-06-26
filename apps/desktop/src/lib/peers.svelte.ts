@@ -63,9 +63,15 @@ async function tick(): Promise<void> {
         speedUp,
       };
     });
-    // Connected first, then most-transferred first.
+    // Connected first, then most-transferred first, then peer id as a STABLE
+    // tiebreaker. Without the id tiebreaker, peers with equal totals (e.g. warm
+    // roster peers at 0 bytes) keep the backend's order, which is a Rust HashSet
+    // iteration — randomized per poll — so the list reshuffles every second.
     rows.sort(
-      (a, b) => Number(b.connected) - Number(a.connected) || b.down + b.up - (a.down + a.up),
+      (a, b) =>
+        Number(b.connected) - Number(a.connected) ||
+        b.down + b.up - (a.down + a.up) ||
+        a.id.localeCompare(b.id),
     );
     prev = new Map(s.peers.map((p) => [p.id, { down: p.down, up: p.up }]));
     lastT = now;
