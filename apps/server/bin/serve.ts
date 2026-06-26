@@ -7,20 +7,30 @@
 // (e.g. dev, or a pre-TLS deployment reached on http://<ip>:8080).
 import { API_PORT } from "@trackerstream/config";
 import { Catalog } from "../src/catalog.ts";
+import { Tracker } from "../src/tracker.ts";
+import { IpnsStore } from "../src/ipns.ts";
 import { createApi } from "../src/api.ts";
 
 const dbPath = process.env.CATALOG_DB ?? "./catalog.db";
 const port = +(process.env.API_PORT ?? API_PORT);
 const host = process.env.API_HOST ?? "127.0.0.1";
 
+// Peer-assist presence TTL: a client re-announces every ~30s, so 90s tolerates a
+// couple missed heartbeats before we drop it from the roster.
+const PRESENCE_TTL_MS = 90_000;
+
 const catalog = new Catalog(dbPath);
-const server = createApi(catalog);
+const tracker = new Tracker();
+const ipns = new IpnsStore();
+const server = createApi(catalog, tracker, ipns);
+const sweep = setInterval(() => tracker.sweep(PRESENCE_TTL_MS), 30_000);
 server.listen(port, host, () =>
   console.log(`trackerstream API on ${host}:${port}  (${catalog.count()} modules)`),
 );
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
+    clearInterval(sweep);
     server.close();
     catalog.close();
     process.exit(0);

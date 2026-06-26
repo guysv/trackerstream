@@ -5,13 +5,14 @@
 // did up/down then dropped stays in the list (connected:false → grayed) with its
 // totals intact, and continues from them on reconnect. Polling runs for the app's
 // lifetime so the toggle count stays live with the pane closed.
-import { peerStats } from "./p2p";
+import { peerStats, type PeerRole } from "./p2p";
 
 export interface PeerRow {
   id: string;
   down: number;
   up: number;
   connected: boolean;
+  role: PeerRole;
   speedDown: number; // bytes/sec over the last poll interval
   speedUp: number;
 }
@@ -23,7 +24,10 @@ export const peers = $state<{
   totalUp: number;
   speedDown: number; // aggregate over all peers
   speedUp: number;
-}>({ connected: 0, rows: [], totalDown: 0, totalUp: 0, speedDown: 0, speedUp: 0 });
+  // Offload proof: cumulative down bytes from NON-master peers. >0 means blocks
+  // came from a peer, not the master (PEER-ASSIST.md §B6 / verification).
+  offloadDown: number;
+}>({ connected: 0, rows: [], totalDown: 0, totalUp: 0, speedDown: 0, speedUp: 0, offloadDown: 0 });
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let prev = new Map<string, { down: number; up: number }>();
@@ -38,6 +42,7 @@ async function tick(): Promise<void> {
     let totalUp = 0;
     let aggDown = 0;
     let aggUp = 0;
+    let offloadDown = 0;
     const rows: PeerRow[] = s.peers.map((p) => {
       const was = prev.get(p.id);
       // max(0, …): totals only grow; guard a node-restart counter reset.
@@ -47,7 +52,16 @@ async function tick(): Promise<void> {
       totalUp += p.up;
       aggDown += speedDown;
       aggUp += speedUp;
-      return { id: p.id, down: p.down, up: p.up, connected: p.connected, speedDown, speedUp };
+      if (p.role !== "master") offloadDown += p.down;
+      return {
+        id: p.id,
+        down: p.down,
+        up: p.up,
+        connected: p.connected,
+        role: p.role,
+        speedDown,
+        speedUp,
+      };
     });
     // Connected first, then most-transferred first.
     rows.sort(
@@ -61,6 +75,7 @@ async function tick(): Promise<void> {
     peers.totalUp = totalUp;
     peers.speedDown = aggDown;
     peers.speedUp = aggUp;
+    peers.offloadDown = offloadDown;
   } catch {
     // Node not ready yet — keep the last snapshot, retry next tick.
   }

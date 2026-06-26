@@ -40,12 +40,29 @@ pub fn peer_bandwidth() -> HashMap<PeerId, (u64, u64)> {
 const MASTER_PEER_ID: &str = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL";
 
 fn master_provider() -> Option<PeerId> {
-    // TS_PROVIDER overrides the Bitswap provider hint (e.g. point the headless
-    // transport soak at a local kubo). Defaults to the always-on master.
+    // TS_PROVIDER overrides the master identity (e.g. point the headless transport
+    // soak at a local kubo). Defaults to the always-on master. Used by
+    // keepalive_master to hold the master connection open.
     if let Ok(s) = std::env::var("TS_PROVIDER") {
         return s.parse().ok();
     }
     MASTER_PEER_ID.parse().ok()
+}
+
+/// The master's PeerId (TS_PROVIDER override or the hardcoded default) — used by
+/// the peers pane to tag the master row vs warm-set holders.
+pub fn master_peer_id() -> Option<PeerId> {
+    master_provider()
+}
+
+/// Bitswap provider hint for block fetches — set ONLY when TS_PROVIDER is
+/// explicitly configured (the headless soak harness, which dials a local kubo it
+/// doesn't otherwise keepalive-connect to). In normal operation this is None so
+/// the want-list BROADCASTS to every connected peer (the master, held open by
+/// keepalive_master, AND any warm-set holders). That broadcast is what offloads
+/// the master — peers answer, the master backfills. See PEER-ASSIST.md §4.
+fn explicit_provider_override() -> Option<PeerId> {
+    std::env::var("TS_PROVIDER").ok().and_then(|s| s.parse().ok())
 }
 
 // --- v1 manifest (byte-exact reassembly) — kept only for the v1 fallback path:
@@ -218,7 +235,17 @@ pub struct Node {
 /// given the blockstore is fs-backed and PERSISTENT — that store IS the client's
 /// CID block cache (cross-module reuse + survives restarts; Phase 3).
 pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
-    let keypair = Keypair::generate_ed25519();
+    // Persist the identity alongside the blockstore so the PeerId is STABLE across
+    // restarts. The blockstore survives restarts but a fresh keypair every launch
+    // would churn the PeerId — orphaning our tracker presence row and the per-peer
+    // byte counters. With `data_dir == None` (headless/test) we stay ephemeral.
+    let keypair = match &data_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).ok();
+            load_or_create_keypair(&dir.join("identity.key"))?
+        }
+        None => Keypair::generate_ed25519(),
+    };
     let peer_id = keypair.public().to_peer_id().to_string();
     // The builder is generic over a custom NetworkBehaviour; we don't need one,
     // so pin it to libp2p's no-op dummy behaviour (ToSwarm = Infallible).
@@ -252,6 +279,29 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
     }
     let ipfs: Ipfs = builder.start().await?;
     Ok(Node { ipfs, peer_id })
+}
+
+/// Load the persisted ed25519 keypair from `path`, or mint + persist a new one.
+/// The file is the libp2p protobuf encoding (private key material), so it is
+/// written 0600 on unix. A corrupt/unreadable file is replaced (a fresh identity
+/// is better than refusing to start). Deleting this file is the intended "new
+/// identity" reset — the next start mints a fresh keypair.
+fn load_or_create_keypair(path: &std::path::Path) -> Result<Keypair> {
+    if let Ok(bytes) = std::fs::read(path) {
+        match Keypair::from_protobuf_encoding(&bytes) {
+            Ok(kp) => return Ok(kp),
+            Err(e) => eprintln!("[identity] {} unreadable ({e}); minting fresh", path.display()),
+        }
+    }
+    let keypair = Keypair::generate_ed25519();
+    let bytes = keypair.to_protobuf_encoding()?;
+    std::fs::write(path, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).ok();
+    }
+    Ok(keypair)
 }
 
 /// Resolve a `/dns4|/dns6|/dnsaddr/<host>/…` multiaddr to a literal
@@ -358,12 +408,42 @@ pub async fn keepalive_master(ipfs: &Ipfs, addrs: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Warm-connect a peer-assist holder (from the tracker): dial + keepalive so the
+/// connection isn't pruned before playback wants it. Unlike the master we do NOT
+/// `.reconnect()` — a dropped warm holder should fall out of the set rather than
+/// reconnect-storm (the master is the durable link; warm holders are opportunistic).
+/// `/dns*` hosts are resolved to a literal IP first (connexa can't dial `/dns*`).
+pub async fn warm_connect(ipfs: &Ipfs, peer_id: &str, addrs: &[String]) -> Result<()> {
+    let pid: PeerId = peer_id
+        .parse()
+        .map_err(|e| anyhow!("bad warm peer id {peer_id}: {e}"))?;
+    let mut dialable: Vec<Multiaddr> = Vec::new();
+    for a in addrs {
+        let Ok(ma) = a.parse::<Multiaddr>() else { continue };
+        dialable.push(resolve_dns_multiaddr(&ma).await.unwrap_or(ma));
+    }
+    if dialable.is_empty() {
+        return Err(anyhow!("no dialable addrs for {peer_id}"));
+    }
+    let opt = AddPeerOpt::with_peer_id(pid)
+        .set_addresses(dialable)
+        .set_dial(true)
+        .keepalive();
+    ipfs.add_peer(opt).await?;
+    Ok(())
+}
+
 /// Fetch one block (Bitswap when not local); `Block::new` verifies cid == hash.
 async fn fetch_bytes(ipfs: &Ipfs, cid: Cid) -> Result<Vec<u8>> {
     let mut req = ipfs.get_block(cid).set_local(false).timeout(FETCH_TIMEOUT);
-    // Ask the master directly (Bitswap dials it) rather than DHT-discovering
-    // providers — skips the flaky public-swarm crawl.
-    if let Some(p) = master_provider() {
+    // DO NOT unconditionally re-add `.provider(master)` here. A non-empty provider
+    // list makes Bitswap TARGET only those peers and REPLACES the broadcast to
+    // connected peers (verified in vendor/rust-ipfs/src/p2p/bitswap.rs) — so
+    // pinning the master as provider silently routes every want to the master
+    // alone and kills peer offload, with no error. We set a hint ONLY for the
+    // explicit TS_PROVIDER soak override; otherwise the want broadcasts to all
+    // connected peers (master + warm-set holders). See PEER-ASSIST.md §4.
+    if let Some(p) = explicit_provider_override() {
         req = req.provider(p);
     }
     let block = req.await?;
@@ -762,5 +842,57 @@ mod tests {
         assert_eq!(back.order_for_seconds(999.0), 8); // clamp to last
         // 70%-style mapping on a 10s "track": 0.70*10 = 7.0 -> last order <= 7.0
         assert_eq!(back.order_for_seconds(0.70 * 10.0), 8);
+    }
+
+    fn raw_block(data: &[u8]) -> rust_ipfs::Block {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(data);
+        // 0x12 = sha2-256, 0x55 = raw codec.
+        let mh = cid::multihash::Multihash::<64>::wrap(0x12, &digest).unwrap();
+        let cid = Cid::new_v1(0x55, mh);
+        rust_ipfs::Block::new(cid, data.to_vec()).unwrap()
+    }
+
+    // The CORE offload claim (B5 / PEER-ASSIST.md §4): with the master-provider hint
+    // removed, a block fetch BROADCASTS its want to every CONNECTED peer. Two
+    // ephemeral nodes, NO master: A holds a block, B merely connects to A (no
+    // provider hint, no DHT) and fetches it — proving "connect-is-enough."
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_fetches_from_connected_peer_without_provider_hint() {
+        let a = start(None).await.unwrap();
+        let b = start(None).await.unwrap();
+
+        let payload = b"trackerstream peer offload test".to_vec();
+        let block = raw_block(&payload);
+        let cid = *block.cid();
+        a.ipfs.put_block(&block).await.unwrap();
+
+        // Dial A from B over loopback using A's actual TCP listen port.
+        let port = a
+            .ipfs
+            .listening_addresses()
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|m| {
+                m.iter().find_map(|p| match p {
+                    Protocol::Tcp(port) => Some(port),
+                    _ => None,
+                })
+            })
+            .expect("A should have a TCP listener");
+        let addr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", a.peer_id);
+        connect(&b.ipfs, &addr).await.unwrap();
+
+        // Fetch on B: network-only (set_local false), NO `.provider()` hint. If this
+        // resolves, the want reached A purely via the connected-peer broadcast.
+        let got = tokio::time::timeout(
+            Duration::from_secs(20),
+            b.ipfs.get_block(cid).set_local(false),
+        )
+        .await
+        .expect("offload fetch timed out (want did not reach the connected peer)")
+        .unwrap();
+        assert_eq!(got.data(), payload.as_slice());
     }
 }

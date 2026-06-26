@@ -17,6 +17,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+# Test-only: forge signed IPNS records (rust-ipns::Record::new takes a chrono
+# Duration). Not in the shipping binary.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
@@ -24,10 +29,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-deep-link = "2"
 rust-ipfs = "0.15"
+# IPNS record decode + signature verify (off-DHT resolution of the future IPNS
+# catalog). Already a transitive dep of the vendored rust-ipfs, so this just
+# surfaces it directly — same version, no extra build. See PEER-ASSIST.md §9.
+rust-ipns = { version = "0.8.1", default-features = false, features = ["libp2p"] }
+base64 = "0.22"
 sha2 = "0.11.0"
 futures = "0.3.32"
 anyhow = "1.0.102"
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 cid = { version = "0.11", features = ["serde"] }
 serde_ipld_dagcbor = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
