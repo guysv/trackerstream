@@ -6,9 +6,9 @@
 pub mod ipfs;
 
 use cid::Cid;
-use rust_ipfs::Ipfs;
+use rust_ipfs::{Ipfs, PeerId};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, Response};
 use tauri::{Manager, State};
@@ -55,12 +55,68 @@ async fn node_info(state: State<'_, IpfsState>) -> Result<NodeInfo, String> {
     })
 }
 
+#[derive(Serialize)]
+struct PeerEntry {
+    /// Peer id (frontend labels the master via config MASTER_PEER_ID).
+    id: String,
+    /// Cumulative Bitswap block bytes exchanged with this peer (real wire bytes
+    /// from the rust-ipfs patch). Persist across disconnects.
+    down: u64,
+    up: u64,
+    /// Whether the peer is connected right now. False -> the UI grays the row but
+    /// keeps it (and its totals); a later reconnect continues from the same totals.
+    connected: bool,
+}
+
+#[derive(Serialize)]
+struct PeerStats {
+    /// Count of currently-connected peers (the `peers · N` toggle).
+    connected: usize,
+    /// Connected peers UNION every peer that has ever transferred — so peers that
+    /// did up/down then dropped remain (grayed) until they reconnect.
+    peers: Vec<PeerEntry>,
+}
+
+/// Snapshot for the peers pane. Polled ~1/s by the frontend, which derives per-peer
+/// up/down speed from the byte-counter deltas.
+#[tauri::command]
+async fn peer_stats(state: State<'_, IpfsState>) -> Result<PeerStats, String> {
+    let connected: HashSet<PeerId> = state
+        .ipfs
+        .connected()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let bw = ipfs::peer_bandwidth();
+    let mut ids: HashSet<PeerId> = bw.keys().copied().collect();
+    ids.extend(connected.iter().copied());
+    let peers = ids
+        .into_iter()
+        .map(|p| {
+            let (down, up) = bw.get(&p).copied().unwrap_or((0, 0));
+            PeerEntry { id: p.to_string(), down, up, connected: connected.contains(&p) }
+        })
+        .collect();
+    Ok(PeerStats { connected: connected.len(), peers })
+}
+
 #[tauri::command]
 async fn connect_peer(addr: String, state: State<'_, IpfsState>) -> Result<(), String> {
     let ipfs = state.ipfs.clone();
     ipfs::connect(&ipfs, &addr)
         .await
         .map_err(|e| format!("connect {addr} failed: {e}"))
+}
+
+/// Pin a persistent, auto-reconnecting connection to the master (called once at
+/// app mount with the config bootstrap addrs). Without it the master link is
+/// dialed lazily per-play and pruned when idle — see ipfs::keepalive_master.
+#[tauri::command]
+async fn keepalive_master(addrs: Vec<String>, state: State<'_, IpfsState>) -> Result<(), String> {
+    ipfs::keepalive_master(&state.ipfs, &addrs)
+        .await
+        .map_err(|e| format!("keepalive master failed: {e}"))
 }
 
 /// Resolve a module root CID to its exact bytes, sourced 100% from CID blocks
@@ -181,7 +237,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             node_info,
+            peer_stats,
             connect_peer,
+            keepalive_master,
             fetch_module,
             start_stream,
             get_skeleton,

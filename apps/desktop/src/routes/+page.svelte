@@ -5,6 +5,7 @@
   import DetailPanel from "$lib/components/DetailPanel.svelte";
   import NowPlaying from "$lib/components/NowPlaying.svelte";
   import QueuePanel from "$lib/components/QueuePanel.svelte";
+  import PeersPanel from "$lib/components/PeersPanel.svelte";
   import {
     search,
     listModules,
@@ -13,9 +14,12 @@
     type FormatCount,
   } from "$lib/catalog";
   import { playList, playNext, playPrev, player, nowPlaying, queue } from "$lib/player.svelte";
+  import { peers, startPeerPolling } from "$lib/peers.svelte";
   import { initDeepLinks } from "$lib/deeplink";
+  import { keepaliveMaster } from "$lib/p2p";
+  import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
 
-  let rightView = $state<"detail" | "queue">("detail");
+  let rightView = $state<"detail" | "queue" | "peers">("detail");
 
   function play(h: ModuleHit) {
     playList(
@@ -71,8 +75,15 @@
       .catch(() => (apiError = true));
     // E2: register the trackerstream:// scheme (handlers land with P2P sharing).
     void initDeepLinks();
+    // Hold a persistent master connection from startup (not lazily per-play), so
+    // the peers pane reflects reality and uncached playback skips the re-dial.
+    void keepaliveMaster(BOOTSTRAP_MULTIADDRS);
+    const stopPeers = startPeerPolling();
     window.addEventListener("keydown", globalKeys);
-    return () => window.removeEventListener("keydown", globalKeys);
+    return () => {
+      window.removeEventListener("keydown", globalKeys);
+      stopPeers();
+    };
   });
 
   let timer: ReturnType<typeof setTimeout>;
@@ -115,9 +126,14 @@
       {:else if loading}loading…
       {:else}{rows.length} result{rows.length === 1 ? "" : "s"}{/if}
     </span>
-    <button class="qtoggle" class:on={rightView === "queue"} onclick={() => (rightView = rightView === "queue" ? "detail" : "queue")}>
-      queue · {queue.items.length}
-    </button>
+    <div class="rtoggles">
+      <button class="rtoggle peers" class:on={rightView === "peers"} onclick={() => (rightView = rightView === "peers" ? "detail" : "peers")}>
+        peers · {peers.connected}
+      </button>
+      <button class="rtoggle" class:on={rightView === "queue"} onclick={() => (rightView = rightView === "queue" ? "detail" : "queue")}>
+        queue · {queue.items.length}
+      </button>
+    </div>
     <span class="engine">{player.ready ? "engine ●" : "engine ○"}</span>
   </header>
 
@@ -129,6 +145,8 @@
     <aside class="detail">
       {#if rightView === "queue"}
         <QueuePanel />
+      {:else if rightView === "peers"}
+        <PeersPanel />
       {:else}
         <DetailPanel id={selectedId} onplay={play} />
       {/if}
@@ -180,13 +198,22 @@
   .err {
     color: var(--hot);
   }
-  .qtoggle {
+  .rtoggles {
     margin-left: auto;
+    display: flex;
+    gap: 0.4rem;
+  }
+  .rtoggle {
     font-size: 12px;
   }
-  .qtoggle.on {
+  .rtoggle.on {
     border-color: var(--amber);
     color: var(--amber);
+  }
+  /* peers pane uses cyan as its accent (matches PeersPanel header) */
+  .rtoggle.peers.on {
+    border-color: var(--cyan);
+    color: var(--cyan);
   }
   .engine {
     color: var(--dim);

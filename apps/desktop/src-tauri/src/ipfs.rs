@@ -9,17 +9,28 @@ use anyhow::{anyhow, Result};
 use cid::Cid;
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use rust_ipfs::builder::IpfsBuilder;
-use rust_ipfs::{Ipfs, Keypair, Multiaddr, PeerId, Protocol};
+use rust_ipfs::{AddPeerOpt, Ipfs, Keypair, Multiaddr, PeerId, Protocol};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const FETCH_CONCURRENCY: usize = 32;
+
+/// Per-peer cumulative `(down, up)` Bitswap block bytes since process start, read
+/// by the peers pane via `peer_stats`. Sourced from our rust-ipfs patch
+/// (patches/0001-bitswap-peer-attribution.patch), which counts real block
+/// payloads at the wire — inbound `put_block` (down) + outbound block response
+/// (up) — keyed by peer. The map never evicts a peer, so a peer that disconnects
+/// keeps its totals (the UI grays it) and continues from them on reconnect.
+pub fn peer_bandwidth() -> HashMap<PeerId, (u64, u64)> {
+    rust_ipfs::bandwidth_snapshot()
+}
 
 // The fra1 master (mirror of packages/config MASTER_PEER_ID). Every block fetch
 // names it as the Bitswap provider, so we ask the always-on master directly
@@ -316,6 +327,37 @@ pub async fn connect(ipfs: &Ipfs, addr: &str) -> Result<()> {
     Ok(())
 }
 
+/// Dial the master and HOLD the connection open — keepalive + auto-reconnect —
+/// instead of the lazy one-shot dials playback makes. libp2p prunes idle
+/// connections, so without this the master is only in the swarm while a fetch is
+/// actually in flight: it pops into the peers pane for an uncached track, then
+/// drops. `add_peer().keepalive()` keeps it from being pruned; `.reconnect()`
+/// re-dials if it ever closes (master restart, network blip). `addrs` are the
+/// config BOOTSTRAP_MULTIADDRS; `/dns*` ones are resolved here for the same
+/// reason `connect()` resolves them (connexa can't dial `/dns*` itself).
+pub async fn keepalive_master(ipfs: &Ipfs, addrs: &[String]) -> Result<()> {
+    let master = master_provider().ok_or_else(|| anyhow!("no master peer id"))?;
+    let mut dialable: Vec<Multiaddr> = Vec::new();
+    for a in addrs {
+        let Ok(ma) = a.parse::<Multiaddr>() else { continue };
+        // resolve_dns_multiaddr -> None for already-literal addrs; keep them as-is.
+        dialable.push(resolve_dns_multiaddr(&ma).await.unwrap_or(ma));
+    }
+    if dialable.is_empty() {
+        return Err(anyhow!("no dialable master addresses"));
+    }
+    // reconnect attempts must be > 0 (0 disables it); 255 + re-arm on each close
+    // gives effectively-permanent reconnection.
+    let opt = AddPeerOpt::with_peer_id(master)
+        .set_addresses(dialable)
+        .set_dial(true)
+        .keepalive()
+        .reconnect(Duration::from_secs(5), 255);
+    ipfs.add_peer(opt).await?;
+    eprintln!("[keepalive] master pinned (keepalive + reconnect)");
+    Ok(())
+}
+
 /// Fetch one block (Bitswap when not local); `Block::new` verifies cid == hash.
 async fn fetch_bytes(ipfs: &Ipfs, cid: Cid) -> Result<Vec<u8>> {
     let mut req = ipfs.get_block(cid).set_local(false).timeout(FETCH_TIMEOUT);
@@ -408,8 +450,6 @@ pub async fn reassemble(ipfs: &Ipfs, root: Cid) -> Result<Vec<u8>> {
 }
 
 // --- v2 streaming: immortal instance + provide_sample + playhead prefetch ------
-
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Per-stream shared state: the assembled skeleton, decoded sample PCM as it
 /// arrives (pulled by the frontend per index), and the live playhead order the
