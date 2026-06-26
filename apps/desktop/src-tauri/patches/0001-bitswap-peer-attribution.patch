@@ -1,0 +1,66 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 41e3062..ccbabaf 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -34,6 +34,9 @@ pub mod ipns;
+ mod keystore;
+ pub mod p2p;
+ pub mod path;
++
++// trackerstream patch: per-peer Bitswap byte accounting (see p2p::bitswap).
++pub use crate::p2p::bitswap::bandwidth_snapshot;
+ pub mod refs;
+ pub mod repo;
+ pub mod unixfs;
+diff --git a/src/p2p/bitswap.rs b/src/p2p/bitswap.rs
+index 5821af4..f521f39 100644
+--- a/src/p2p/bitswap.rs
++++ b/src/p2p/bitswap.rs
+@@ -59,6 +59,31 @@ pub enum Event {
+     CancelBlock { cid: Cid },
+ }
+ 
++// trackerstream patch: per-peer Bitswap byte accounting. Counted at the two
++// points where block PAYLOADS actually cross the wire — inbound `put_block`
++// (down) and the outbound `HaveSessionEvent::Block` response (up) — so the totals
++// reflect real per-peer block transfer. A process-global snapshot map, polled by
++// the app (no swarm-command plumbing needed). See patches/0001-*.patch.
++static BANDWIDTH: std::sync::OnceLock<std::sync::Mutex<HashMap<PeerId, (u64, u64)>>> =
++    std::sync::OnceLock::new();
++
++fn bandwidth_map() -> &'static std::sync::Mutex<HashMap<PeerId, (u64, u64)>> {
++    BANDWIDTH.get_or_init(Default::default)
++}
++
++fn record_down(peer: PeerId, bytes: usize) {
++    bandwidth_map().lock().unwrap().entry(peer).or_default().0 += bytes as u64;
++}
++
++fn record_up(peer: PeerId, bytes: usize) {
++    bandwidth_map().lock().unwrap().entry(peer).or_default().1 += bytes as u64;
++}
++
++/// Cumulative `(down, up)` Bitswap block bytes per peer since process start.
++pub fn bandwidth_snapshot() -> HashMap<PeerId, (u64, u64)> {
++    bandwidth_map().lock().unwrap().clone()
++}
++
+ pub struct Behaviour {
+     events: VecDeque<ToSwarm<<Self as NetworkBehaviour>::ToSwarm, THandlerInEvent<Self>>>,
+     connections: HashMap<PeerId, HashSet<ConnectionId>>,
+@@ -450,6 +475,7 @@ impl NetworkBehaviour for Behaviour {
+                         session.dont_have_block(peer_id);
+                         continue;
+                     };
++                    record_down(peer_id, block.data().len());
+                     session.put_block(peer_id, block);
+                 }
+             }
+@@ -491,6 +517,7 @@ impl NetworkBehaviour for Behaviour {
+                     });
+                 }
+                 HaveSessionEvent::Block { peer_id, bytes } => {
++                    record_up(peer_id, bytes.len());
+                     return Poll::Ready(ToSwarm::NotifyHandler {
+                         peer_id,
+                         handler: NotifyHandler::Any,

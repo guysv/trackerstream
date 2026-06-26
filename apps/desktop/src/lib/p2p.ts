@@ -19,7 +19,27 @@ export type StreamEvent =
 
 export const nodeInfo = (): Promise<NodeInfo> => invoke<NodeInfo>("node_info");
 
+export interface PeerEntry {
+  id: string;
+  down: number; // cumulative Bitswap bytes down from this peer
+  up: number; // cumulative Bitswap bytes up to this peer
+  connected: boolean;
+}
+
+export interface PeerStats {
+  connected: number; // currently-connected count (the `peers · N` toggle)
+  peers: PeerEntry[]; // connected ∪ ever-transferred (disconnected ones retained)
+}
+
+/** Snapshot of per-peer cumulative up/down bytes + connected state (peers pane). */
+export const peerStats = (): Promise<PeerStats> => invoke<PeerStats>("peer_stats");
+
 export const connectPeer = (addr: string): Promise<void> => invoke("connect_peer", { addr });
+
+/** Pin a persistent, auto-reconnecting connection to the master (call once at
+ *  startup with the bootstrap addrs) so it isn't dialed lazily + pruned when idle. */
+export const keepaliveMaster = (addrs: string[]): Promise<void> =>
+  invoke("keepalive_master", { addrs });
 
 /** Resolve a v1 root -> exact module bytes (ArrayBuffer). v2 roots stream instead. */
 export const fetchModule = (root: string): Promise<ArrayBuffer> =>
