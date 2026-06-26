@@ -79,14 +79,96 @@ struct CheckpointV2 {
     samples: Vec<u32>, // resident slot indices
 }
 
-// The Rust transport only needs `checkpoints` (prefetch ordering). We deliberately
-// do NOT model `orderSeconds`: dag-cbor encodes whole-number floats as ints, so a
-// `seconds: f64` field fails to deserialize on `seconds: 0`. serde ignores the
-// unmodeled field; the client doesn't use the time<->order map yet either.
+// Cumulative seconds at the start of each valid play order — the time<->order map
+// for seek-by-seconds (consumed by the seek benchmark; the fence/prefetch only need
+// `checkpoints`). dag-cbor canonically encodes whole-number floats as ints, so
+// `seconds: 0` arrives as a CBOR integer that a plain `f64` field rejects — the
+// crash that fec83fa fixed by dropping the field. We instead accept int OR float
+// via a lenient visitor, so re-modeling the field can't reintroduce that crash.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct OrderSec {
+    order: u32,
+    #[serde(deserialize_with = "de_f64_lenient")]
+    seconds: f64,
+}
+
+fn de_f64_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    struct V;
+    impl serde::de::Visitor<'_> for V {
+        type Value = f64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a number (CBOR int or float)")
+        }
+        fn visit_f64<E>(self, v: f64) -> Result<f64, E> { Ok(v) }
+        fn visit_i64<E>(self, v: i64) -> Result<f64, E> { Ok(v as f64) }
+        fn visit_u64<E>(self, v: u64) -> Result<f64, E> { Ok(v as f64) }
+        fn visit_i128<E>(self, v: i128) -> Result<f64, E> { Ok(v as f64) }
+        fn visit_u128<E>(self, v: u128) -> Result<f64, E> { Ok(v as f64) }
+    }
+    d.deserialize_any(V)
+}
+
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct PlanV2 {
     #[serde(default)]
     checkpoints: Vec<CheckpointV2>,
+    #[serde(default, rename = "orderSeconds")]
+    order_seconds: Vec<OrderSec>,
+}
+
+impl PlanV2 {
+    /// Sample slots that must be resident before playback may proceed at `order` —
+    /// the Rust port of `Fence.requiredAt(order)` (apps/desktop/src/lib/audio/fence.ts):
+    /// the floor checkpoint at `order` UNION the next one (a render quantum can cross
+    /// one checkpoint boundary mid-buffer). Empty plan / single checkpoint degrade
+    /// gracefully. The fence (and the TTFP/seek benchmarks) gate on exactly this set.
+    pub fn required_at(&self, order: u32) -> Vec<u32> {
+        let mut cps: Vec<&CheckpointV2> = self.checkpoints.iter().collect();
+        cps.sort_by_key(|c| c.order);
+        // floorIdx: greatest index with checkpoint order <= `order`, else -1.
+        // unionRange(floor, floor+1), clamped (floor=-1 => cp[0] only).
+        let floor: isize = cps.iter().rposition(|c| c.order <= order).map_or(-1, |i| i as isize);
+        let lo = floor.max(0) as usize;
+        let hi = ((floor + 1).max(0) as usize).min(cps.len().saturating_sub(1));
+        let mut set: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        if !cps.is_empty() {
+            for k in lo..=hi {
+                set.extend(cps[k].samples.iter().copied());
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// requiredAt(0) — the "enough to start playing" set the TTFP benchmark waits on.
+    pub fn required_at_zero(&self) -> Vec<u32> {
+        self.required_at(0)
+    }
+
+    /// Map a wall-clock position (seconds) to the play order to seek to, via the baked
+    /// cumulative `orderSeconds` map: the latest order whose start time is <= `secs`.
+    /// Empty map (v1/flat root, or a v2 root with no time map) -> 0. This is the
+    /// bake-time approximation of where libopenmpt's seek-by-seconds lands.
+    pub fn order_for_seconds(&self, secs: f64) -> u32 {
+        let mut best = 0u32;
+        let mut best_t = f64::NEG_INFINITY;
+        for os in &self.order_seconds {
+            if os.seconds <= secs && os.seconds >= best_t {
+                best_t = os.seconds;
+                best = os.order;
+            }
+        }
+        best
+    }
+
+    /// Number of checkpoints in the plan (0 for a v1/flat root with no streaming).
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
+
+    /// Whether the plan carries a time<->order map (false for v1/flat roots).
+    pub fn has_order_map(&self) -> bool {
+        !self.order_seconds.is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,5 +563,70 @@ mod tests {
     async fn literal_multiaddr_is_left_alone() {
         let ma: Multiaddr = "/ip4/5.75.131.145/tcp/4001".parse().unwrap();
         assert!(resolve_dns_multiaddr(&ma).await.is_none());
+    }
+
+    fn plan(cps: &[(u32, &[u32])]) -> PlanV2 {
+        PlanV2 {
+            checkpoints: cps
+                .iter()
+                .map(|(order, s)| CheckpointV2 { order: *order, samples: s.to_vec() })
+                .collect(),
+            order_seconds: vec![],
+        }
+    }
+
+    // required_at_zero must equal Fence.requiredAt(0): floor checkpoint at order 0
+    // UNION the next one. Mirrors fence.spec semantics so the TTFP benchmark gates
+    // on exactly the bytes the worklet fence gates on.
+    #[test]
+    fn required_at_zero_is_floor_union_next() {
+        // Typical: first checkpoint is order 0 -> cp[0] ∪ cp[1].
+        assert_eq!(plan(&[(0, &[3, 1]), (4, &[5]), (8, &[9])]).required_at_zero(), vec![1, 3, 5]);
+        // Single checkpoint at order 0 -> just it (no next to union).
+        assert_eq!(plan(&[(0, &[2, 7])]).required_at_zero(), vec![2, 7]);
+        // No order-0 checkpoint (degenerate) -> floor = -1 -> cp[0] only, not cp[1].
+        assert_eq!(plan(&[(2, &[4]), (5, &[6])]).required_at_zero(), vec![4]);
+        // Empty plan -> nothing to gate.
+        assert!(plan(&[]).required_at_zero().is_empty());
+        // Dedup across the union (same slot in both checkpoints).
+        assert_eq!(plan(&[(0, &[1, 2]), (3, &[2, 8])]).required_at_zero(), vec![1, 2, 8]);
+    }
+
+    // required_at(order) generalizes the fence to any seek target: floor∪next.
+    #[test]
+    fn required_at_arbitrary_order() {
+        let p = plan(&[(0, &[1]), (4, &[5]), (8, &[9]), (12, &[13])]);
+        assert_eq!(p.required_at(0), vec![1, 5]); // floor(0) ∪ next(4)
+        assert_eq!(p.required_at(4), vec![5, 9]); // floor(4) ∪ next(8)
+        assert_eq!(p.required_at(5), vec![5, 9]); // between -> floor(4)
+        assert_eq!(p.required_at(8), vec![9, 13]); // floor(8) ∪ next(12)
+        assert_eq!(p.required_at(12), vec![13]); // last -> no next
+        assert_eq!(p.required_at(100), vec![13]); // beyond end -> floor=last
+    }
+
+    // orderSeconds must survive a dag-cbor round-trip (whole-number floats encode
+    // as CBOR ints — the fec83fa crash) and map seconds -> seek order correctly.
+    #[test]
+    fn order_seconds_tolerates_cbor_ints_and_maps() {
+        let p = PlanV2 {
+            checkpoints: vec![],
+            order_seconds: vec![
+                OrderSec { order: 0, seconds: 0.0 },   // encodes as CBOR int 0
+                OrderSec { order: 4, seconds: 1.5 },   // stays a float
+                OrderSec { order: 8, seconds: 3.0 },   // encodes as CBOR int 3
+            ],
+        };
+        let bytes = serde_ipld_dagcbor::to_vec(&p).unwrap();
+        let back: PlanV2 = serde_ipld_dagcbor::from_slice(&bytes).unwrap();
+        assert_eq!(back.order_seconds.len(), 3);
+        assert!(back.has_order_map());
+        assert_eq!(back.order_for_seconds(0.0), 0);
+        assert_eq!(back.order_for_seconds(1.4), 0);
+        assert_eq!(back.order_for_seconds(1.5), 4);
+        assert_eq!(back.order_for_seconds(2.9), 4);
+        assert_eq!(back.order_for_seconds(3.0), 8);
+        assert_eq!(back.order_for_seconds(999.0), 8); // clamp to last
+        // 70%-style mapping on a 10s "track": 0.70*10 = 7.0 -> last order <= 7.0
+        assert_eq!(back.order_for_seconds(0.70 * 10.0), 8);
     }
 }
