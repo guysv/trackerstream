@@ -1,20 +1,16 @@
 <script lang="ts">
-  import type { FormatCount, PlaylistSummary } from "$lib/catalog";
+  import type { FormatCount } from "$lib/catalog";
 
   let {
     formats,
     total,
-    playlists = [],
     format = $bindable(null),
     sort = $bindable("latest"),
-    onPlaylist,
   }: {
     formats: FormatCount[];
     total: number;
-    playlists?: PlaylistSummary[];
     format?: string | null;
     sort?: "latest" | "random" | "title";
-    onPlaylist?: (id: number) => void;
   } = $props();
 
   const sorts: Array<"latest" | "random" | "title"> = ["latest", "random", "title"];
@@ -39,15 +35,6 @@
       <button class="chip" class:active={sort === s} onclick={() => (sort = s)}>{s}</button>
     {/each}
   </div>
-
-  {#if playlists.length}
-    <div class="group">playlists</div>
-    {#each playlists as p}
-      <button class="nav" onclick={() => onPlaylist?.(p.id)}>
-        <span class="pl">{p.isPublic ? "" : "🔒"}{p.name}</span><span class="count">{p.count}</span>
-      </button>
-    {/each}
-  {/if}
 </nav>
 
 <style>
@@ -94,12 +81,6 @@
   }
   .count {
     color: var(--dim);
-  }
-  .pl {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    text-transform: none;
   }
   .sorts {
     display: flex;

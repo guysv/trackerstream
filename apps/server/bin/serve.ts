@@ -7,7 +7,6 @@
 // (e.g. dev, or a pre-TLS deployment reached on http://<ip>:8080).
 import { API_PORT } from "@trackerstream/config";
 import { Catalog } from "../src/catalog.ts";
-import { Social } from "../src/social.ts";
 import { createApi } from "../src/api.ts";
 
 const dbPath = process.env.CATALOG_DB ?? "./catalog.db";
@@ -15,8 +14,7 @@ const port = +(process.env.API_PORT ?? API_PORT);
 const host = process.env.API_HOST ?? "127.0.0.1";
 
 const catalog = new Catalog(dbPath);
-const social = new Social(dbPath);
-const server = createApi(catalog, social);
+const server = createApi(catalog);
 server.listen(port, host, () =>
   console.log(`trackerstream API on ${host}:${port}  (${catalog.count()} modules)`),
 );
@@ -25,7 +23,6 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, () => {
     server.close();
     catalog.close();
-    social.close();
     process.exit(0);
   });
 }

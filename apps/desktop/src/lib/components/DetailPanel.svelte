@@ -2,20 +2,8 @@
   import { getModule, type ModuleDetail, type ModuleHit } from "$lib/catalog";
   import { fmtTime, fmtBytes } from "$lib/format";
   import { enqueue } from "$lib/player.svelte";
-  import { shareModule } from "$lib/social.svelte";
 
   let { id, onplay }: { id: number | null; onplay: (h: ModuleHit) => void } = $props();
-  let shareCode = $state("");
-
-  async function doShare() {
-    if (!detail) return;
-    try {
-      shareCode = await shareModule(detail);
-      await navigator.clipboard?.writeText(shareCode).catch(() => {});
-    } catch {
-      shareCode = "share failed";
-    }
-  }
 
   let detail = $state<ModuleDetail | null>(null);
 
@@ -45,9 +33,7 @@
       <button class="play" onclick={() => onplay(detail!)}>▶ play</button>
       <button onclick={() => enqueue(detail!)}>+ queue</button>
       <button onclick={() => enqueue(detail!, true)}>play next</button>
-      <button onclick={doShare} title="create a share code">share</button>
     </div>
-    {#if shareCode}<div class="cid">share code: <b>{shareCode}</b> (copied)</div>{/if}
 
     <dl class="meta">
       <dt>format</dt><dd class="fmt-{detail.format}">{detail.format.toUpperCase()}</dd>

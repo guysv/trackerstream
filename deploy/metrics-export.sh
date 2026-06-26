@@ -45,15 +45,11 @@ emit() {
 if json="$(curl -fsS --max-time "$CURL_TIMEOUT" "$HEALTHZ_URL" 2>/dev/null)" \
    && echo "$json" | jq -e . >/dev/null 2>&1; then
   # Pull counts defensively: missing keys -> 0. /healthz shape:
-  #   { "modules": N, "playlists": N, "users": N, "uptimeSeconds": N, ... }
+  #   { "modules": N, "uptimeSeconds": N, ... }
   modules="$(echo "$json"   | jq -r '.modules       // 0 | floor' 2>/dev/null || echo 0)"
-  playlists="$(echo "$json" | jq -r '.playlists     // 0 | floor' 2>/dev/null || echo 0)"
-  users="$(echo "$json"     | jq -r '.users         // 0 | floor' 2>/dev/null || echo 0)"
   uptime="$(echo "$json"    | jq -r '.uptimeSeconds // 0 | floor' 2>/dev/null || echo 0)"
   emit trackerstream_up            "1 if the trackerstream API /healthz responded with valid JSON" 1
   emit trackerstream_modules       "Number of catalog modules"   "$modules"
-  emit trackerstream_playlists     "Number of playlists"         "$playlists"
-  emit trackerstream_users         "Number of user accounts"     "$users"
   emit trackerstream_uptime_seconds "API process uptime in seconds" "$uptime"
 else
   emit trackerstream_up "1 if the trackerstream API /healthz responded with valid JSON" 0

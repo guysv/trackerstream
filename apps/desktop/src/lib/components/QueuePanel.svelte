@@ -1,23 +1,6 @@
 <script lang="ts">
   import { queue, playList, removeFromQueue, moveInQueue, clearQueue } from "$lib/player.svelte";
-  import { createPlaylist } from "$lib/catalog";
   import { fmtTime } from "$lib/format";
-
-  let saving = $state(false);
-  let plName = $state("");
-
-  async function saveAsPlaylist() {
-    if (!plName.trim() || queue.items.length === 0) return;
-    saving = true;
-    try {
-      await createPlaylist(plName.trim(), false, queue.items.map((i) => i.id));
-      plName = "";
-    } catch {
-      /* offline */
-    } finally {
-      saving = false;
-    }
-  }
 </script>
 
 <div class="queue">
@@ -42,13 +25,6 @@
       </div>
     {/each}
     {#if !queue.items.length}<div class="empty">queue empty</div>{/if}
-  </div>
-
-  <div class="save">
-    <input bind:value={plName} placeholder="save queue as playlist…" />
-    <button onclick={saveAsPlaylist} disabled={saving || !plName.trim() || !queue.items.length}>
-      save
-    </button>
   </div>
 </div>
 
@@ -122,14 +98,5 @@
     padding: 2rem;
     text-align: center;
     color: var(--dim);
-  }
-  .save {
-    display: flex;
-    gap: 0.4rem;
-    padding: 0.6rem 0.8rem;
-    border-top: 1px solid var(--border);
-  }
-  .save input {
-    flex: 1;
   }
 </style>
