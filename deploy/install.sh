@@ -71,10 +71,42 @@ cfg Provide.Strategy roots                            # was: all (per-block prov
 cfg Provide.DHT.Interval 22h                          # (kubo 0.42 renamed Reprovider.* -> Provide.*)
 cfg --json Swarm.RelayService.Enabled true            # circuit-relay v2 (NAT fallback for peers)
 cfg --json Swarm.AddrFilters '[]'
+
+# --- Inbound capacity: absorb connection STORMS, not just steady-state churn -------
+# The master is an always-on bootstrap + provider, so a launch flash-crowd (many
+# distinct clients dialing at once) must not get trimmed or shed. Two levers:
+#  1) ConnMgr — defaults trim above HighWater=900, which would drop real clients
+#     mid-stream during a crowd. Raise the watermarks so the master HOLDS a big warm
+#     peer set. This is the lever that actually bit (the box already runs ~260 peers).
+#  2) ResourceMgr scopes — keep the RM ENABLED (don't drop DoS protection); raise the
+#     System/Transient/Peer count ceilings well above defaults so connection COUNT
+#     isn't the limiter (the per-scope Memory budget, ~half RAM, stays the backstop —
+#     the 8GB box bounds the true ceiling regardless).
+# NOTE: a burst from a SINGLE source IP is separately capped by go-libp2p's per-subnet
+# ConnLimiter, which kubo 0.42 does not expose in config — so this does NOT lift the
+# single-host benchmark cap (keep client sweeps to low --jobs). It lifts real,
+# many-IP storms. Verify after restart with `ipfs swarm resources`.
+cfg --json Swarm.ConnMgr.Type '"basic"'
+cfg --json Swarm.ConnMgr.LowWater 1000                # hold a large warm peer set
+cfg --json Swarm.ConnMgr.HighWater 3000               # before trimming kicks in (was 900)
+cfg --json Swarm.ConnMgr.GracePeriod '"60s"'          # don't trim a peer in its first minute
+cfg --json Swarm.ResourceMgr.Enabled true             # keep DoS protection ON, just looser
+# Per-scope COUNT overrides. NB: kubo removed the `Swarm.ResourceMgr.Limits` config
+# key in 0.19 — overrides now live in this side-car file (merged over the memory-scaled
+# defaults). Memory/FD omitted = keep defaults, so the per-scope Memory budget (~half
+# RAM) stays the real backstop; we only lift the conn/stream count ceilings.
+sudo -u trackerstream tee "$IPFS_PATH/libp2p-resource-limit-overrides.json" >/dev/null <<'JSON'
+{
+  "System":      {"Conns":16384,"ConnsInbound":8192,"ConnsOutbound":16384,"Streams":65536,"StreamsInbound":32768,"StreamsOutbound":65536},
+  "Transient":   {"Conns":4096,"ConnsInbound":2048,"ConnsOutbound":4096,"Streams":16384,"StreamsInbound":8192,"StreamsOutbound":16384},
+  "PeerDefault": {"Conns":64,"ConnsInbound":32,"ConnsOutbound":64,"Streams":4096,"StreamsInbound":2048,"StreamsOutbound":4096}
+}
+JSON
+
 # Drop the deprecated Reprovider block if an older init created one (0.42 is fatal on it).
 F="$IPFS_PATH/config"; jq 'del(.Reprovider)' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 chown -R trackerstream:trackerstream "$DATA/ipfs"
-echo "kubo configured (DHT server, provider=roots, relay v2)"
+echo "kubo configured (DHT server, provider=roots, relay v2, storm-tolerant rcmgr/connmgr)"
 
 echo "=== [5/8] coturn STUN/TURN ==="
 secret_file=/etc/trackerstream/turn.secret
