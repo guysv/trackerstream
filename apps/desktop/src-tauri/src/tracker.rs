@@ -40,6 +40,11 @@ struct PeersResponse {
     peers: Vec<PeerRef>,
 }
 
+#[derive(Deserialize)]
+struct RosterResponse {
+    peers: Vec<PeerRef>,
+}
+
 /// Best-effort primary LAN IP (no packets sent — connecting a UDP socket just
 /// selects the egress interface so we can read its local address).
 fn local_lan_ip() -> Option<IpAddr> {
@@ -124,6 +129,28 @@ pub(crate) fn spawn_announce_loop(ipfs: Ipfs, peer_id: PeerId, held: Arc<HeldRoo
             announce_once(&client, &ipfs, &peer_id, &held).await;
         }
     });
+}
+
+/// Ask the tracker for the online roster (presence backbone). Excludes ourselves
+/// client-side. Best-effort: empty on any error. Used to warm a bounded set of
+/// peers regardless of content, so connections are symmetric (both ends keepalive)
+/// and persist past a download — see PEER-ASSIST.md §2.3 (presence floor).
+pub(crate) async fn query_roster(self_peer_id: &str) -> Vec<PeerRef> {
+    let url = format!("{}/roster", api_base());
+    let peers = match reqwest::Client::new().get(&url).send().await {
+        Ok(r) => match r.json::<RosterResponse>().await {
+            Ok(rr) => rr.peers,
+            Err(e) => {
+                eprintln!("[roster] decode {url}: {e}");
+                vec![]
+            }
+        },
+        Err(e) => {
+            eprintln!("[roster] {url} failed: {e}");
+            vec![]
+        }
+    };
+    peers.into_iter().filter(|p| p.peer_id != self_peer_id).collect()
 }
 
 /// Ask the tracker which peers hold `root` (excluding ourselves). Best-effort:
