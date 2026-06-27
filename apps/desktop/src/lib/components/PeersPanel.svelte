@@ -31,12 +31,12 @@
     <div class="bwcol">
       <span class="dir">↓ down</span>
       <span class="rate">{rate(peers.speedDown)}</span>
-      <span class="total">{fmtBytes(peers.totalDown)} total</span>
+      <span class="total">{fmtBytes(peers.totalDown)}</span>
     </div>
     <div class="bwcol">
       <span class="dir">↑ up</span>
       <span class="rate">{rate(peers.speedUp)}</span>
-      <span class="total">{fmtBytes(peers.totalUp)} total</span>
+      <span class="total">{fmtBytes(peers.totalUp)}</span>
     </div>
   </div>
 
@@ -62,8 +62,8 @@
           {#if p.role === "master"}<span class="tag">master</span>{/if}
           {#if p.role === "warm"}<span class="tag warm">warm</span>{/if}
         </span>
-        <span class="pbw" title="download from this peer">↓ {rate(p.speedDown)}<small>{fmtBytes(p.down)} total</small></span>
-        <span class="pbw" title="upload to this peer">↑ {rate(p.speedUp)}<small>{fmtBytes(p.up)} total</small></span>
+        <span class="pbw" title="download from this peer">↓ {rate(p.speedDown)}<small>{fmtBytes(p.down)}</small></span>
+        <span class="pbw" title="upload to this peer">↑ {rate(p.speedUp)}<small>{fmtBytes(p.up)}</small></span>
       </div>
     {/each}
     {#if !peers.rows.length}<div class="empty">no peers yet</div>{/if}
