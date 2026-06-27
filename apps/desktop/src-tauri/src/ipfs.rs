@@ -388,10 +388,15 @@ pub async fn connect(ipfs: &Ipfs, addr: &str) -> Result<()> {
 /// instead of the lazy one-shot dials playback makes. libp2p prunes idle
 /// connections, so without this the master is only in the swarm while a fetch is
 /// actually in flight: it pops into the peers pane for an uncached track, then
-/// drops. `add_peer().keepalive()` keeps it from being pruned; `.reconnect()`
-/// re-dials if it ever closes (master restart, network blip). `addrs` are the
+/// drops. `add_peer().keepalive()` keeps it from being pruned. `addrs` are the
 /// config BOOTSTRAP_MULTIADDRS; `/dns*` ones are resolved here for the same
 /// reason `connect()` resolves them (connexa can't dial `/dns*` itself).
+///
+/// We DON'T use AddPeerOpt's built-in `.reconnect()`: it re-dials on a FIXED interval
+/// with no jitter (its 2nd arg is max-attempts, not interval — see vendor/rust-ipfs
+/// addressbook.rs), so when the master returns after a correlated outage every client
+/// re-dials it in lockstep — a thundering herd against its rcmgr. Instead we spawn our
+/// own re-dial loop with jitter + capped exponential backoff. See P2P-NEXT-STEPS Phase 0.
 pub async fn keepalive_master(ipfs: &Ipfs, addrs: &[String]) -> Result<()> {
     let master = master_provider().ok_or_else(|| anyhow!("no master peer id"))?;
     let mut dialable: Vec<Multiaddr> = Vec::new();
@@ -403,15 +408,39 @@ pub async fn keepalive_master(ipfs: &Ipfs, addrs: &[String]) -> Result<()> {
     if dialable.is_empty() {
         return Err(anyhow!("no dialable master addresses"));
     }
-    // reconnect attempts must be > 0 (0 disables it); 255 + re-arm on each close
-    // gives effectively-permanent reconnection.
+    // Register the addrs + pin keepalive so the live connection isn't pruned (no
+    // built-in reconnect). set_addresses puts the addrs in libp2p's addressbook, which
+    // the by-peer-id dial below relies on.
     let opt = AddPeerOpt::with_peer_id(master)
         .set_addresses(dialable)
         .set_dial(true)
-        .keepalive()
-        .reconnect(Duration::from_secs(5), 255);
+        .keepalive();
     ipfs.add_peer(opt).await?;
-    eprintln!("[keepalive] master pinned (keepalive + reconnect)");
+    eprintln!("[keepalive] master pinned (keepalive); custom reconnect loop armed");
+
+    // Custom re-dial loop: poll the connection; while it's down, dial and back off
+    // exponentially (capped, jittered); reset to base once connected. Spawned so the
+    // command returns immediately. Ipfs is a cheap clonable handle.
+    //
+    // Dial BY PEER-ID (not per-addr): libp2p then uses its addressbook + happy-eyeballs
+    // to form ONE managed connection and applies PeerCondition::DisconnectedAndNotDialing
+    // (won't pile up dials). Dialing each addr explicitly instead opened a redundant
+    // TCP *and* QUIC link to the master, which it reset — a ping-failure storm.
+    let ipfs = ipfs.clone();
+    const BASE: Duration = Duration::from_secs(5);
+    const MAX: Duration = Duration::from_secs(300);
+    tauri::async_runtime::spawn(async move {
+        let mut backoff = BASE;
+        loop {
+            if ipfs.is_connected(master).await.unwrap_or(false) {
+                backoff = BASE;
+            } else {
+                let _ = ipfs.connect(master).await;
+                backoff = (backoff * 2).min(MAX);
+            }
+            tokio::time::sleep(crate::jittered(backoff)).await;
+        }
+    });
     Ok(())
 }
 

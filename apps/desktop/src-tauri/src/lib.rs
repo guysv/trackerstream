@@ -13,9 +13,17 @@ use rust_ipfs::{Ipfs, PeerId};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::ipc::{Channel, Response};
 use tauri::{Manager, State};
+
+/// A duration with ±25% random jitter. Fixed retry intervals make every client fire in
+/// lockstep — a synchronized thundering herd against the master rcmgr during a
+/// correlated outage. Used by the announce / roster / master-reconnect loops. See
+/// P2P-NEXT-STEPS Phase 0.
+pub(crate) fn jittered(base: Duration) -> Duration {
+    base.mul_f64(rand::random::<f64>() * 0.5 + 0.75) // 0.75 .. 1.25
+}
 
 /// Embedded node handle (started once at setup; `Ipfs` is a cheap clonable,
 /// thread-safe handle, unlike the non-Send builder it came from).
@@ -65,6 +73,82 @@ impl HeldRoots {
 
     pub(crate) fn roots(&self) -> Vec<String> {
         self.map.lock().unwrap().keys().cloned().collect()
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.path else { return };
+        let snapshot = self.map.lock().unwrap().clone();
+        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+            std::fs::write(path, bytes).ok();
+        }
+    }
+}
+
+/// Last-known online roster, persisted to `roster_cache.json` next to the blockstore.
+/// Written through on every non-empty roster pull; read once on startup so a restart
+/// — even during a tracker/box outage — immediately re-dials last session's peers
+/// instead of waiting on a (possibly dead) tracker. On a normal restart it also warms
+/// the set a full roster round-trip sooner. Stale addrs are harmless (Noise binds the
+/// connection to the PeerId, so a wrong addr is a failed dial, never a wrong peer) and
+/// a fresh roster tick supersedes the cache within ~30s. This is the on-disk seed of
+/// PEX (P2P-NEXT-STEPS Phase 1): the durable form of the address book PEX will gossip.
+pub(crate) struct RosterCache {
+    path: Option<std::path::PathBuf>,
+}
+
+impl RosterCache {
+    fn load(dir: Option<&std::path::Path>) -> Self {
+        RosterCache { path: dir.map(|d| d.join("roster_cache.json")) }
+    }
+
+    /// The cached roster — empty on a missing/corrupt file or no data dir.
+    fn read(&self) -> Vec<tracker::PeerRef> {
+        self.path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<Vec<tracker::PeerRef>>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Write-through the latest roster (best-effort; errors swallowed like HeldRoots).
+    fn persist(&self, roster: &[tracker::PeerRef]) {
+        let Some(path) = &self.path else { return };
+        if let Ok(bytes) = serde_json::to_vec(roster) {
+            std::fs::write(path, bytes).ok();
+        }
+    }
+}
+
+/// Verified IPNS records cached to `ipns_cache.json` (name -> base64 record). Lets the
+/// thin client resolve the catalog name through a short tracker/box outage with zero
+/// network: the cached record is re-verified (signature + EOL) on every read, so a
+/// stale/expired/forged entry simply fails and falls through to the tracker. Spans an
+/// outage only as far as the record's EOL — the master should publish IPNS with a
+/// generous validity window (~24–48h). See P2P-NEXT-STEPS Phase 0.
+pub(crate) struct IpnsCache {
+    map: Mutex<HashMap<String, String>>,
+    path: Option<std::path::PathBuf>,
+}
+
+impl IpnsCache {
+    fn load(dir: Option<&std::path::Path>) -> Self {
+        let path = dir.map(|d| d.join("ipns_cache.json"));
+        let map = path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice::<HashMap<String, String>>(&b).ok())
+            .unwrap_or_default();
+        IpnsCache { map: Mutex::new(map), path }
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.map.lock().unwrap().get(name).cloned()
+    }
+
+    /// Cache a freshly-verified record (write-through, like HeldRoots::mark).
+    fn put(&self, name: &str, record_b64: &str) {
+        self.map.lock().unwrap().insert(name.to_string(), record_b64.to_string());
+        self.persist();
     }
 
     fn persist(&self) {
@@ -407,11 +491,20 @@ async fn warm_root(
 /// not yet wired into any flow, but lets the thin client resolve `/ipns/<name>`
 /// without a DHT once the catalog is published as IPNS.
 #[tauri::command]
-async fn resolve_ipns(name: String) -> Result<String, String> {
-    ipns::resolve_ipns(&name)
+async fn resolve_ipns(name: String, cache: State<'_, IpnsCache>) -> Result<String, String> {
+    // 1. Local cache — re-verify (signature + EOL); a stale/expired/forged entry fails
+    //    here and falls through. Zero network when valid: survives a short outage.
+    if let Some(b64) = cache.get(&name) {
+        if let Ok(cid) = ipns::verify_b64(&name, &b64) {
+            return Ok(cid.to_string());
+        }
+    }
+    // 2. Tracker fetch; cache the verified record for the next outage.
+    let (b64, cid) = ipns::fetch_record(&name)
         .await
-        .map(|cid| cid.to_string())
-        .map_err(|e| format!("resolve_ipns {name} failed: {e}"))
+        .map_err(|e| format!("resolve_ipns {name} failed: {e}"))?;
+    cache.put(&name, &b64);
+    Ok(cid.to_string())
 }
 
 /// Resolve a module root CID to its exact bytes, sourced 100% from CID blocks
@@ -520,8 +613,19 @@ pub fn run() {
     // RUST_LOG is unset (release runs stay otherwise quiet — fmt is off by default).
     {
         use tracing_subscriber::prelude::*;
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_filter(tracing_subscriber::EnvFilter::from_default_env());
+        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                // Silence connexa's swarm-task ERROR spam: routine outgoing-dial failures
+                // (stale roster peers re-dialed on startup, unreachable NAT'd peers) are
+                // logged at ERROR but aren't actionable — our code already treats a failed
+                // dial as expected. This is a specific-target directive, so it overrides a
+                // global RUST_LOG level (e.g. `info`) by specificity; an explicit
+                // `RUST_LOG=connexa::task::swarm=…` still customizes it. Does NOT affect the
+                // separate connexa::task::ping capture (pinglog runs as its own layer).
+                .add_directive(
+                    "connexa::task::swarm=off".parse().expect("valid tracing directive"),
+                ),
+        );
         let ping_layer = pinglog::PingLayer
             .with_filter(tracing_subscriber::EnvFilter::new(pinglog::PING_DIRECTIVE));
         let _ = tracing_subscriber::registry()
@@ -546,6 +650,10 @@ pub fn run() {
             let dir = app.path().app_data_dir().ok().map(|d| d.join("ipfs"));
             // Held-roots index lives next to the blockstore (load before `dir` moves).
             let held = Arc::new(HeldRoots::load(dir.as_deref()));
+            // Roster cache sits beside it — also load before `dir` moves into start().
+            let roster_cache = RosterCache::load(dir.as_deref());
+            // IPNS record cache — same directory, load before `dir` moves.
+            let ipns_cache = IpnsCache::load(dir.as_deref());
             // Start the (non-Send) builder once here, off the command path.
             let node =
                 tauri::async_runtime::block_on(ipfs::start(dir)).map_err(|e| e.to_string())?;
@@ -563,6 +671,7 @@ pub fn run() {
             app.manage(Streams::default());
             app.manage(held.clone());
             app.manage(warm.clone());
+            app.manage(ipns_cache);
             // Peer-assist tracker: announce presence + held roots every ~30s (also
             // the presence heartbeat). Skipped only if our PeerId failed to parse.
             if let Some(pid) = announce_pid {
@@ -573,13 +682,24 @@ pub fn run() {
             // keepalive, so a holder no longer drops us when a download finishes —
             // and the presence backbone forms. Bounded + LRU-evicted by WARM_CAP.
             tauri::async_runtime::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                // Startup: re-dial last session's peers immediately, before the first
+                // roster pull. During a tracker/box outage this is the ONLY source of
+                // peers; on a normal restart it just warms the set ~30s sooner. Bounded
+                // by WARM_CAP; the first live roster tick supersedes it.
+                let cached = roster_cache.read();
+                if !cached.is_empty() {
+                    warm_into_set(&roster_ipfs, &warm, cached, "restore", &self_peer).await;
+                }
+                // Pull immediately, then every ~30s with jitter so clients don't poll the
+                // tracker (and re-dial the master) in lockstep after a correlated outage.
                 loop {
-                    tick.tick().await;
                     let roster = tracker::query_roster(&self_peer).await;
                     if !roster.is_empty() {
+                        // Write-through so the next restart has a fresh peer list.
+                        roster_cache.persist(&roster);
                         warm_into_set(&roster_ipfs, &warm, roster, "roster", &self_peer).await;
                     }
+                    tokio::time::sleep(jittered(Duration::from_secs(30))).await;
                 }
             });
             Ok(())

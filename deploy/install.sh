@@ -69,7 +69,15 @@ cfg Routing.Type dht                                  # full DHT server (bootstr
 # it, so only roots need DHT provider records (for warm-cache peer discovery).
 cfg Provide.Strategy roots                            # was: all (per-block provide = ingest bottleneck)
 cfg Provide.DHT.Interval 22h                          # (kubo 0.42 renamed Reprovider.* -> Provide.*)
-cfg --json Swarm.RelayService.Enabled true            # circuit-relay v2 (NAT fallback for peers)
+# circuit-relay v2 (NAT fallback for peers), clamped to HANDSHAKE-ONLY (P2P-NEXT-STEPS
+# Phase 0): the master may broker a DCUtR hole-punch but must NOT carry bulk data. This
+# kills the "relay-bytes trap" — offload audio silently flowing through the master's relay
+# instead of peer↔peer — and makes any fake-offload fail loudly. 128KiB / 30s is ample for
+# signaling, far below an audio stream. (go-libp2p RelayLimit: Data=int64 bytes, Duration.)
+# Set the WHOLE RelayService object in one call: kubo 0.42's `ipfs config --json` refuses
+# to create the nested `.Limit` key when it doesn't exist yet ("RelayService.Limit not
+# found"), so the per-leaf form fails on a fresh box.
+cfg --json Swarm.RelayService '{"Enabled":true,"Limit":{"ConnectionDataLimit":131072,"ConnectionDurationLimit":"30s"}}'
 cfg --json Swarm.AddrFilters '[]'
 
 # --- Inbound capacity: absorb connection STORMS, not just steady-state churn -------
@@ -106,7 +114,7 @@ JSON
 # Drop the deprecated Reprovider block if an older init created one (0.42 is fatal on it).
 F="$IPFS_PATH/config"; jq 'del(.Reprovider)' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
 chown -R trackerstream:trackerstream "$DATA/ipfs"
-echo "kubo configured (DHT server, provider=roots, relay v2, storm-tolerant rcmgr/connmgr)"
+echo "kubo configured (DHT server, provider=roots, relay v2 handshake-only, storm-tolerant rcmgr/connmgr)"
 
 echo "=== [5/8] coturn STUN/TURN ==="
 secret_file=/etc/trackerstream/turn.secret
