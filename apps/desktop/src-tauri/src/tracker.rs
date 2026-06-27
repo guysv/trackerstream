@@ -12,6 +12,8 @@ use std::time::Duration;
 
 const DEFAULT_API_BASE: &str = "https://trackerstream.xyz";
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+/// Ceiling for the announce backoff when the tracker is unreachable.
+const ANNOUNCE_BACKOFF_MAX: Duration = Duration::from_secs(300);
 
 /// Tracker base URL. `TS_API_BASE` overrides it (local dev / 2-client test against
 /// a local server, e.g. http://127.0.0.1:8080).
@@ -28,7 +30,10 @@ struct AnnouncePayload {
     held_roots: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+// Serialize too: the roster cache (lib.rs RosterCache) persists `Vec<PeerRef>` to
+// disk so a restart can re-dial last session's peers. The `peerId` rename keeps the
+// on-disk JSON identical to the tracker wire shape.
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PeerRef {
     #[serde(rename = "peerId")]
     pub peer_id: String,
@@ -104,7 +109,13 @@ async fn announce_addrs(ipfs: &Ipfs, peer_id: &PeerId) -> Vec<String> {
 }
 
 /// POST one announce (presence + held roots). Doubles as the presence heartbeat.
-async fn announce_once(client: &reqwest::Client, ipfs: &Ipfs, peer_id: &PeerId, held: &HeldRoots) {
+/// Returns whether it succeeded, so the loop can back off when the tracker is down.
+async fn announce_once(
+    client: &reqwest::Client,
+    ipfs: &Ipfs,
+    peer_id: &PeerId,
+    held: &HeldRoots,
+) -> bool {
     let payload = AnnouncePayload {
         peer_id: peer_id.to_string(),
         addrs: announce_addrs(ipfs, peer_id).await,
@@ -112,21 +123,33 @@ async fn announce_once(client: &reqwest::Client, ipfs: &Ipfs, peer_id: &PeerId, 
     };
     let url = format!("{}/announce", api_base());
     match client.post(&url).json(&payload).send().await {
-        Ok(r) if r.status().is_success() => {}
-        Ok(r) => eprintln!("[announce] {url} -> {}", r.status()),
-        Err(e) => eprintln!("[announce] {url} failed: {e}"),
+        Ok(r) if r.status().is_success() => true,
+        Ok(r) => {
+            eprintln!("[announce] {url} -> {}", r.status());
+            false
+        }
+        Err(e) => {
+            eprintln!("[announce] {url} failed: {e}");
+            false
+        }
     }
 }
 
-/// Spawn the announce/heartbeat loop. `tokio::time::interval` fires immediately on
-/// the first tick, so we register as soon as the node is up, then every ~30s.
+/// Spawn the announce/heartbeat loop. Announces immediately (register as soon as the
+/// node is up), then sleeps ~30s with jitter between announces. On failure it backs off
+/// exponentially (capped) so a dead tracker isn't hammered and clients don't all re-dial
+/// the returning tracker in lockstep. See P2P-NEXT-STEPS Phase 0.
 pub(crate) fn spawn_announce_loop(ipfs: Ipfs, peer_id: PeerId, held: Arc<HeldRoots>) {
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::new();
-        let mut tick = tokio::time::interval(ANNOUNCE_INTERVAL);
+        let mut backoff = ANNOUNCE_INTERVAL;
         loop {
-            tick.tick().await;
-            announce_once(&client, &ipfs, &peer_id, &held).await;
+            if announce_once(&client, &ipfs, &peer_id, &held).await {
+                backoff = ANNOUNCE_INTERVAL;
+            } else {
+                backoff = (backoff * 2).min(ANNOUNCE_BACKOFF_MAX);
+            }
+            tokio::time::sleep(crate::jittered(backoff)).await;
         }
     });
 }
@@ -151,6 +174,29 @@ pub(crate) async fn query_roster(self_peer_id: &str) -> Vec<PeerRef> {
         }
     };
     peers.into_iter().filter(|p| p.peer_id != self_peer_id).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The roster cache persists Vec<PeerRef> as JSON and reads it back on restart, so
+    // PeerRef must Serialize<->Deserialize symmetrically — and the on-disk key must stay
+    // `peerId` (matching the tracker wire shape), not the Rust field `peer_id`.
+    #[test]
+    fn peer_ref_json_round_trips_with_peerid_key() {
+        let peers = vec![PeerRef {
+            peer_id: "12D3KooWtest".into(),
+            addrs: vec!["/ip4/1.2.3.4/tcp/4001/p2p/12D3KooWtest".into()],
+        }];
+        let json = serde_json::to_string(&peers).unwrap();
+        assert!(json.contains("\"peerId\""), "on-disk key must be peerId: {json}");
+        assert!(!json.contains("peer_id"), "must not leak the Rust field name: {json}");
+        let back: Vec<PeerRef> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].peer_id, "12D3KooWtest");
+        assert_eq!(back[0].addrs, peers[0].addrs);
+    }
 }
 
 /// Ask the tracker which peers hold `root` (excluding ourselves). Best-effort:

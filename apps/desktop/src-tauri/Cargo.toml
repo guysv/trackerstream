@@ -46,6 +46,10 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "t
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 cid = { version = "0.11", features = ["serde"] }
 serde_ipld_dagcbor = "0.6"
+# Jitter for the announce/roster/master-reconnect loops: fixed intervals make every
+# client retry in lockstep, a synchronized herd against the master rcmgr during a
+# correlated outage. See P2P-NEXT-STEPS Phase 0.
+rand = "0.9"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1"
 

@@ -18,11 +18,11 @@ struct IpnsResponse {
     record: String, // base64 of the signed IPNS record protobuf
 }
 
-/// Resolve an IPNS name to the CID it currently points at, verifying the record's
-/// signature (and that it hasn't expired). `name` is the publisher PeerId (the form
-/// our master publishes under). Returns an error on a missing/forged/expired record
-/// so callers can fall back to the master.
-pub(crate) async fn resolve_ipns(name: &str) -> Result<Cid> {
+/// Fetch the latest signed record for `name` from the tracker, verify it (signature +
+/// EOL), and return BOTH the raw base64 record (so the caller can cache it) and the CID
+/// it points at. `name` is the publisher PeerId (the form our master publishes under).
+/// Errors on a missing/forged/expired record so callers can fall back to the master.
+pub(crate) async fn fetch_record(name: &str) -> Result<(String, Cid)> {
     let url = format!("{}/ipns/{name}", crate::tracker::api_base());
     let resp: IpnsResponse = reqwest::Client::new()
         .get(&url)
@@ -31,8 +31,19 @@ pub(crate) async fn resolve_ipns(name: &str) -> Result<Cid> {
         .error_for_status()?
         .json()
         .await?;
+    let b64 = resp.record.trim().to_string();
+    let cid = verify_b64(name, &b64)?;
+    Ok((b64, cid))
+}
+
+/// Decode a base64-encoded signed record and verify it (signature + EOL), returning the
+/// CID it points at. Shared by `fetch_record` (fresh from the tracker) and the on-disk
+/// IPNS cache (lib.rs IpnsCache) — a cached entry is re-verified on every read, so a
+/// stale/expired/forged cache entry fails here and the caller falls through to the
+/// tracker. No network — pure decode + verify.
+pub(crate) fn verify_b64(name: &str, b64: &str) -> Result<Cid> {
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(resp.record.trim())
+        .decode(b64.trim())
         .map_err(|e| anyhow!("ipns record not base64: {e}"))?;
     verify_record(name, &bytes)
 }
@@ -102,5 +113,28 @@ mod tests {
         let kp = Keypair::generate_ed25519();
         let name = kp.public().to_peer_id().to_string();
         assert!(verify_record(&name, &signed(&kp, CID, -10)).is_err());
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn verify_b64_round_trips_a_cached_record() {
+        // The IPNS cache stores the base64 record; on read it's decoded + re-verified
+        // via verify_b64. A valid (signed, unexpired) cached entry must resolve.
+        let kp = Keypair::generate_ed25519();
+        let name = kp.public().to_peer_id().to_string();
+        let cid = verify_b64(&name, &b64(&signed(&kp, CID, 3600))).unwrap();
+        assert_eq!(cid.to_string(), CID);
+    }
+
+    #[test]
+    fn verify_b64_rejects_expired_cache_entry() {
+        // An expired cached record must fail verify_b64 so the caller falls through to
+        // the tracker rather than serving a stale name.
+        let kp = Keypair::generate_ed25519();
+        let name = kp.public().to_peer_id().to_string();
+        assert!(verify_b64(&name, &b64(&signed(&kp, CID, -10))).is_err());
     }
 }
