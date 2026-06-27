@@ -11,6 +11,16 @@ This supersedes nothing in [`PEER-ASSIST.md`](PEER-ASSIST.md); it sequences the
 work *after* it. PEER-ASSIST built the tracker + warm-set + IPNS readiness; this
 doc is how that hardens into a swarm that outlives its origin.
 
+**The Node backend is transitional.** Two processes share the box: the **master kubo**
+(seeder + libp2p bootstrap — *permanent*) and the **`apps/server` Node service** (catalog
+HTTP API + tracker + IPNS dumb-store — *scaffolding*). The long-term target is to **dissolve
+the Node service entirely**, replacing each of its jobs with a P2P protocol: **R1** removes
+the **catalog API** (clients query the IPNS-published DB directly); Phase 1's PEX + `Peers`
+already cover **membership + holder-discovery** when it's down; what's left for later is the
+**presence / interest table** and the **blind mailbox** (P5). End state: the box runs *only* a
+kubo. Design accordingly — **don't add new hard dependencies on the Node service**; every new
+capability should degrade to peer-served.
+
 Status legend: ▶️ do-now · 🟡 core · 🟢 demand-driven / later · ⚪ deferred.
 
 ---
@@ -48,9 +58,10 @@ Phase 0  (free SPOF relief)                    ✅ shipped
    │
 Phase 1  (request_response protocol) ── the keystone; everything peer-served rides it  ✅ shipped
    │
-   ├── Track R (resilience):  R2 reachability ✅ ─→ R3 floor/scale (deferred: needs catalog→IPNS)
+   ├── Track R (resilience):  R2 reachability ✅ (independent, client-only)
+   │                          R1 catalog→IPNS ▶️ ─→ R3 floor/scale   ◀ R1 IS THE NEXT RESILIENCE DO-NOW
    │
-   └── Track P (product):     P4 identity ─→ P4.5 user-feeds ─→ P5 friends ─→ P6 social   ◀ YOU ARE HERE
+   └── Track P (product):     P4 identity ─→ P4.5 user-feeds ─→ P5 friends ─→ P6 social
                                    │
                               (Browser tier gated on R2 + P4)
 ```
@@ -142,8 +153,8 @@ master stops secretly relaying audio. Nothing structural has changed yet.
 > - **IPNS leg is wired but dormant in prod.** `resolve_ipns` isn't invoked by the frontend
 >   yet, and nothing publishes the catalog as IPNS (the server `IpnsStore` is *"inert until
 >   the catalog migrates to IPNS"*; no master republish hook). The cache/pull chain stays
->   dormant until that **catalog→IPNS migration** lands server-side (publish with ~24–48h
->   validity). PEX + `Peers` go live the moment clients update.
+>   dormant until the **catalog→IPNS migration** lands server-side (publish with ~24–48h
+>   validity) — now specified as **R1** below. PEX + `Peers` go live the moment clients update.
 > - **Rollout pending:** rebuild + push to the two desktop clients (carries Phase 0 + 1).
 
 _Original design sketch (kept as rationale of record; see **Shipped** above for what
@@ -191,6 +202,145 @@ backfill* (R3). Highest-leverage phase: one behaviour unlocks all three.
 ---
 
 ## Track R — Resilience
+
+### R1 — Catalog → IPNS: the catalog as a pinned, self-certifying artifact ▶️ (the missing link)
+
+> **The prerequisite everything IPNS-shaped waits on.** Phase 1 built the entire *client*
+> IPNS plane — verify → cache → peer-pull (`ipns.rs` + `IpnsCache` + `peer::ipns_pull`) — and
+> the server dumb-store (`GET/POST /ipns`). It is **dormant**: nothing publishes the catalog
+> as IPNS, no master key signs anything, the frontend never calls `resolve_ipns`
+> (`lib.rs:803-806`). R1 lights it up. It also gives **R3** its anchor (the catalog is the
+> hottest root, pinned first), so **R3 cannot start until R1 lands** — this is the
+> "needs catalog→IPNS" deferral the roadmap keeps citing. **R2 shipped ahead of R1** because
+> it was independent and client-only; R1 is server + master work and was correctly deferred
+> until the client plane existed to consume it.
+
+**The idea (confirmed direction): publish the catalog *as a SQLite file* on IPFS, point a
+master-signed IPNS record at it, let clients pin + query it locally.** Today the catalog is a
+`node:sqlite` DB (`modules` table + FTS5, `catalog.ts`) the server queries on every
+`/search`, `/modules`, `/module/:id` and returns thin `SearchHit`s over HTTP (`api.ts`). That
+makes the box a hard dependency for *finding* anything — even though the audio bytes already
+flow peer-to-peer. R1 turns the catalog into just-another-content-addressed-artifact riding
+the plane we already built:
+
+```
+master: snapshot DB → `ipfs add` (CDC chunker) → catalogCID → name publish (seq++) → POST /ipns
+client: resolve_ipns (cache → tracker → peer-pull) → Bitswap-assemble the DB → pin it → query locally (rusqlite + FTS5)
+```
+
+Box-down, the pointer still resolves (cached record within EOL, or peer-pull) **and** the DB
+is fetchable (peers who pinned it serve its blocks). That closed loop — *resolve the name from
+a peer, assemble the bytes from a peer, answer the query locally* — is the "missing link" the
+rest of the roadmap keeps referencing.
+
+**Why SQLite-as-a-blob and not a CBOR/DAG catalog.** We already bake audio into CBOR DAGs; the
+catalog *could* be one too. **Don't** — the whole value of shipping the SQLite file is that
+**FTS5 + SQL ride inside it for free**. A DAG catalog throws away bm25 search and structured
+filter/sort/paginate, forcing us to rebuild a query/index layer client-side. Keep SQLite;
+solve the one real problem it creates (next).
+
+**Don't sync the whole DB to query it — fetch only the pages a query touches.** This is the
+realization that reshapes R1 (cf. phiresky's [`sql.js-httpvfs`](https://phiresky.github.io/blog/2021/hosting-sqlite-databases-on-github-pages/),
+which queries a 600 MB+ SQLite DB on a *static host* by fetching only the pages a query reads
+over HTTP **range** requests). SQLite reads in fixed-size **pages** and walks **B-tree
+indexes**, so any one query touches O(log n) + result pages — a handful, not the file. The
+IPFS analog is exact: a UnixFS file *is* a DAG of chunks, and Bitswap fetches a byte range by
+fetching just the leaf blocks it covers. Back `rusqlite` with a **custom VFS** (the
+`sqlite-vfs` crate registers one in Rust) whose `read(offset,len)` maps to leaf block(s) →
+`ipfs` block-get, with a local page cache. A search then pulls a few KB of index + row blocks,
+**not the catalog.** This is the headline of R1 and it dissolves the
+whole-DB-download problem for the common case.
+
+**So R1 has three access modes, and they compose:**
+1. **Lazy query (default, no pin).** Most users never hold the whole catalog — they resolve
+   the IPNS pointer, then query over the Bitswap-backed VFS, fetching only touched pages. Tiny
+   footprint; offline-capable for any block a peer holds.
+2. **Full pin (R3, opt-in).** Durable replicas hold *every* page → serve the cold tail +
+   guarantee completeness box-down. **This is why R3 still matters:** lazy query covers hot
+   paths, full pins cover cold rows no peer happens to hold. Incremental update of a full copy
+   is the chunk-stability concern below.
+3. **Server HTTP (transitional).** The fast path while the box is up — and precisely the
+   dependency R1 dissolves (see *"the Node backend is transitional"* up top).
+
+**What chunking still has to get right (refined — not "re-download everything," but cache
+locality).** Lazy query removes the bulk-download cost, but two things still ride on
+**page↔block stability across versions:**
+- **Align the UnixFS leaf size to the SQLite `page_size`** (small fixed chunks, ~16–64 KB —
+  *not* the 256 KB default) so one page read → one block fetch, minimal over-fetch (the same
+  tuning phiresky does with chunk size).
+- **Keep unchanged pages byte-stable across rebakes** so their block CIDs don't churn: publish
+  the **WAL-checkpointed file as-is, never `VACUUM`d** (vacuum reorders pages → every block CID
+  changes). This earns *two* wins at once — (a) full-pinners (mode 2) fetch a small diff on a
+  rebake, and (b) the hot index pages **every** querier touches stay **cached across the swarm**
+  version-to-version instead of being re-fetched from the master each rebake. Content-defined
+  chunking (which `repack`'s `buildDagV2` already does for samples) is the stronger version if
+  fixed page-aligned chunks churn too much. **Measure the cross-version block reuse + per-query
+  page count on a real rebake (R1.3)** before committing; format/id-range **sharded DBs** are
+  the fallback if page churn wins.
+
+**New hard part — Bitswap latency per page.** HTTP range (phiresky) rides one multiplexed
+connection; Bitswap is a per-block want/have round-trip, so a query touching 30 pages serially
+could stall. Mitigate with a generous local page cache (the blockstore already caches),
+**read-ahead / block prefetch** (issue a wantlist for the predicted page set), and the natural
+swarm-wide caching of exactly the hot index pages everyone touches. Acceptable for a
+near-static catalog; measure, then prefetch if it bites.
+
+**Publishing + signing (the server/master half that's missing).** Nothing holds a master
+private key today — `MASTER_PEER_ID` is config-only, and `IpnsStore` is in-memory and never
+written (`ipns.ts`). R1 adds the publisher:
+- The **master kubo already holds keys and already pins the corpus** (ingest's
+  `loadDagToKubo` recursively pins every root). Give it a dedicated **catalog key**; on each
+  ingest/rebake, snapshot the DB → `ipfs add` (CDC chunker) → `ipfs name publish --key=catalog`
+  (bumps the IPNS sequence, ~24–48h validity per Phase 0). This yields a **standard IPNS record
+  the client already verifies** — `verify_record` derives the pubkey from the name = the key's
+  PeerId. Wire the publish into `runIngest` after `updateRoot`/insert so it fires exactly
+  "once per rebake."
+- A small **republish hook** reads the signed record back (`ipfs routing get /ipns/<key>`) and
+  `POST /ipns`es it to the tracker dumb-store — the caller the `ipns.ts:14` comment promises.
+  **Persist `IpnsStore`** (today in-memory) so it survives a tracker restart.
+- The published **name = the catalog key's PeerId**; ship it in `packages/config` beside
+  `MASTER_PEER_ID` so the client knows what to resolve.
+
+**Pinning + R3 composition.** R1 makes the catalog the **first thing R3 pins** ("catalog
+first, hottest root"). Peers that pin it become catalog-block providers, so even box-down a
+client assembles the *latest* catalog (within the record EOL) from peers — discovery survives
+without the box. R1 ships the publish/resolve/local-query loop; R3 layers the opt-in disk
+budget + at-risk-root pinning on top.
+
+**Milestones.**
+- **R1.0 — publisher + signing.** Catalog key on the master; `runIngest` snapshots
+  (page-aligned chunker, no-vacuum) → `ipfs add` → `name publish` → republish hook
+  `POST /ipns`; persist `IpnsStore`. *Gate:* `GET /ipns/<catalogKey>` returns a record the
+  client's `verify_record` accepts, and the CID matches the added DB.
+- **R1.1 — lazy-query VFS (the headline).** `rusqlite` over a Bitswap-backed `sqlite-vfs`:
+  resolve `<catalogKey>` → open the remote DB → answer `/search` (FTS5) + list + detail by
+  fetching only touched pages. Port the 5 query handlers from TS (`catalog.ts`) to Rust.
+  *Gate:* box-up, a client answers a search pulling ≪ the whole DB (instrument bytes fetched).
+- **R1.2 — box-down lazy query.** Same path, blocks sourced from peers — hot index pages from
+  swarm cache, anything else from full-pinners. *Gate:* with the box down, a popular search
+  returns correct results assembled purely from peers.
+- **R1.3 — chunk-stability proof.** Page-aligned leaves + no-vacuum (CDC if needed); measure
+  cross-version block reuse and per-query page count over a real incremental rebake. *Gate:* a
+  +N-module rebake reuses ~all prior blocks; a typical query touches a handful of pages.
+- **R1.4 — full-pin mode + flip the default.** Opt-in full-DB pin (feeds R3's "catalog first");
+  optionally make lazy-VFS the frontend default and demote HTTP to bootstrap/fallback. *Gate:*
+  search works with the box never contacted (lazy for hot, full-pin for cold).
+
+**Hard parts / risks.**
+- **Per-query latency** (Bitswap round-trips) and **chunk stability** (cache locality across
+  rebakes) — both covered above; settle empirically in R1.1/R1.3, sharding is the fallback.
+- **Snapshot consistency:** publish a checkpointed, WAL-free single file; never publish a DB
+  mid-write — `.backup` into a temp path and `ipfs add` *that*.
+- **Staleness window:** box-down, a client may query a catalog up to one record-EOL old.
+  Acceptable (the catalog is near-static); the Phase-1 doorbell (deferred) tightens it if
+  freshness ever bites.
+- **Trust:** the record signature is the only trust anchor — the tracker/peer serving it stays
+  untrusted (already the design). The catalog key's compromise = a poisoned catalog; treat it
+  like the release-signing key.
+
+**Ship gate:** with the box down, a client resolves the catalog name from a peer and answers a
+search **locally over Bitswap-fetched pages — pulling ≪ the catalog** — so discovery survives
+the box end to end, and an incremental rebake leaves the hot index pages cached swarm-wide.
 
 ### R2 — Reachability: peer-provided relay ✅ SHIPPED (client-only)
 
@@ -278,10 +428,15 @@ actually landed):_
 **Ship gate:** NAT'd peers reach each other through peer relays without the master;
 the peers pane shows B↔A traffic, not B↔master. The offload is finally *genuine*.
 
-### R3 — Cold-content floor + structured discovery 🟢 (demand-driven)
+### R3 — Cold-content floor + structured discovery 🟢 (demand-driven; **gated on R1**)
+
+> **Prerequisite: R1.** "Catalog first" is only meaningful once the catalog *is* a
+> self-certifying IPNS-pointed root to pin — which is exactly what R1 delivers. R3 starts
+> after R1 (+ any current work), before the P track.
 
 - **Collaborative pinning.** Voluntarily pin hot/at-risk roots — **catalog first**
-  (hottest root, self-certifying) — onto clients as replicas. Sets the floor on what
+  (hottest root, self-certifying — its IPNS pointer + pinned blocks come from R1) — onto
+  clients as replicas. Sets the floor on what
   "zero downtime" can mean (PEER-ASSIST §9). The presence table yields a live
   replication factor; alert if it drops below a floor.
 - **Structured discovery, only if scale demands it.** PEX is neighborhood-bounded:
@@ -493,16 +648,16 @@ Great for zero-install reach; weakest tier for both-boxes-dead. Slots in after R
 ## Recommended order
 
 ```
-Phase 0 ─→ Phase 1 ─→ ┌─ R2  (start first: hardest, long pole, north-star gate) ─→ R3
+Phase 0 ─→ Phase 1 ─→ ┌─ R2 ✅ ─→ R1 (catalog→IPNS; lights up the dormant IPNS plane) ─→ R3
                       └─ P4  (in parallel: cheap, non-retrofittable, unblocks P5/P6) ─→ P4.5 ─→ P5 ─→ P6
 Browser: whenever reach matters, after R2 + P4.
 ```
 
-**The one genuine fork is yours:** after Phase 1, lead with **R2 (resilience)** or
-**P4→P5 (product)**? Lean: start R2 because it's the hardest and the north star
-depends on it — but run **P4 alongside** since it's small, non-retrofittable, and
-unblocks the entire product track. That way neither blocks, and you never ship a
-feature that forces an identity migration.
+**With R2 shipped, the next resilience step is R1** — the catalog→IPNS migration. It's the
+keystone that lights up the entire dormant Phase-1 IPNS plane (verify/cache/peer-pull all
+built, all idle) *and* unblocks R3 (collaborative pinning needs a self-certifying catalog
+root). Run **P4 alongside** as before — it's small, non-retrofittable, and unblocks the
+product track, and it shares no critical path with R1.
 
 ---
 
@@ -551,3 +706,9 @@ feature that forces an identity migration.
 7. User feeds (P4.5): playlist concurrency — do two devices ever edit the **same** playlist
    simultaneously (→ sequence-CRDT now), or is it different-device-different-time
    (→ OR-set/LWW is enough for v1)?
+8. Catalog→IPNS (R1): do page-aligned (or CDC) chunks of the SQLite file stay stable enough
+   across rebakes that the hot index pages keep their CIDs (swarm cache survives) and a query
+   touches a handful of pages — or do we need format/id shards? (Settle empirically in R1.3.)
+9. Catalog→IPNS (R1): is Bitswap per-page latency low enough (with read-ahead + page cache) to
+   make the lazy VFS the **frontend default**, demoting the HTTP catalog API to
+   bootstrap/fallback — or does HTTP stay the primary fast-path while the box is up? (R1.1/R1.4.)
