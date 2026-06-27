@@ -3,6 +3,7 @@
 //! frontend never fetches module files over HTTP — it asks the embedded node to
 //! resolve a root CID and gets back the reassembled module bytes to play.
 
+pub mod catalog;
 pub mod ipfs;
 pub mod ipns;
 pub mod peer;
@@ -811,26 +812,57 @@ async fn resolve_ipns(
     state: State<'_, IpfsState>,
     warm: State<'_, Arc<WarmSet>>,
 ) -> Result<String, String> {
-    // 1. Local cache — re-verify (signature + EOL); a stale/expired/forged entry fails
-    //    here and falls through. Zero network when valid: survives a short outage.
-    if let Some(b64) = cache.get(&name) {
-        if let Ok(cid) = ipns::verify_b64(&name, &b64) {
-            return Ok(cid.to_string());
+    resolve_ipns_name(&name, &cache, &state.ipfs, &warm).await.map(|c| c.to_string())
+}
+
+/// Shared IPNS resolution chain, verifying the signed record at each step. Tracker
+/// FIRST (freshest record when the box is up — a republish propagates immediately,
+/// not after the cached record's EOL), then the local cache and peer-pull as the
+/// box-down fallbacks. The catalog data itself is always P2P; only the name lookup
+/// prefers the box when it's reachable. Used by `resolve_ipns` and `catalog_query`.
+async fn resolve_ipns_name(
+    name: &str,
+    cache: &IpnsCache,
+    ipfs: &Ipfs,
+    warm: &WarmSet,
+) -> Result<Cid, String> {
+    // 1. Tracker (fresh + authoritative when the box is up). A short timeout inside
+    //    fetch_record bounds a box blip so we fall through to the cache quickly.
+    if let Ok((b64, cid)) = ipns::fetch_record(name).await {
+        cache.put(name, &b64);
+        return Ok(cid);
+    }
+    // 2. Local cache — box down: re-verify (signature + EOL); serves the last good
+    //    record, so a short outage doesn't break the catalog.
+    if let Some(b64) = cache.get(name) {
+        if let Ok(cid) = ipns::verify_b64(name, &b64) {
+            return Ok(cid);
         }
     }
-    // 2. Tracker fetch; cache the verified record for the next outage.
-    if let Ok((b64, cid)) = ipns::fetch_record(&name).await {
-        cache.put(&name, &b64);
-        return Ok(cid.to_string());
-    }
-    // 3. Peer-pull (box-down path, Phase 1): ask warm peers, verify each, newest sequence
+    // 3. Peer-pull (box-down + cold cache): ask warm peers, verify each, newest sequence
     //    wins. We cache + serve what we resolve, so records spread peer-to-peer (pull-based
     //    IPNS gossip — no DHT, no gossipsub mesh).
-    if let Some((b64, cid)) = peer::ipns_pull(&state.ipfs, warm.inner(), &name).await {
-        cache.put(&name, &b64);
-        return Ok(cid.to_string());
+    if let Some((b64, cid)) = peer::ipns_pull(ipfs, warm, name).await {
+        cache.put(name, &b64);
+        return Ok(cid);
     }
-    Err(format!("resolve_ipns {name}: tracker + peers all failed"))
+    Err(format!("resolve_ipns {name}: tracker + cache + peers all failed"))
+}
+
+/// Answer a catalog query by lazily reading the IPNS-published catalog DB over a
+/// Bitswap-backed SQLite VFS (R1). Resolves `name` (the catalog's `CATALOG_IPNS_KEY`,
+/// passed from the frontend config) to the current DB CID, then runs the query touching
+/// only the pages it needs. Returns JSON in the same shape the HTTP `/catalog` API did.
+#[tauri::command]
+async fn catalog_query(
+    name: String,
+    req: catalog::CatalogReq,
+    cache: State<'_, Arc<IpnsCache>>,
+    state: State<'_, IpfsState>,
+    warm: State<'_, Arc<WarmSet>>,
+) -> Result<serde_json::Value, String> {
+    let cid = resolve_ipns_name(&name, &cache, &state.ipfs, &warm).await?;
+    catalog::run_query(state.ipfs.clone(), cid, req).await
 }
 
 /// Resolve a module root CID to its exact bytes, sourced 100% from CID blocks
@@ -1168,6 +1200,7 @@ pub fn run() {
             keepalive_master,
             warm_root,
             resolve_ipns,
+            catalog_query,
             fetch_module,
             start_stream,
             get_skeleton,

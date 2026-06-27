@@ -87,6 +87,7 @@
   });
 
   let timer: ReturnType<typeof setTimeout>;
+  let reqSeq = 0;
   $effect(() => {
     const q = query.trim();
     const fmt = format;
@@ -95,16 +96,23 @@
     loading = true;
     timer = setTimeout(
       async () => {
+        // Stale-result guard: catalog queries now run over the P2P VFS and a cold one
+        // can take seconds, so two can be in flight at once. Tag each with a sequence
+        // number and only let the LATEST commit — a slow earlier query must not overwrite
+        // a newer result. (The 180ms debounce above still collapses keystroke bursts.)
+        const myReq = ++reqSeq;
         try {
-          rows = q
+          const result = q
             ? await search(q, 200)
             : await listModules({ format: fmt ?? undefined, sort: s, limit: 300 });
+          if (myReq !== reqSeq) return; // superseded by a newer query — drop this result
+          rows = result;
           apiError = false;
           if (!rows.some((x) => x.id === selectedId)) selectedId = rows[0]?.id ?? null;
         } catch {
-          apiError = true;
+          if (myReq === reqSeq) apiError = true;
         } finally {
-          loading = false;
+          if (myReq === reqSeq) loading = false;
         }
       },
       q ? 180 : 0,

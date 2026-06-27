@@ -5,6 +5,7 @@
 // termination on 443 -> reverse_proxy 127.0.0.1:8080, see deploy/setup-tls.sh),
 // and ufw denies :8080 externally. Set API_HOST=0.0.0.0 for direct/local access
 // (e.g. dev, or a pre-TLS deployment reached on http://<ip>:8080).
+import { dirname, join } from "node:path";
 import { API_PORT } from "@trackerstream/config";
 import { Catalog } from "../src/catalog.ts";
 import { Tracker } from "../src/tracker.ts";
@@ -12,6 +13,8 @@ import { IpnsStore } from "../src/ipns.ts";
 import { createApi } from "../src/api.ts";
 
 const dbPath = process.env.CATALOG_DB ?? "./catalog.db";
+// Persist published IPNS records beside the catalog DB so they survive a restart.
+const ipnsPath = process.env.IPNS_STORE ?? join(dirname(dbPath), "ipns.json");
 const port = +(process.env.API_PORT ?? API_PORT);
 const host = process.env.API_HOST ?? "127.0.0.1";
 
@@ -21,7 +24,7 @@ const PRESENCE_TTL_MS = 90_000;
 
 const catalog = new Catalog(dbPath);
 const tracker = new Tracker();
-const ipns = new IpnsStore();
+const ipns = new IpnsStore(ipnsPath);
 const server = createApi(catalog, tracker, ipns);
 const sweep = setInterval(() => tracker.sweep(PRESENCE_TTL_MS), 30_000);
 server.listen(port, host, () =>

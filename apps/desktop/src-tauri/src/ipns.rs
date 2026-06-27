@@ -26,6 +26,9 @@ pub(crate) async fn fetch_record(name: &str) -> Result<(String, Cid)> {
     let url = format!("{}/ipns/{name}", crate::tracker::api_base());
     let resp: IpnsResponse = reqwest::Client::new()
         .get(&url)
+        // Bounded so resolve falls through to the cache/peer fallbacks fast when the
+        // box is down or slow (the record is tiny; this is a single small GET).
+        .timeout(std::time::Duration::from_secs(4))
         .send()
         .await?
         .error_for_status()?

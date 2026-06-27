@@ -60,3 +60,11 @@ export const BOOTSTRAP_MULTIADDRS = MASTER_PEER_ID
 // primary path, this is the symmetric-NAT fallback). Hostname-based for durability.
 export const STUN_PORT = 3478;
 export const STUN_ENDPOINT = `${MASTER_HOST}:${STUN_PORT}`;
+
+// IPNS name (base58 PeerId, `12D3…`) the master publishes the catalog SQLite DB
+// under (R1). Generated ONCE on the master with kubo `key gen catalog` — the ingest
+// publish step prints the PeerId on first run; paste it here and ship a client build.
+// The client resolves /ipns/<this> and verifies the record's signature against it, so
+// it MUST be the base58 (`b58mh`) form, matching what the ingest stores it under.
+// Empty -> the client catalog-over-IPNS path stays dormant (HTTP /catalog still works).
+export const CATALOG_IPNS_KEY = "12D3KooWDb53qFZvANj5kDCr3riMhT2HJG32i5xqFKhvBtzh7wPC";

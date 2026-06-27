@@ -2,10 +2,22 @@
 // formats the parsers don't cover) -> block-put + recursive pin on the master
 // kubo node (shared chunks stored once) -> libopenmpt metadata -> SQLite/FTS5
 // catalog row carrying the root CID. Incremental + re-runnable (skips by source).
+import { copyFileSync, unlinkSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { buildDagV2, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
+import { CATALOG_IPNS_KEY } from "@trackerstream/config";
 import { Catalog } from "./catalog.ts";
 import { initMeta, extractModule, type ModuleMeta } from "./meta.ts";
 import { forEachModule } from "./corpus.ts";
+
+// Catalog publish layout (R1): page-aligned 16 KB chunks so each SQLite page maps to
+// one stable UnixFS block (deterministic chunking -> high cross-rebake block reuse).
+// NOT raw-leaves: the client's vendored rust-unixfs visitor can't walk raw (codec
+// 0x55) leaves ("walk failed"), so leaves stay dag-pb. kubo enables raw-leaves by
+// default at cid-version=1, hence the explicit rawLeaves:false in the addFile call.
+const CATALOG_CHUNKER = "size-16384";
+const CATALOG_KEY_NAME = "catalog"; // kubo keystore name for the catalog signing key
+const CATALOG_LIFETIME = "48h"; // IPNS record validity window the client enforces as EOL
 
 export interface IngestOpts {
   root: string;
@@ -18,6 +30,14 @@ export interface IngestOpts {
    *  catalog and unpin the superseded root. Without this, existing sources are
    *  skipped (the default incremental behavior). */
   rebuild?: boolean;
+  /** Publish the catalog DB to IPFS under the master-signed IPNS key at the end of
+   *  ingest (R1). Default true; set false for dev slices. */
+  publish?: boolean;
+  /** Live API server to POST the freshly-signed IPNS record to (its in-memory +
+   *  persisted IpnsStore is what clients resolve against). */
+  apiPublishUrl?: string;
+  /** Bearer token for POST /ipns (matches the server's TS_IPNS_TOKEN). */
+  ipnsToken?: string;
   onProgress?: (s: IngestStats) => void;
 }
 
@@ -160,7 +180,69 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
     { formats: opts.formats, limit: opts.limit },
   );
 
+  // Refresh precomputed aggregates and fold the WAL into the main file so the
+  // on-disk DB is a consistent, page-aligned snapshot before we publish it.
+  cat.refreshMeta();
+  cat.checkpoint();
   const stats: IngestStats = { processed, skipped, failed, flat, rebuilt, unchanged, total: cat.count(), ms: Date.now() - t0 };
   cat.close();
+
+  if (opts.publish !== false) {
+    try {
+      await publishCatalog(rpc, opts);
+    } catch (e) {
+      // The module DAGs are already pinned; only the IPNS announce failed. Clients
+      // keep resolving the previous record until the next rebake re-announces.
+      console.error(`catalog publish failed (DAG pinned; IPNS not re-announced): ${e}`);
+    }
+  }
   return stats;
+}
+
+/** Publish the freshly-ingested catalog DB to IPFS under the master-signed IPNS
+ *  key, then push the signed record to the live tracker so thin clients can resolve
+ *  it (R1). Snapshots the DB to a sibling file first — never adds the live path. */
+async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
+  const snapshot = `${opts.dbPath}.snapshot`;
+  copyFileSync(opts.dbPath, snapshot);
+  // Convert the snapshot to a rollback-journal (DELETE) DB so a client can open it
+  // READ-ONLY over the Bitswap VFS without a sidecar -wal file (a WAL-format header
+  // makes SQLite demand the -wal, which the single published file doesn't carry).
+  const snapDb = new DatabaseSync(snapshot);
+  snapDb.exec("PRAGMA journal_mode = DELETE;");
+  snapDb.close();
+  try {
+    const cid = await rpc.addFile(snapshot, {
+      chunker: CATALOG_CHUNKER,
+      rawLeaves: false, // dag-pb leaves — rust-unixfs can't walk raw leaves (see above)
+      cidVersion: 1,
+      pin: true,
+    });
+    const peerId = await rpc.keyGen(CATALOG_KEY_NAME); // idempotent; base58 PeerId
+    await rpc.namePublish(cid, { key: CATALOG_KEY_NAME, lifetime: CATALOG_LIFETIME });
+    const record = await rpc.routingGet(peerId);
+    console.log(`catalog published: cid=${cid} ipns=${peerId}`);
+    if (!CATALOG_IPNS_KEY) {
+      console.log(`  -> set CATALOG_IPNS_KEY="${peerId}" in packages/config and ship a client build`);
+    } else if (CATALOG_IPNS_KEY !== peerId) {
+      console.error(`  !! config CATALOG_IPNS_KEY (${CATALOG_IPNS_KEY}) != master key (${peerId}); clients will resolve the wrong name`);
+    }
+    await pushIpnsRecord(opts, peerId, record);
+  } finally {
+    try {
+      unlinkSync(snapshot);
+    } catch {
+      /* snapshot already gone -> fine */
+    }
+  }
+}
+
+/** POST a signed IPNS record to the live API server's IpnsStore (GET /ipns/<key>
+ *  is the tracker step of the client's resolve chain; the store persists it). */
+async function pushIpnsRecord(opts: IngestOpts, key: string, record: string): Promise<void> {
+  const base = opts.apiPublishUrl ?? "http://127.0.0.1:8080";
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (opts.ipnsToken) headers.authorization = `Bearer ${opts.ipnsToken}`;
+  const res = await fetch(`${base}/ipns`, { method: "POST", headers, body: JSON.stringify({ key, record }) });
+  if (!res.ok) throw new Error(`POST ${base}/ipns -> ${res.status} ${await res.text()}`);
 }
