@@ -1,0 +1,26 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -854,6 +854,22 @@
+             .map_err(Into::into)
+     }
+
++    /// AutoNAT's public-reachability verdict, reduced to a `bool` so callers need no
++    /// `libp2p` dependency: `true` once AutoNAT has confirmed a public address, `false`
++    /// while it believes the node is private OR hasn't decided yet (`Private`/`Unknown`
++    /// collapse together — the only boundary that matters for relay eligibility and
++    /// self-reservation is public-vs-not). AutoNAT flips on probe results, so callers
++    /// should debounce. Unlike `external_addresses`, this can't be fooled by our own
++    /// relay-circuit or identify-observed addrs. trackerstream patch (R2 eligibility gate).
++    pub async fn nat_public(&self) -> Result<bool, Error> {
++        self.connexa
++            .autonat()
++            .nat_status()
++            .await
++            .map(|status| status.is_public())
++            .map_err(Into::into)
++    }
++
+     /// Add a given multiaddr as a listening address. Will fail if the address is unsupported, or
+     /// if it is already being listened on. Currently will invoke `Swarm::listen_on` internally,
+     /// returning the first `Multiaddr` that is being listened on.
