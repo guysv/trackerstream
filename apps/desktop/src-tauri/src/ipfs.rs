@@ -247,6 +247,19 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
         None => Keypair::generate_ed25519(),
     };
     let peer_id = keypair.public().to_peer_id().to_string();
+    // STABLE inbound port (P2P-NEXT-STEPS). We bind TCP, and that port leaks into every
+    // address we announce / a peer persists about us (the LAN/observed-direct cases — see
+    // tracker::announce_addrs). A fresh ephemeral port every launch makes all of those
+    // stale the moment WE restart, so a peer that remembered us (Phase 0 reconnect /
+    // Phase 1 PEX) can't re-dial us directly. Reuse last session's port when it's still
+    // free; fall back to ephemeral if it's taken (a second instance, or some other
+    // process grabbed it) — never fail startup over it. Best-effort: it hardens
+    // direct-dialable entries, but NAT remapping / IP changes still need a tracker/PEX
+    // refresh (Noise binds the connection to the PeerId, so a stale addr is only ever a
+    // wasted dial). Ephemeral (data_dir == None, headless/test) keeps port 0.
+    let port_file = data_dir.as_ref().map(|d| d.join("listen_port"));
+    let tcp_port = pick_listen_port(port_file.as_deref());
+    let listen_addr = format!("/ip4/0.0.0.0/tcp/{tcp_port}");
     // The builder is generic over a custom NetworkBehaviour; we don't need one,
     // so pin it to libp2p's no-op dummy behaviour (ToSwarm = Infallible).
     // A LIGHTWEIGHT client node — deliberately NOT a DHT server. with_default()
@@ -268,7 +281,7 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
         // what delivers dial-by-hostname (IP change needs no client rebuild). This
         // call is kept harmless/in-place pending an upstream connexa fix.
         .enable_dns()
-        .add_listening_addr("/ip4/0.0.0.0/tcp/0".parse()?)
+        .add_listening_addr(listen_addr.parse()?)
         .with_relay(true) // relay client + DCUtR hole punching
         .with_autonat()
         // libp2p defaults idle_connection_timeout to 0 — a connection with no
@@ -293,7 +306,50 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
         builder = builder.set_path(dir);
     }
     let ipfs: Ipfs = builder.start().await?;
+    // Persist the port we ACTUALLY bound, so next launch reuses it. Covers both paths:
+    // we reused last session's port, or fell back to ephemeral and now pin whatever the
+    // OS handed us. Best-effort — a write failure just means an ephemeral port next time.
+    if let Some(pf) = &port_file {
+        if let Some(p) = bound_tcp_port(&ipfs).await {
+            std::fs::write(pf, p.to_string()).ok();
+        }
+    }
     Ok(Node { ipfs, peer_id })
+}
+
+/// Choose the inbound TCP port: reuse the persisted one if it's still bindable right now,
+/// else 0 (let the OS pick). Probing with a throwaway bind is a tiny TOCTOU race — if it
+/// loses (port grabbed between probe and libp2p's bind), the next launch self-heals by
+/// persisting whatever we actually got. `None`/unreadable/0 → ephemeral.
+fn pick_listen_port(port_file: Option<&std::path::Path>) -> u16 {
+    let Some(pf) = port_file else { return 0 };
+    let Some(p) = std::fs::read_to_string(pf)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&p| p != 0)
+    else {
+        return 0;
+    };
+    // Free iff we can bind it this instant; release immediately and hand the number to
+    // the builder.
+    match std::net::TcpListener::bind(("0.0.0.0", p)) {
+        Ok(l) => {
+            drop(l);
+            p
+        }
+        Err(_) => 0,
+    }
+}
+
+/// The TCP port the live node actually bound (after `start`), read from its listen addrs.
+/// All listen addrs share the one bound port, so the first TCP hop is authoritative.
+async fn bound_tcp_port(ipfs: &Ipfs) -> Option<u16> {
+    ipfs.listening_addresses().await.ok()?.into_iter().find_map(|m| {
+        m.iter().find_map(|p| match p {
+            Protocol::Tcp(port) => Some(port),
+            _ => None,
+        })
+    })
 }
 
 /// Load the persisted ed25519 keypair from `path`, or mint + persist a new one.
@@ -802,6 +858,32 @@ pub async fn stream_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_listen_port_reuses_a_free_port_and_falls_back_when_taken() {
+        let tmp = std::env::temp_dir().join(format!("ts-port-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pf = tmp.join("listen_port");
+
+        // No file → ephemeral.
+        assert_eq!(pick_listen_port(Some(&pf)), 0);
+        // No port file path at all (headless) → ephemeral.
+        assert_eq!(pick_listen_port(None), 0);
+
+        // Record a port the OS just confirmed is free, then reuse it.
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+        std::fs::write(&pf, free.to_string()).unwrap();
+        assert_eq!(pick_listen_port(Some(&pf)), free, "a free persisted port is reused");
+
+        // Occupy it → pick must fall back to ephemeral rather than collide.
+        let occupy = std::net::TcpListener::bind(("0.0.0.0", free)).unwrap();
+        assert_eq!(pick_listen_port(Some(&pf)), 0, "a taken persisted port falls back to 0");
+        drop(occupy);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
     // localhost resolves offline + deterministically, so this exercises the
     // /dns* -> /ip* rewrite (and the hop-preservation) without external DNS.
