@@ -50,7 +50,7 @@ Phase 1  (request_response protocol) ── the keystone; everything peer-served
    │
    ├── Track R (resilience):  R2 reachability ─→ R3 floor/scale        ◀ YOU ARE HERE (the fork)
    │
-   └── Track P (product):     P4 identity ─→ P5 friends ─→ P6 social   ◀ run alongside R2
+   └── Track P (product):     P4 identity ─→ P4.5 user-feeds ─→ P5 friends ─→ P6 social   ◀ run alongside R2
                                    │
                               (Browser tier gated on R2 + P4)
 ```
@@ -288,6 +288,93 @@ cross-signing.
 model is in place. Forward-compatible — friends pin `Ik`, so hardening *how* `Ik` is
 stored later (cold root + delegated signing) breaks nothing.
 
+### P4.5 — User feeds: per-device IPNS, CRDT-merged 🟡 (the user-data plane for P5/P6)
+
+Once there's an identity, peers publish their own feeds — **profile, playlists, friend
+set, now-playing history** — that others read. The naive shape (one IPNS name per user)
+is **impossible under the P4 key rule**, and the fix forces a CRDT.
+
+**The crux: an IPNS name is 1:1 with a keypair.** Verification derives the pubkey *from
+the name* and checks the signature (`ipns.rs:verify_record`); there is no cert-chain
+delegation in IPNS. So whoever holds the name's private key can bump it — and only they.
+
+- One feed under `Ik` → only **owner** devices (which hold `Ik`) can write; delegated
+  member devices can't. And you must **not** hand `Ik` to a device (kills revocation, P4).
+- One shared "feed key" F → same problem moved to F; revoking one device means rotating
+  F → republishing under a **new name** → every friend has to re-discover you.
+
+There is no safe way to let a delegated device bump a *shared* name. So:
+
+**Each device publishes its OWN feed under its device key; the user's state is the CRDT
+merge of all authorized device feeds.** A delegated device signs *its* feed freely (no
+`Ik`), is fully revocable, and readers merge. Two tiers mirror the key hierarchy:
+
+| Tier | Content | Writer | Frequency |
+|---|---|---|---|
+| **Roster** | authorized device set (`Ik`-signed certs) | **owner only** | rare (enroll/revoke) |
+| **Data** | profile, playlists, friends, history | **any authorized device** (device key) | frequent |
+
+A reader resolves the `Ik`-signed **roster** → resolves **each device feed** → **merges**,
+gating each device's ops on "was it authorized at write time?" Frequent writes never touch
+`Ik`; `Ik` only signs the rarely-changing membership. The stable public handle stays
+**`Ik`** (friends bond to it); the roster is the `Ik`→devices indirection.
+
+**Reuses the Phase 1 plane almost wholesale.** Our `Ipns` record (`verify_b64_seq` +
+newest-by-sequence + peer-pull) is *already* a signed, versioned, peer-gossipable mutable
+pointer. A device feed = that, with the name being a **device PeerId**, verification
+*also* checking the `Ik`→device cert (+ revocation), and the pointer targeting a
+**content-addressed CRDT snapshot** fetched over Bitswap. The merge sits *above* the
+existing transport — net-new work is the CRDT data model + the **cert-gated merge**.
+
+**v1 shape (recommended).** **State-based** CRDT snapshots per device (idempotent merge,
+no causal-delivery machinery; reuses IPNS-pointer + Bitswap exactly):
+
+- *Profile fields*: LWW-register per field, ordered by a **hybrid logical clock** (never
+  wall-clock — skew/backdating), device-id tiebreak.
+- *Playlists / friends / blocks*: **OR-set** of entries (the friend-set OR-set P5 already
+  names); block list wants remove-resistant semantics.
+- Each op carries **(device-id, HLC)**; merge is **gated on cert validity at op time**.
+
+**Hard parts (the design lives here):**
+
+- **Revocation vs. history.** Revoking a device cuts its *new* writes (gate on the cert
+  validity window); the user re-asserts state from a trusted device to stomp anything bad.
+  Don't blindly drop a revoked device's *past* ops — it can resurrect deletions.
+- **Revocation propagation in degraded mode.** Lean on **short-`notAfter` device certs**
+  (owner re-issues) → revocation = stop renewing → auto-expiry, eventually-consistent
+  without pushing a revoke to every reader. Explicit `Ik`-signed revocation records
+  (newest-wins) are the fast path on top. Trade-off: owner must reappear periodically.
+- **Tombstone GC** (OR-sets accumulate removes) — compact at snapshot time with a rule
+  that can't drop a concurrent unseen add. ⚪ defer, but don't design into a corner.
+- **Encryption.** Friend-scoped feeds are sealed to the friend set (the P4 x25519 subkey);
+  merge happens on plaintext post-decrypt. Keep public vs friend-scoped as separate
+  sub-feeds, not one mixed blob.
+
+⚪ **Defer:** sequence-CRDT playlists (concurrent reorder of the *same* list is rare for a
+single user's own devices — OR-set/LWW is plenty for v1), op-logs (vs snapshots), GC.
+
+**Library landscape (Rust).** There is **no production-grade turnkey "libp2p + CRDT store"
+in Rust** (Go has `go-ds-crdt`; Rust has no maintained equivalent). The pattern is
+**bring-your-own-transport + a CRDT lib** — which fits us, since we already own the
+transport:
+
+- *Transport-agnostic CRDT libs* (pair with our plane): **`automerge`** (JSON-doc,
+  multi-actor, history + compaction — best "document" fit), **`yrs`** (Yjs; best
+  lists/text), **`loro`** (rich types incl. movable list — good for reorderable
+  playlists), **`crdts`** (low-level OR-set/LWW toolkit if hand-rolling the composite).
+- *Full-stack alternatives on their OWN network* (not rust-libp2p): **`iroh`+`iroh-docs`**
+  (multi-writer signed KV, per-author keys — conceptually ideal but iroh's QUIC stack),
+  **`p2panda`** (per-author append-only logs + materialization), **`willow-rs`** (per-
+  author subspaces; maturity unverified). Adopting one means adopting its stack.
+- **Decision:** pair a transport-agnostic CRDT (lean `automerge` or `loro`) with the
+  Phase 1 plane; do **not** bolt on a parallel replication stack. Critically, **none** of
+  these do the **authorization layer** (whose ops count, cert windows, revocation) — that
+  cert-gated merge is ours, and it's the actually-novel part.
+
+**Ship gate:** a second device edits a playlist; both devices + a friend converge on the
+merged state with the box down; revoking a device drops its future writes. Naming + data
+both peer-served (rides Phase 1).
+
 ### P5 — Friends 🟡
 
 - **Two relations.** `friend` (mutual, consented, symmetric — gates DM, rich
@@ -358,7 +445,7 @@ Great for zero-install reach; weakest tier for both-boxes-dead. Slots in after R
 
 ```
 Phase 0 ─→ Phase 1 ─→ ┌─ R2  (start first: hardest, long pole, north-star gate) ─→ R3
-                      └─ P4  (in parallel: cheap, non-retrofittable, unblocks P5/P6) ─→ P5 ─→ P6
+                      └─ P4  (in parallel: cheap, non-retrofittable, unblocks P5/P6) ─→ P4.5 ─→ P5 ─→ P6
 Browser: whenever reach matters, after R2 + P4.
 ```
 
@@ -388,6 +475,11 @@ feature that forces an identity migration.
   which is per-track chat, not the catalog.
 - **Relay ability is relational** (live common neighbors), not a node flag.
 - **Sign device certs; never copy `Ik`.** Preserves revocation.
+- **User data is per-device CRDT feeds, merged — not a shared writable name.** An IPNS
+  name is 1:1 with a key and you never copy `Ik`, so each device owns a feed under its own
+  key; readers merge (cert-gated). Use a transport-agnostic CRDT (`automerge`/`loro`) over
+  the Phase 1 plane — not a parallel replication stack (iroh/p2panda/willow). The
+  cert-gated merge is ours. See P4.5.
 - **Rich presence is friend-to-friend encrypted; the tracker stays blind** to graph
   and activity.
 - **Bitswap is single-hop.** Discovery exists to make the holder a direct neighbor;
@@ -404,3 +496,9 @@ feature that forces an identity migration.
    pinned-log + reputation layer?
 5. Self-sync transport for the friend OR-set — same request_response channel, or a
    dedicated device-group topic?
+6. User feeds (P4.5): must they stay live with **no owner device present**? Short-`notAfter`
+   certs (owner must reappear to renew) vs. explicit revocation records (more machinery,
+   owner-optional).
+7. User feeds (P4.5): playlist concurrency — do two devices ever edit the **same** playlist
+   simultaneously (→ sequence-CRDT now), or is it different-device-different-time
+   (→ OR-set/LWW is enough for v1)?
