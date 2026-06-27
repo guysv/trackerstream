@@ -30,10 +30,11 @@ struct AnnouncePayload {
     held_roots: Vec<String>,
 }
 
-// Serialize too: the roster cache (lib.rs RosterCache) persists `Vec<PeerRef>` to
-// disk so a restart can re-dial last session's peers. The `peerId` rename keeps the
-// on-disk JSON identical to the tracker wire shape.
-#[derive(Debug, Serialize, Deserialize)]
+// Serialize too: the address book (lib.rs AddressBook) persists peer entries to disk so
+// a restart can re-dial last session's peers, and PEX (peer.rs) ships `PeerRef`s over the
+// wire. The `peerId` rename keeps the on-disk JSON and the CBOR wire shape identical to
+// the tracker wire shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PeerRef {
     #[serde(rename = "peerId")]
     pub peer_id: String,
@@ -89,7 +90,7 @@ fn with_p2p(mut ma: Multiaddr, peer_id: &PeerId) -> Multiaddr {
 /// Our dialable addrs for the announce: AutoNAT/identify-confirmed external addrs
 /// (incl. relay/circuit) when present, else listening addrs with 0.0.0.0 rewritten
 /// to the LAN IP so the local 2-client test is dialable. Each carries `/p2p/<id>`.
-async fn announce_addrs(ipfs: &Ipfs, peer_id: &PeerId) -> Vec<String> {
+pub(crate) async fn announce_addrs(ipfs: &Ipfs, peer_id: &PeerId) -> Vec<String> {
     let external = ipfs.external_addresses().await.unwrap_or_default();
     let base: Vec<Multiaddr> = if !external.is_empty() {
         external

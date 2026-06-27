@@ -5,15 +5,16 @@
 
 pub mod ipfs;
 pub mod ipns;
+pub mod peer;
 pub mod pinglog;
 pub mod tracker;
 
 use cid::Cid;
 use rust_ipfs::{Ipfs, PeerId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::{Channel, Response};
 use tauri::{Manager, State};
 
@@ -84,36 +85,131 @@ impl HeldRoots {
     }
 }
 
-/// Last-known online roster, persisted to `roster_cache.json` next to the blockstore.
-/// Written through on every non-empty roster pull; read once on startup so a restart
-/// — even during a tracker/box outage — immediately re-dials last session's peers
-/// instead of waiting on a (possibly dead) tracker. On a normal restart it also warms
-/// the set a full roster round-trip sooner. Stale addrs are harmless (Noise binds the
-/// connection to the PeerId, so a wrong addr is a failed dial, never a wrong peer) and
-/// a fresh roster tick supersedes the cache within ~30s. This is the on-disk seed of
-/// PEX (P2P-NEXT-STEPS Phase 1): the durable form of the address book PEX will gossip.
-pub(crate) struct RosterCache {
+/// Durable peer address book — the live generalization of Phase 0's roster cache, which
+/// it replaces. Persisted to `address_book.json` next to the blockstore. Fed from THREE
+/// sources — the tracker roster, PEX gossip (`peer::pex_pull`), and learned holders — and
+/// consumed two ways: startup warm-restore, and opportunistic book-dialing when the
+/// tracker is unreachable but the warm set has free slots. Stale addrs are harmless (Noise
+/// binds the connection to the PeerId, so a wrong addr is a failed dial, never a wrong
+/// peer). This is the on-disk + in-RAM form of the PEX address book (P2P-NEXT-STEPS
+/// Phase 1). Cap is well above WARM_CAP: most known peers are gossiped but never dialed.
+pub(crate) struct AddressBook {
+    map: Mutex<HashMap<String, BookEntry>>,
     path: Option<std::path::PathBuf>,
 }
 
-impl RosterCache {
-    fn load(dir: Option<&std::path::Path>) -> Self {
-        RosterCache { path: dir.map(|d| d.join("roster_cache.json")) }
-    }
+#[derive(Clone, Serialize, Deserialize)]
+struct BookEntry {
+    addrs: Vec<String>,
+    /// Has at least one non-relay addr → directly dialable. Direct peers are kept
+    /// preferentially (sampled first, evicted last).
+    #[serde(default)]
+    direct: bool,
+    /// Unix secs of last sighting — drives freshness ordering + cap eviction.
+    #[serde(default)]
+    last_seen: u64,
+}
 
-    /// The cached roster — empty on a missing/corrupt file or no data dir.
-    fn read(&self) -> Vec<tracker::PeerRef> {
-        self.path
+const BOOK_CAP: usize = 256;
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn is_direct(addrs: &[String]) -> bool {
+    addrs.iter().any(|a| !a.contains("/p2p-circuit"))
+}
+
+impl AddressBook {
+    fn load(dir: Option<&std::path::Path>) -> Self {
+        let path = dir.map(|d| d.join("address_book.json"));
+        let mut map: HashMap<String, BookEntry> = path
             .as_ref()
             .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice::<Vec<tracker::PeerRef>>(&b).ok())
-            .unwrap_or_default()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        // One-time migration: with no book yet but a Phase 0 roster cache present, seed
+        // from it so the first launch after the upgrade keeps last session's peers. The
+        // book owns the data thereafter; roster_cache.json becomes vestigial.
+        if map.is_empty() {
+            if let Some(seed) = dir
+                .and_then(|d| std::fs::read(d.join("roster_cache.json")).ok())
+                .and_then(|b| serde_json::from_slice::<Vec<tracker::PeerRef>>(&b).ok())
+            {
+                let now = unix_now();
+                for p in seed.into_iter().filter(|p| !p.addrs.is_empty()) {
+                    let direct = is_direct(&p.addrs);
+                    map.insert(p.peer_id, BookEntry { addrs: p.addrs, direct, last_seen: now });
+                }
+            }
+        }
+        AddressBook { map: Mutex::new(map), path }
     }
 
-    /// Write-through the latest roster (best-effort; errors swallowed like HeldRoots).
-    fn persist(&self, roster: &[tracker::PeerRef]) {
+    /// Merge peers in: dedup by peerId, union addrs, refresh `direct` + `last_seen`; then
+    /// cap (evict relay-only/oldest first, never a direct peer before a relay one) and
+    /// write through. Best-effort, like HeldRoots.
+    fn merge(&self, peers: &[tracker::PeerRef]) {
+        if peers.is_empty() {
+            return;
+        }
+        let now = unix_now();
+        {
+            let mut m = self.map.lock().unwrap();
+            for p in peers {
+                if p.addrs.is_empty() {
+                    continue;
+                }
+                let direct = is_direct(&p.addrs);
+                let e = m
+                    .entry(p.peer_id.clone())
+                    .or_insert_with(|| BookEntry { addrs: vec![], direct: false, last_seen: now });
+                for a in &p.addrs {
+                    if !e.addrs.contains(a) {
+                        e.addrs.push(a.clone());
+                    }
+                }
+                e.direct |= direct;
+                e.last_seen = now;
+            }
+            if m.len() > BOOK_CAP {
+                // Order worst-first by (direct, last_seen): relay-only + oldest lead.
+                let mut ranked: Vec<(String, bool, u64)> =
+                    m.iter().map(|(k, v)| (k.clone(), v.direct, v.last_seen)).collect();
+                ranked.sort_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+                for (k, _, _) in ranked.into_iter().take(m.len() - BOOK_CAP) {
+                    m.remove(&k);
+                }
+            }
+        }
+        self.persist();
+    }
+
+    /// Up to `want` peers as `PeerRef`s, DIRECT-dialable first then most-recently-seen,
+    /// excluding `self_peer`. Serves `Pex` and feeds startup/opportunistic book-dialing.
+    fn sample(&self, want: usize, self_peer: &str) -> Vec<tracker::PeerRef> {
+        let m = self.map.lock().unwrap();
+        let mut ranked: Vec<(&String, &BookEntry)> =
+            m.iter().filter(|(k, _)| k.as_str() != self_peer).collect();
+        ranked.sort_by(|a, b| (b.1.direct, b.1.last_seen).cmp(&(a.1.direct, a.1.last_seen)));
+        ranked
+            .into_iter()
+            .take(want)
+            .map(|(k, v)| tracker::PeerRef { peer_id: k.clone(), addrs: v.addrs.clone() })
+            .collect()
+    }
+
+    /// Number of known peers (for tests; the opportunistic-dial gate keys off the warm
+    /// set size, not the book).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
+    fn persist(&self) {
         let Some(path) = &self.path else { return };
-        if let Ok(bytes) = serde_json::to_vec(roster) {
+        let snapshot = self.map.lock().unwrap().clone();
+        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
             std::fs::write(path, bytes).ok();
         }
     }
@@ -187,8 +283,9 @@ impl WarmSet {
         e.last_used = Instant::now();
     }
 
-    /// Currently-warm peers — for the peers-pane `role` tag (B6 telemetry).
-    fn members(&self) -> HashSet<PeerId> {
+    /// Currently-warm peers — for the peers-pane `role` tag (B6 telemetry) and as the
+    /// pull target set for peer.rs (warm ∩ connected = never dial a stranger).
+    pub(crate) fn members(&self) -> HashSet<PeerId> {
         self.0.lock().unwrap().keys().copied().collect()
     }
 
@@ -478,10 +575,18 @@ async fn warm_root(
     root: String,
     state: State<'_, IpfsState>,
     warm: State<'_, Arc<WarmSet>>,
+    book: State<'_, Arc<AddressBook>>,
 ) -> Result<(), String> {
     // Validate the CID but don't fetch — this only pre-connects.
     let _: Cid = root.parse().map_err(|e| format!("bad CID {root}: {e}"))?;
-    let holders = tracker::query_peers(&state.peer_id, &root).await;
+    let mut holders = tracker::query_peers(&state.peer_id, &root).await;
+    if holders.is_empty() {
+        // Tracker had nothing (or is down): ask warm peers who holds it (Phase 1).
+        holders = peer::peers_pull(&state.ipfs, warm.inner(), &root).await;
+    }
+    if !holders.is_empty() {
+        book.merge(&holders); // learned holders enrich the book for PEX + future restores
+    }
     warm_into_set(&state.ipfs, warm.inner(), holders, &root, &state.peer_id).await;
     Ok(())
 }
@@ -491,7 +596,12 @@ async fn warm_root(
 /// not yet wired into any flow, but lets the thin client resolve `/ipns/<name>`
 /// without a DHT once the catalog is published as IPNS.
 #[tauri::command]
-async fn resolve_ipns(name: String, cache: State<'_, IpnsCache>) -> Result<String, String> {
+async fn resolve_ipns(
+    name: String,
+    cache: State<'_, Arc<IpnsCache>>,
+    state: State<'_, IpfsState>,
+    warm: State<'_, Arc<WarmSet>>,
+) -> Result<String, String> {
     // 1. Local cache — re-verify (signature + EOL); a stale/expired/forged entry fails
     //    here and falls through. Zero network when valid: survives a short outage.
     if let Some(b64) = cache.get(&name) {
@@ -500,11 +610,18 @@ async fn resolve_ipns(name: String, cache: State<'_, IpnsCache>) -> Result<Strin
         }
     }
     // 2. Tracker fetch; cache the verified record for the next outage.
-    let (b64, cid) = ipns::fetch_record(&name)
-        .await
-        .map_err(|e| format!("resolve_ipns {name} failed: {e}"))?;
-    cache.put(&name, &b64);
-    Ok(cid.to_string())
+    if let Ok((b64, cid)) = ipns::fetch_record(&name).await {
+        cache.put(&name, &b64);
+        return Ok(cid.to_string());
+    }
+    // 3. Peer-pull (box-down path, Phase 1): ask warm peers, verify each, newest sequence
+    //    wins. We cache + serve what we resolve, so records spread peer-to-peer (pull-based
+    //    IPNS gossip — no DHT, no gossipsub mesh).
+    if let Some((b64, cid)) = peer::ipns_pull(&state.ipfs, warm.inner(), &name).await {
+        cache.put(&name, &b64);
+        return Ok(cid.to_string());
+    }
+    Err(format!("resolve_ipns {name}: tracker + peers all failed"))
 }
 
 /// Resolve a module root CID to its exact bytes, sourced 100% from CID blocks
@@ -650,10 +767,11 @@ pub fn run() {
             let dir = app.path().app_data_dir().ok().map(|d| d.join("ipfs"));
             // Held-roots index lives next to the blockstore (load before `dir` moves).
             let held = Arc::new(HeldRoots::load(dir.as_deref()));
-            // Roster cache sits beside it — also load before `dir` moves into start().
-            let roster_cache = RosterCache::load(dir.as_deref());
-            // IPNS record cache — same directory, load before `dir` moves.
-            let ipns_cache = IpnsCache::load(dir.as_deref());
+            // Durable peer address book sits beside it — also load before `dir` moves.
+            let book = Arc::new(AddressBook::load(dir.as_deref()));
+            // IPNS record cache — same directory, load before `dir` moves. Arc so the
+            // serve loop and the resolve_ipns command share it.
+            let ipns_cache = Arc::new(IpnsCache::load(dir.as_deref()));
             // Start the (non-Send) builder once here, off the command path.
             let node =
                 tauri::async_runtime::block_on(ipfs::start(dir)).map_err(|e| e.to_string())?;
@@ -661,9 +779,19 @@ pub fn run() {
             // moves into managed state.
             let announce_ipfs = node.ipfs.clone();
             let roster_ipfs = node.ipfs.clone();
+            let pex_ipfs = node.ipfs.clone();
+            let serve_ipfs = node.ipfs.clone();
             let announce_pid = node.peer_id.parse::<PeerId>().ok();
             let self_peer = node.peer_id.clone();
+            let serve_self = node.peer_id.clone();
             let warm = Arc::new(WarmSet::default());
+            // Loops/serve share the Arcs; clone before `held` moves into the announce loop.
+            let held_for_serve = held.clone();
+            let book_for_serve = book.clone();
+            let book_for_pex = book.clone();
+            let book_for_roster = book.clone();
+            let warm_for_pex = warm.clone();
+            let ipns_for_serve = ipns_cache.clone();
             app.manage(IpfsState {
                 ipfs: node.ipfs,
                 peer_id: node.peer_id,
@@ -672,32 +800,63 @@ pub fn run() {
             app.manage(held.clone());
             app.manage(warm.clone());
             app.manage(ipns_cache);
+            app.manage(book.clone());
             // Peer-assist tracker: announce presence + held roots every ~30s (also
             // the presence heartbeat). Skipped only if our PeerId failed to parse.
             if let Some(pid) = announce_pid {
                 tracker::spawn_announce_loop(announce_ipfs, pid, held);
             }
+            // Phase-1 peer control plane: answer inbound Pex/Peers/Ipns requests from our
+            // local caches so warm peers can serve each other when the box is down.
+            peer::spawn_serve_loop(peer::ServeCtx {
+                ipfs: serve_ipfs,
+                held: held_for_serve,
+                ipns: ipns_for_serve,
+                book: book_for_serve,
+                self_peer: serve_self,
+            });
+            // PEX gossip: periodically pull peers from the warm set and fold them into the
+            // address book (the durable PEX store). Sleep FIRST — the warm set is empty at
+            // boot; the roster/restore path populates it. Jittered so clients don't gossip
+            // in lockstep. This is what sustains membership knowledge through a box outage.
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(jittered(Duration::from_secs(60))).await;
+                    let learned = peer::pex_pull(&pex_ipfs, &warm_for_pex, 32).await;
+                    if !learned.is_empty() {
+                        book_for_pex.merge(&learned);
+                    }
+                }
+            });
             // Roster backbone: periodically warm a bounded set of ONLINE peers
             // (content-independent), so warm connections are symmetric — both ends
             // keepalive, so a holder no longer drops us when a download finishes —
             // and the presence backbone forms. Bounded + LRU-evicted by WARM_CAP.
             tauri::async_runtime::spawn(async move {
-                // Startup: re-dial last session's peers immediately, before the first
-                // roster pull. During a tracker/box outage this is the ONLY source of
-                // peers; on a normal restart it just warms the set ~30s sooner. Bounded
-                // by WARM_CAP; the first live roster tick supersedes it.
-                let cached = roster_cache.read();
-                if !cached.is_empty() {
-                    warm_into_set(&roster_ipfs, &warm, cached, "restore", &self_peer).await;
+                // Startup: re-dial last session's peers (from the address book) immediately,
+                // before the first roster pull. During a tracker/box outage this is the ONLY
+                // source of peers; on a normal restart it just warms the set ~30s sooner.
+                // Bounded by WARM_CAP; the first live roster tick supersedes it.
+                let restore = book_for_roster.sample(WARM_CAP, &self_peer);
+                if !restore.is_empty() {
+                    warm_into_set(&roster_ipfs, &warm, restore, "restore", &self_peer).await;
                 }
                 // Pull immediately, then every ~30s with jitter so clients don't poll the
                 // tracker (and re-dial the master) in lockstep after a correlated outage.
                 loop {
                     let roster = tracker::query_roster(&self_peer).await;
                     if !roster.is_empty() {
-                        // Write-through so the next restart has a fresh peer list.
-                        roster_cache.persist(&roster);
+                        // Feed the book so the next restart + PEX have a fresh peer list.
+                        book_for_roster.merge(&roster);
                         warm_into_set(&roster_ipfs, &warm, roster, "roster", &self_peer).await;
+                    } else if warm.members().len() < WARM_CAP {
+                        // Empty roster = tracker unreachable. With free warm slots, dial
+                        // from the book to sustain membership through the outage. (PEX keeps
+                        // the book itself fresh from whoever we're still connected to.)
+                        let dialable = book_for_roster.sample(WARM_CAP, &self_peer);
+                        if !dialable.is_empty() {
+                            warm_into_set(&roster_ipfs, &warm, dialable, "book", &self_peer).await;
+                        }
                     }
                     tokio::time::sleep(jittered(Duration::from_secs(30))).await;
                 }
@@ -721,4 +880,110 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracker::PeerRef;
+
+    fn pref(id: &str, addrs: &[&str]) -> PeerRef {
+        PeerRef { peer_id: id.into(), addrs: addrs.iter().map(|s| s.to_string()).collect() }
+    }
+
+    // AddressBook with no path: pure in-memory, no disk I/O — exercises merge/sample/cap.
+    fn mem_book() -> AddressBook {
+        AddressBook { map: Mutex::new(HashMap::new()), path: None }
+    }
+
+    #[test]
+    fn book_merge_dedups_and_unions_addrs() {
+        let book = mem_book();
+        book.merge(&[pref("12D3KooWa", &["/ip4/1.1.1.1/tcp/4001/p2p/12D3KooWa"])]);
+        // Same peer, a new addr — addrs union, not duplicate, one entry.
+        book.merge(&[pref(
+            "12D3KooWa",
+            &[
+                "/ip4/1.1.1.1/tcp/4001/p2p/12D3KooWa",
+                "/ip4/2.2.2.2/udp/4001/quic-v1/p2p/12D3KooWa",
+            ],
+        )]);
+        assert_eq!(book.len(), 1);
+        let s = book.sample(10, "self");
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].addrs.len(), 2, "addrs should union, not duplicate");
+    }
+
+    #[test]
+    fn book_sample_is_direct_first_and_excludes_self() {
+        let book = mem_book();
+        book.merge(&[
+            pref("relayonly", &["/ip4/9.9.9.9/tcp/4001/p2p-circuit/p2p/relayonly"]),
+            pref("direct", &["/ip4/1.1.1.1/tcp/4001/p2p/direct"]),
+            pref("self", &["/ip4/3.3.3.3/tcp/4001/p2p/self"]),
+        ]);
+        let s = book.sample(10, "self");
+        assert!(!s.iter().any(|p| p.peer_id == "self"), "self must be excluded");
+        assert_eq!(s[0].peer_id, "direct", "direct-dialable peer must sort first");
+    }
+
+    #[test]
+    fn book_cap_evicts_relay_only_and_oldest_first() {
+        let book = mem_book();
+        // One direct peer, then flood with > BOOK_CAP relay-only peers. The direct peer
+        // must survive (never evicted before a relay-only one).
+        book.merge(&[pref("keepDirect", &["/ip4/1.1.1.1/tcp/4001/p2p/keepDirect"])]);
+        let flood: Vec<PeerRef> = (0..BOOK_CAP + 50)
+            .map(|i| pref(&format!("r{i}"), &[&format!("/ip4/9.9.9.9/tcp/4001/p2p-circuit/p2p/r{i}")]))
+            .collect();
+        book.merge(&flood);
+        assert!(book.len() <= BOOK_CAP, "book must be capped");
+        assert!(
+            book.sample(BOOK_CAP, "x").iter().any(|p| p.peer_id == "keepDirect"),
+            "direct peer must outlive relay-only peers under cap pressure",
+        );
+    }
+
+    #[test]
+    fn book_seed_migrates_from_roster_cache() {
+        // load() with only roster_cache.json present should seed the book from it.
+        let tmp = std::env::temp_dir().join(format!("ts-book-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let roster = vec![pref("12D3KooWseed", &["/ip4/4.4.4.4/tcp/4001/p2p/12D3KooWseed"])];
+        std::fs::write(tmp.join("roster_cache.json"), serde_json::to_vec(&roster).unwrap()).unwrap();
+        let book = AddressBook::load(Some(&tmp));
+        assert_eq!(book.len(), 1);
+        assert_eq!(book.sample(10, "x")[0].peer_id, "12D3KooWseed");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // HeldRoots with no path: in-memory, exercises the Peers serve arm.
+    fn mem_held(root: Option<&str>) -> HeldRoots {
+        let mut map = HashMap::new();
+        if let Some(r) = root {
+            map.insert(r.to_string(), true);
+        }
+        HeldRoots { map: Mutex::new(map), path: None }
+    }
+
+    #[test]
+    fn peers_response_self_reports_only_when_held() {
+        let held = mem_held(Some("bafyROOT"));
+        let me = pref("12D3KooWme", &["/ip4/5.5.5.5/tcp/4001/p2p/12D3KooWme"]);
+        // Holds it + we have a self ref → answer with ourselves.
+        let peer::Resp::Peers { peers } =
+            peer::peers_response(&held, "bafyROOT", Some(me.clone()))
+        else {
+            panic!("expected Resp::Peers");
+        };
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].peer_id, "12D3KooWme");
+        // Don't hold it → empty, even with a self ref.
+        let peer::Resp::Peers { peers } =
+            peer::peers_response(&held, "bafyOTHER", Some(me))
+        else {
+            panic!("expected Resp::Peers");
+        };
+        assert!(peers.is_empty());
+    }
 }
