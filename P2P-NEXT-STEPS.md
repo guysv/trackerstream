@@ -44,13 +44,13 @@ stays true. So the achievable target is precise:
 ## 1. The dependency spine
 
 ```
-Phase 0  (free SPOF relief)
+Phase 0  (free SPOF relief)                    ✅ shipped
    │
-Phase 1  (request_response behaviour) ── the keystone; everything peer-served rides it
+Phase 1  (request_response protocol) ── the keystone; everything peer-served rides it  ✅ shipped
    │
-   ├── Track R (resilience):  R2 reachability ─→ R3 floor/scale
+   ├── Track R (resilience):  R2 reachability ─→ R3 floor/scale        ◀ YOU ARE HERE (the fork)
    │
-   └── Track P (product):     P4 identity ─→ P5 friends ─→ P6 social
+   └── Track P (product):     P4 identity ─→ P5 friends ─→ P6 social   ◀ run alongside R2
                                    │
                               (Browser tier gated on R2 + P4)
 ```
@@ -63,7 +63,12 @@ parallelize.
 
 ---
 
-## Phase 0 — Free wins ▶️
+## Phase 0 — Free wins ✅ SHIPPED
+
+> **Shipped** (commit `525eec4`). All four landed: verified-IPNS cache, reconnect
+> last-session peers, jitter+backoff on the loops, and the master relay clamped to
+> handshake-only (128 KiB / 30s — deployed + live on prod). The roster cache was later
+> absorbed into Phase 1's `AddressBook`.
 
 No new protocols, no behaviour changes. Days of work, immediate SPOF relief.
 
@@ -98,7 +103,51 @@ master stops secretly relaying audio. Nothing structural has changed yet.
 
 ---
 
-## Phase 1 — The keystone: a `request_response` behaviour 🟡
+## Phase 1 — The keystone: a `request_response` protocol ✅ SHIPPED
+
+> **Shipped** — commits `3cf3f5f` (Phase 1) + `e86f236` (stable listen port). New module
+> `peer.rs`, protocol `/trackerstream/peer/1.0.0`. **Client-only — no server deploy**: the
+> master stays a seeder, it doesn't speak the protocol. Validated by 26 unit tests + a
+> 2-node box-down integration test (`peer_to_peer_queries_survive_a_dead_box`): with no
+> tracker, **membership, naming, and holder-discovery all answered peer-to-peer.**
+>
+> **What shipped, and where it diverged from the sketch below:**
+> - **No custom `NetworkBehaviour`.** The plan was to drop a `request_response` behaviour
+>   into the dummy custom-behaviour slot — but that slot is constrained to
+>   `ToSwarm = Infallible`, which a real RR behaviour doesn't satisfy. The vendored
+>   rust-ipfs/connexa stack *already* exposes request_response as a built-in
+>   (`builder.with_request_response(...)` + `Ipfs::{send_request, send_requests,
+>   requests_subscribe, send_response}`), so we enabled THAT and left the dummy slot
+>   untouched. The codec is raw bytes, so we CBOR-encode ourselves (`serde_ipld_dagcbor`).
+> - **Wire types are `String`, not `Cid`/`PeerId`/`Vec<u8>`** — to match every existing
+>   shape (`PeerRef`, `HeldRoots` keys, the base64 `IpnsCache` value). `Resp::Ipns.record`
+>   is the base64 string `verify_b64` already takes → threads through the cache with zero
+>   re-encoding.
+> - **`AddressBook` absorbed Phase 0's `RosterCache`** (one source of truth): the durable
+>   PEX store (`address_book.json`), seeded once from the old `roster_cache.json`, fed by
+>   roster + PEX + learned holders, direct-first sampling, 256-cap.
+> - **All three legs live**: PEX (membership; opportunistic book-dialing fills free warm
+>   slots when the tracker is unreachable), `Peers{root}` (served from `HeldRoots`;
+>   `warm_root` falls back to `peers_pull`), IPNS peer-pull (`resolve_ipns`: local →
+>   tracker → peers, newest-by-sequence). Pulls target only warm ∩ connected peers — never
+>   dial a stranger, no G1 crawl.
+> - **Stable listen port** (`e86f236`): we persist + reuse the bound TCP port, so the
+>   addresses peers persist/gossip about us survive *our* restart. The old ephemeral
+>   `tcp/0` made every direct entry stale on relaunch, silently defeating reconnect + PEX.
+>   Best-effort — NAT remap / IP change still need a tracker/PEX refresh.
+>
+> **Residuals (not blockers):**
+> - **Doorbell deferred** (the `{name, seq}` push). Pull-on-resolve already spreads records
+>   epidemically; add it only if freshness latency proves to matter.
+> - **IPNS leg is wired but dormant in prod.** `resolve_ipns` isn't invoked by the frontend
+>   yet, and nothing publishes the catalog as IPNS (the server `IpnsStore` is *"inert until
+>   the catalog migrates to IPNS"*; no master republish hook). The cache/pull chain stays
+>   dormant until that **catalog→IPNS migration** lands server-side (publish with ~24–48h
+>   validity). PEX + `Peers` go live the moment clients update.
+> - **Rollout pending:** rebuild + push to the two desktop clients (carries Phase 0 + 1).
+
+_Original design sketch (kept as rationale of record; see **Shipped** above for what
+actually changed):_
 
 The builder is generic over a custom `NetworkBehaviour`; today it's pinned to the
 no-op dummy (`ipfs.rs:251`). **That slot is the integration point.** Drop in a single
