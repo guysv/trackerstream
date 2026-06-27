@@ -10,7 +10,8 @@ pub mod pinglog;
 pub mod tracker;
 
 use cid::Cid;
-use rust_ipfs::{Ipfs, PeerId};
+use futures::stream::StreamExt;
+use rust_ipfs::{ConnectionEvent, Ipfs, Multiaddr, PeerId, Protocol};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -319,6 +320,182 @@ impl WarmSet {
     }
 }
 
+/// Number of consecutive agreeing AutoNAT samples required to flip the debounced verdict.
+const REACH_HYSTERESIS: i32 = 3;
+
+/// Debounced public-reachability verdict from AutoNAT — the R2 eligibility gate. AutoNAT
+/// flips on individual probe results, so we require `REACH_HYSTERESIS` consecutive agreeing
+/// samples before changing the published verdict; this keeps the advertised `willingToRelay`
+/// fact (Tier-1 PEX) and the self-reservation loop (M3) from churning on one noisy probe.
+/// `public()` is read by the announce loop, relay-fact gossip, and self-reservation.
+/// `nat_public()` collapses Private/Unknown together, so a freshly-booted node reads as
+/// "not public" until AutoNAT confirms — undecided is surfaced as `None`.
+#[derive(Default)]
+pub(crate) struct Reachability(Mutex<ReachState>);
+
+#[derive(Default)]
+struct ReachState {
+    /// Debounced verdict: `Some(true)` public, `Some(false)` private, `None` undecided.
+    public: Option<bool>,
+    /// Signed run length of consecutive agreeing samples (+ public, − not-public).
+    run: i32,
+}
+
+impl Reachability {
+    /// Feed one AutoNAT sample (`is_public`); extend or reset the run in its direction and
+    /// flip the debounced verdict once the run reaches the hysteresis threshold. Returns
+    /// the (possibly updated) verdict.
+    fn observe(&self, is_public: bool) -> Option<bool> {
+        let mut s = self.0.lock().unwrap();
+        s.run = if is_public {
+            if s.run > 0 {
+                s.run + 1
+            } else {
+                1
+            }
+        } else if s.run < 0 {
+            s.run - 1
+        } else {
+            -1
+        };
+        if s.run >= REACH_HYSTERESIS {
+            s.public = Some(true);
+        } else if s.run <= -REACH_HYSTERESIS {
+            s.public = Some(false);
+        }
+        s.public
+    }
+
+    /// Current debounced verdict (`None` until AutoNAT produces a decisive run).
+    pub(crate) fn public(&self) -> Option<bool> {
+        self.0.lock().unwrap().public
+    }
+}
+
+/// R2 relay facts learned from warm peers via `peer::relay_pull` (volatile — NOT persisted;
+/// refreshed every PEX tick). Records which connected peers advertise `willing && reachable`,
+/// i.e. the relays a NAT'd node can self-reserve on (M3). `can_reach` is per-query (M4) and
+/// not stored here. Capped implicitly by the warm set it's fed from.
+#[derive(Default)]
+pub(crate) struct RelayView(Mutex<HashMap<PeerId, RelayFacts>>);
+
+#[derive(Clone, Copy)]
+struct RelayFacts {
+    reachable: bool,
+    willing: bool,
+}
+
+impl RelayView {
+    /// Fold in a batch of relay replies (from `relay_pull(target=None)`). A peer that drops
+    /// lingers here harmlessly — the M3 picker intersects with live `connected()` anyway.
+    fn update(&self, replies: &[peer::RelayReply]) {
+        let mut m = self.0.lock().unwrap();
+        for r in replies {
+            m.insert(r.peer, RelayFacts { reachable: r.reachable, willing: r.willing });
+        }
+    }
+
+    /// Peers we believe are usable relays (willing + reachable). The M3 self-reservation loop
+    /// picks from these; it intersects with `ipfs.connected()` at the call site.
+    pub(crate) fn willing_relays(&self) -> Vec<PeerId> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, f)| f.willing && f.reachable)
+            .map(|(p, _)| *p)
+            .collect()
+    }
+}
+
+/// R2/M5 instrumentation: cumulative connection telemetry, so the peers pane can SHOW whether
+/// relayed traffic flows through PEERS (the offload win) vs the MASTER. Fed from
+/// `connection_events`. This is a visibility dashboard, not a flip-off gate — we keep the
+/// master's clamped coordination relay regardless (roadmap §R2 / [[master-relay-dual-role]]).
+#[derive(Default)]
+pub(crate) struct RelayStats(Mutex<RelayCounts>);
+
+#[derive(Default, Clone, Copy, Serialize)]
+pub(crate) struct RelayCounts {
+    /// Direct connections established (non-circuit endpoints).
+    direct: u64,
+    /// Relayed connections established through a PEER relay (the R2 win).
+    relayed_peer: u64,
+    /// Relayed connections established through the MASTER's relay (what peer relays shrink).
+    relayed_master: u64,
+    /// Circuit→direct transitions to the same peer — inferred DCUtR hole-punch upgrades.
+    dcutr_upgrades: u64,
+}
+
+impl RelayStats {
+    fn snapshot(&self) -> RelayCounts {
+        *self.0.lock().unwrap()
+    }
+    fn record_relay(&self, via_master: bool) {
+        let mut c = self.0.lock().unwrap();
+        if via_master {
+            c.relayed_master += 1;
+        } else {
+            c.relayed_peer += 1;
+        }
+    }
+    fn record_direct(&self) {
+        self.0.lock().unwrap().direct += 1;
+    }
+    fn record_upgrade(&self) {
+        self.0.lock().unwrap().dcutr_upgrades += 1;
+    }
+}
+
+/// The relay-hop PeerId of a circuit multiaddr (the `/p2p/<hop>` immediately before
+/// `/p2p-circuit`), or `None` for a direct address. Lets us split relayed connections into
+/// peer-relayed vs master-relayed.
+fn relay_hop(addr: &Multiaddr) -> Option<PeerId> {
+    let mut last_p2p = None;
+    for p in addr.iter() {
+        match p {
+            Protocol::P2p(id) => last_p2p = Some(id),
+            Protocol::P2pCircuit => return last_p2p,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Consume `connection_events`, classifying each established connection for `RelayStats`.
+/// DCUtR upgrades are inferred: a peer first seen on a circuit endpoint, later reached
+/// directly, counts as one hole-punch upgrade.
+fn spawn_relay_stats_loop(ipfs: Ipfs, stats: Arc<RelayStats>, master: Option<PeerId>) {
+    tauri::async_runtime::spawn(async move {
+        let mut stream = match ipfs.connection_events().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[relay-stats] connection_events failed: {e}");
+                return;
+            }
+        };
+        let mut seen_relayed: HashSet<PeerId> = HashSet::new();
+        while let Some(ev) = stream.next().await {
+            let ConnectionEvent::ConnectionEstablished { peer_id, endpoint, .. } = ev else {
+                continue;
+            };
+            let addr = endpoint.get_remote_address();
+            match relay_hop(addr) {
+                Some(hop) => {
+                    stats.record_relay(Some(hop) == master);
+                    seen_relayed.insert(peer_id);
+                }
+                None => {
+                    stats.record_direct();
+                    if seen_relayed.remove(&peer_id) {
+                        stats.record_upgrade(); // circuit → direct = inferred hole-punch
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn stream_for(streams: &State<'_, Streams>, root: &str) -> Result<Arc<ipfs::StreamState>, String> {
     streams
         .0
@@ -333,10 +510,16 @@ fn stream_for(streams: &State<'_, Streams>, root: &str) -> Result<Arc<ipfs::Stre
 struct NodeInfo {
     peer_id: String,
     listening: Vec<String>,
+    /// Debounced AutoNAT verdict (R2): `Some(true)` publicly reachable, `Some(false)`
+    /// private/NAT'd, `None` undecided. Drives relay eligibility + the peers-pane badge.
+    reachable: Option<bool>,
 }
 
 #[tauri::command]
-async fn node_info(state: State<'_, IpfsState>) -> Result<NodeInfo, String> {
+async fn node_info(
+    state: State<'_, IpfsState>,
+    reach: State<'_, Arc<Reachability>>,
+) -> Result<NodeInfo, String> {
     let listening = state
         .ipfs
         .listening_addresses()
@@ -346,6 +529,7 @@ async fn node_info(state: State<'_, IpfsState>) -> Result<NodeInfo, String> {
     Ok(NodeInfo {
         peer_id: state.peer_id.clone(),
         listening,
+        reachable: reach.public(),
     })
 }
 
@@ -374,6 +558,9 @@ struct PeerStats {
     /// Connected peers UNION every peer that has ever transferred — so peers that
     /// did up/down then dropped remain (grayed) until they reconnect.
     peers: Vec<PeerEntry>,
+    /// R2/M5 cumulative relay telemetry: direct vs peer-relayed vs master-relayed
+    /// connections (+ inferred DCUtR upgrades). Shows whether offload rides peers, not the box.
+    relay: RelayCounts,
 }
 
 /// Snapshot for the peers pane. Polled ~1/s by the frontend, which derives per-peer
@@ -382,6 +569,7 @@ struct PeerStats {
 async fn peer_stats(
     state: State<'_, IpfsState>,
     warm: State<'_, Arc<WarmSet>>,
+    relay_stats: State<'_, Arc<RelayStats>>,
 ) -> Result<PeerStats, String> {
     let connected: HashSet<PeerId> = state
         .ipfs
@@ -409,7 +597,7 @@ async fn peer_stats(
             PeerEntry { id: p.to_string(), down, up, connected: connected.contains(&p), role }
         })
         .collect();
-    Ok(PeerStats { connected: connected.len(), peers })
+    Ok(PeerStats { connected: connected.len(), peers, relay: relay_stats.snapshot() })
 }
 
 /// Rich, on-demand per-peer info for the peers-pane detail view. Heavier than
@@ -561,13 +749,34 @@ async fn warm_into_set(
         }
         match ipfs::warm_connect(ipfs, &h.peer_id, &h.addrs).await {
             Ok(()) => warm.record(pid, tag),
-            Err(e) => eprintln!("[warm] {} failed: {e}", h.peer_id),
+            // R2/M4 residual fallback: a direct dial failed and we lack this holder's circuit
+            // addr — ask warm peers if any can relay us to it, and if so dial through that one.
+            Err(e) => match relay_fallback(ipfs, warm, &h.peer_id, pid).await {
+                Ok(()) => warm.record(pid, tag),
+                Err(e2) => eprintln!("[warm] {} failed (direct + relay): {e} / {e2}", h.peer_id),
+            },
         }
     }
     for victim in warm.take_overflow() {
         let _ = ipfs.disconnect(victim).await;
         let _ = ipfs.remove_peer(victim).await;
     }
+}
+
+/// R2/M4: after a direct dial to `holder` fails, ask warm peers whether any can relay us to it
+/// (`Relay{target}` → `can_reach`), and dial through the first that says yes. Thin residual
+/// path — most NAT'd holders are reached directly via their own announced circuit addr (M3).
+/// Errs if no warm peer can reach the holder or the relayed dial fails.
+async fn relay_fallback(ipfs: &Ipfs, warm: &WarmSet, holder: &str, holder_pid: PeerId) -> Result<(), String> {
+    let via = peer::relay_pull(ipfs, warm, Some(holder))
+        .await
+        .into_iter()
+        .find(|r| r.can_reach)
+        .map(|r| r.peer)
+        .ok_or_else(|| "no warm peer can relay to it".to_string())?;
+    ipfs::dial_via_relay(ipfs, via, holder_pid)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -772,6 +981,10 @@ pub fn run() {
             // IPNS record cache — same directory, load before `dir` moves. Arc so the
             // serve loop and the resolve_ipns command share it.
             let ipns_cache = Arc::new(IpnsCache::load(dir.as_deref()));
+            // R2: read the SAME relay opt-in `ipfs::start` uses to enable the relay server, so
+            // the advertised `willing` fact agrees with whether we actually run one. Read before
+            // `dir` moves into start().
+            let relay_willing = ipfs::read_relay_policy(dir.as_deref());
             // Start the (non-Send) builder once here, off the command path.
             let node =
                 tauri::async_runtime::block_on(ipfs::start(dir)).map_err(|e| e.to_string())?;
@@ -785,12 +998,29 @@ pub fn run() {
             let self_peer = node.peer_id.clone();
             let serve_self = node.peer_id.clone();
             let warm = Arc::new(WarmSet::default());
+            // Debounced AutoNAT reachability (R2 eligibility gate). Polled by its own loop.
+            let reach = Arc::new(Reachability::default());
+            let reach_ipfs = node.ipfs.clone();
+            let reach_for_loop = reach.clone();
+            // R2 relay view (volatile): which warm peers are usable relays. Fed by the PEX
+            // loop's relay_pull; read by M3 self-reservation.
+            let relay_view = Arc::new(RelayView::default());
+            let relay_for_pex = relay_view.clone();
+            let relay_for_resv = relay_view.clone();
+            let resv_ipfs = node.ipfs.clone();
+            let reach_for_resv = reach.clone();
+            // R2/M5 relay telemetry, fed from connection_events.
+            let relay_stats = Arc::new(RelayStats::default());
+            let stats_ipfs = node.ipfs.clone();
+            let stats_master = ipfs::master_peer_id();
             // Loops/serve share the Arcs; clone before `held` moves into the announce loop.
             let held_for_serve = held.clone();
             let book_for_serve = book.clone();
             let book_for_pex = book.clone();
             let book_for_roster = book.clone();
             let warm_for_pex = warm.clone();
+            let warm_for_serve = warm.clone();
+            let reach_for_serve = reach.clone();
             let ipns_for_serve = ipns_cache.clone();
             app.manage(IpfsState {
                 ipfs: node.ipfs,
@@ -801,6 +1031,12 @@ pub fn run() {
             app.manage(warm.clone());
             app.manage(ipns_cache);
             app.manage(book.clone());
+            app.manage(reach.clone());
+            app.manage(relay_view.clone());
+            app.manage(relay_stats.clone());
+            // R2/M5: classify every established connection (direct / peer-relay / master-relay,
+            // + inferred DCUtR upgrades) for the peers-pane offload dashboard.
+            spawn_relay_stats_loop(stats_ipfs, relay_stats, stats_master);
             // Peer-assist tracker: announce presence + held roots every ~30s (also
             // the presence heartbeat). Skipped only if our PeerId failed to parse.
             if let Some(pid) = announce_pid {
@@ -814,6 +1050,61 @@ pub fn run() {
                 ipns: ipns_for_serve,
                 book: book_for_serve,
                 self_peer: serve_self,
+                warm: warm_for_serve,
+                reach: reach_for_serve,
+                relay_willing,
+            });
+            // Reachability poll (R2 eligibility gate): sample AutoNAT's verdict every ~30s
+            // and feed the debounced `Reachability`. AutoNAT needs a probe round first, so
+            // the early samples read "not public"; the hysteresis + jitter keep the verdict
+            // from flapping. No behaviour change yet — M1+ read this to gate relay duties.
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    let is_public = reach_ipfs.nat_public().await.unwrap_or(false);
+                    reach_for_loop.observe(is_public);
+                    tokio::time::sleep(jittered(Duration::from_secs(30))).await;
+                }
+            });
+            // R2/M3 self-reservation (the main reachability win): when we are NOT publicly
+            // reachable, hold a circuit reservation on a couple of willing+reachable relays so
+            // peers can dial us through them (the circuit addr flows into announce on its own).
+            // When we become public, tear them down — a public node needs no relay. The relays
+            // come from the RelayView (refreshed by the PEX-tick relay_pull). ~45s cadence.
+            tauri::async_runtime::spawn(async move {
+                const TARGET: usize = 2;
+                let mut held: HashMap<PeerId, rust_ipfs::ListenerId> = HashMap::new();
+                loop {
+                    tokio::time::sleep(jittered(Duration::from_secs(45))).await;
+                    let public = reach_for_resv.public() == Some(true);
+                    let connected: HashSet<PeerId> =
+                        resv_ipfs.connected().await.unwrap_or_default().into_iter().collect();
+                    // Drop reservations we no longer want: we became public, or the relay left.
+                    let stale: Vec<PeerId> = held
+                        .keys()
+                        .copied()
+                        .filter(|r| public || !connected.contains(r))
+                        .collect();
+                    for r in stale {
+                        if let Some(id) = held.remove(&r) {
+                            ipfs::drop_reservation(&resv_ipfs, id).await;
+                        }
+                    }
+                    if public {
+                        continue;
+                    }
+                    // Top up to TARGET reservations from willing+reachable, connected relays.
+                    let mut candidates: Vec<PeerId> = relay_for_resv
+                        .willing_relays()
+                        .into_iter()
+                        .filter(|r| connected.contains(r) && !held.contains_key(r))
+                        .collect();
+                    while held.len() < TARGET {
+                        let Some(relay) = candidates.pop() else { break };
+                        if let Some(id) = ipfs::reserve_on_relay(&resv_ipfs, relay).await {
+                            held.insert(relay, id);
+                        }
+                    }
+                }
             });
             // PEX gossip: periodically pull peers from the warm set and fold them into the
             // address book (the durable PEX store). Sleep FIRST — the warm set is empty at
@@ -825,6 +1116,12 @@ pub fn run() {
                     let learned = peer::pex_pull(&pex_ipfs, &warm_for_pex, 32).await;
                     if !learned.is_empty() {
                         book_for_pex.merge(&learned);
+                    }
+                    // R2: on the same tick, refresh which warm peers are usable relays (node
+                    // facts only — target=None). Feeds the M3 self-reservation picker.
+                    let relays = peer::relay_pull(&pex_ipfs, &warm_for_pex, None).await;
+                    if !relays.is_empty() {
+                        relay_for_pex.update(&relays);
                     }
                 }
             });
@@ -985,5 +1282,51 @@ mod tests {
             panic!("expected Resp::Peers");
         };
         assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn reachability_debounces_with_hysteresis() {
+        let r = Reachability::default();
+        // Undecided until a full agreeing run lands.
+        assert_eq!(r.public(), None);
+        assert_eq!(r.observe(true), None); // run 1
+        assert_eq!(r.observe(true), None); // run 2
+        assert_eq!(r.observe(true), Some(true)); // run 3 → public
+        // A single noisy private sample doesn't flip the verdict...
+        assert_eq!(r.observe(false), Some(true));
+        // ...but three consecutive do.
+        assert_eq!(r.observe(false), Some(true)); // run -2
+        assert_eq!(r.observe(false), Some(false)); // run -3 → private
+        // And a public sample mid-run resets the counter (no premature flip back).
+        assert_eq!(r.observe(true), Some(false)); // run 1
+        assert_eq!(r.observe(true), Some(false)); // run 2
+        assert_eq!(r.observe(true), Some(true)); // run 3 → public again
+    }
+
+    #[test]
+    fn relay_hop_extracts_the_hop_and_stats_count() {
+        let relay: PeerId = "12D3KooWGv1nSsDQ4JnzoNZ1ayGZmAnkM7RpbyGPnixH9xNsXFeV".parse().unwrap();
+        let target: PeerId = "12D3KooWM1LwoXBwBkyZbKZDDTauWyWtGx8WZt1jGXW5vYiRQnxM".parse().unwrap();
+        // A direct address has no relay hop.
+        let direct: Multiaddr = "/ip4/1.2.3.4/tcp/4001".parse().unwrap();
+        assert_eq!(relay_hop(&direct), None);
+        // A circuit address yields the `/p2p/<hop>` immediately before `/p2p-circuit`.
+        let circuit: Multiaddr =
+            format!("/ip4/1.2.3.4/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}")
+                .parse()
+                .unwrap();
+        assert_eq!(relay_hop(&circuit), Some(relay));
+
+        // Counters: peer-relay vs master-relay split + the DCUtR upgrade tally.
+        let stats = RelayStats::default();
+        stats.record_relay(false); // a peer relay (the R2 win)
+        stats.record_relay(true); // the master relay
+        stats.record_direct();
+        stats.record_upgrade();
+        let s = stats.snapshot();
+        assert_eq!(
+            (s.direct, s.relayed_peer, s.relayed_master, s.dcutr_upgrades),
+            (1, 1, 1, 1),
+        );
     }
 }

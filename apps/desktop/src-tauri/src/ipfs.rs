@@ -9,7 +9,10 @@ use anyhow::{anyhow, Result};
 use cid::Cid;
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use rust_ipfs::builder::IpfsBuilder;
-use rust_ipfs::{AddPeerOpt, Ipfs, Keypair, Multiaddr, PeerId, Protocol, RequestResponseConfig};
+use rust_ipfs::p2p::RelayConfig;
+use rust_ipfs::{
+    AddPeerOpt, Ipfs, Keypair, ListenerId, Multiaddr, PeerId, Protocol, RequestResponseConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -260,6 +263,10 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
     let port_file = data_dir.as_ref().map(|d| d.join("listen_port"));
     let tcp_port = pick_listen_port(port_file.as_deref());
     let listen_addr = format!("/ip4/0.0.0.0/tcp/{tcp_port}");
+    // R2: opt-in, default-OFF circuit-relay-v2 server. We decide server PRESENCE once here
+    // (the builder is one-shot); willingness is advertised separately at runtime, so an
+    // idle clamped server is ~free. A NAT'd or opted-out node simply doesn't construct it.
+    let relay_willing = read_relay_policy(data_dir.as_deref());
     // The builder is generic over a custom NetworkBehaviour; we don't need one,
     // so pin it to libp2p's no-op dummy behaviour (ToSwarm = Infallible).
     // A LIGHTWEIGHT client node — deliberately NOT a DHT server. with_default()
@@ -301,6 +308,13 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
             RequestResponseConfig::new(crate::peer::PROTOCOL).set_max_response_size(256 * 1024),
         ])
         .with_custom_behaviour(|_| Ok(rust_ipfs::swarm::dummy::Behaviour));
+    // R2: stand up the clamped relay server only when the user opted in. The clamp mirrors
+    // the master's handshake-only posture — enough to broker a DCUtR hole-punch, never
+    // enough to carry a stream (see relay_server_config). Inert until a peer reserves on us,
+    // and peers only learn to via the willingToRelay PEX fact (M2), gated on reachability.
+    if relay_willing {
+        builder = builder.with_relay_server(relay_server_config());
+    }
     if let Some(dir) = data_dir {
         std::fs::create_dir_all(&dir).ok();
         builder = builder.set_path(dir);
@@ -315,6 +329,105 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
         }
     }
     Ok(Node { ipfs, peer_id })
+}
+
+/// R2 relay-server policy: opt-in, default OFF. Reads `relay_policy.json` (`{"willing":bool}`)
+/// from the data dir. Absent/unreadable/no-dir → `false`. Toggling on takes effect on the
+/// next launch (the builder is one-shot); toggling off is immediate via the advertised fact.
+/// `pub(crate)` so lib.rs reads the SAME value to advertise `willing` (server presence here
+/// must agree with the gossiped fact).
+pub(crate) fn read_relay_policy(dir: Option<&std::path::Path>) -> bool {
+    #[derive(serde::Deserialize)]
+    struct RelayPolicy {
+        #[serde(default)]
+        willing: bool,
+    }
+    dir.map(|d| d.join("relay_policy.json"))
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice::<RelayPolicy>(&b).ok())
+        .map(|p| p.willing)
+        .unwrap_or(false)
+}
+
+/// The clamped circuit-relay-v2 server config (R2). Mirrors the master's handshake-only
+/// posture (`deploy/install.sh`): 128 KiB / 30s per circuit is enough to broker a DCUtR
+/// hole-punch but never enough to carry an audio stream — so a willing client relays
+/// *coordination*, not bulk bytes. Footprint kept small (defaults are master-scale 128/16):
+/// a desktop client volunteers a handful of slots, not a public-relay's worth.
+fn relay_server_config() -> RelayConfig {
+    RelayConfig {
+        max_circuit_bytes: 1 << 17, // 128 KiB — matches the master's ConnectionDataLimit
+        max_circuit_duration: Duration::from_secs(30), // matches ConnectionDurationLimit
+        max_reservations: 32,
+        max_reservations_per_peer: 2,
+        max_circuits: 8,
+        max_circuits_per_peer: 2,
+        ..Default::default() // keep the default PerPeer/PerIp rate limiters
+    }
+}
+
+/// R2/M3: reserve a circuit-relay slot on `relay` (a willing, publicly-reachable peer we're
+/// already connected to) so peers can dial us through it. Builds the circuit listen addr from
+/// the relay's live direct address and adds it as a listener — which (per the vendored-relay
+/// findings) BLOCKS until the relay grants the reservation, so we timeout-guard it and never
+/// await it unbounded. Returns the `ListenerId` on success (track it to tear the reservation
+/// down later). Best-effort: `None` on no usable relay addr / error / timeout. The granted
+/// circuit addr then flows into `announce_addrs` automatically (it returns external addrs).
+pub(crate) async fn reserve_on_relay(ipfs: &Ipfs, relay: PeerId) -> Option<ListenerId> {
+    // The relay's live direct (non-circuit) address — the transport peers route through.
+    let direct = ipfs
+        .addrs()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|(p, _)| *p == relay)?
+        .1
+        .into_iter()
+        .find(|a| !a.to_string().contains("p2p-circuit"))?;
+    // Build "/<relay-transport>/p2p/<relay>/p2p-circuit".
+    let mut circuit = direct;
+    if !matches!(circuit.iter().last(), Some(Protocol::P2p(_))) {
+        circuit.push(Protocol::P2p(relay));
+    }
+    circuit.push(Protocol::P2pCircuit);
+    match tokio::time::timeout(Duration::from_secs(20), ipfs.add_listening_address(circuit)).await {
+        Ok(Ok(id)) => Some(id),
+        Ok(Err(e)) => {
+            eprintln!("[relay] reserve on {relay} failed: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("[relay] reserve on {relay} timed out (no grant)");
+            None
+        }
+    }
+}
+
+/// Tear down a self-reservation (we became publicly reachable, or the relay disconnected).
+pub(crate) async fn drop_reservation(ipfs: &Ipfs, id: ListenerId) {
+    let _ = ipfs.remove_listening_address(id).await;
+}
+
+/// R2/M4: dial `target` THROUGH relay `via` — a warm peer that reported it can reach the
+/// target (`can_reach`). Builds "/<via-transport>/p2p/<via>/p2p-circuit/p2p/<target>" from the
+/// relay's live direct address and connects. This is the residual fallback for when a holder's
+/// own announced circuit addr (M3) isn't known but a common warm peer can bridge us. Err if we
+/// have no usable relay addr or the relayed dial fails.
+pub(crate) async fn dial_via_relay(ipfs: &Ipfs, via: PeerId, target: PeerId) -> Result<()> {
+    let direct = ipfs
+        .addrs()
+        .await?
+        .into_iter()
+        .find(|(p, _)| *p == via)
+        .and_then(|(_, addrs)| addrs.into_iter().find(|a| !a.to_string().contains("p2p-circuit")))
+        .ok_or_else(|| anyhow!("no direct addr for relay {via}"))?;
+    let mut circuit = direct;
+    if !matches!(circuit.iter().last(), Some(Protocol::P2p(_))) {
+        circuit.push(Protocol::P2p(via));
+    }
+    circuit.push(Protocol::P2pCircuit);
+    circuit.push(Protocol::P2p(target));
+    connect(ipfs, &circuit.to_string()).await
 }
 
 /// Choose the inbound TCP port: reuse the persisted one if it's still bindable right now,
@@ -1020,6 +1133,269 @@ mod tests {
         .expect("offload fetch timed out (want did not reach the connected peer)")
         .unwrap();
         assert_eq!(got.data(), payload.as_slice());
+    }
+
+    // R2/M1 ship-gate — retires vendoring-risk #1: a willing node (A) stands up the clamped
+    // relay server, and a second node (B) reserves a circuit slot on it, ending up with a live
+    // `/p2p/<A>/p2p-circuit/p2p/<B>` listen addr. Proves connexa 0.4.1 composes the relay-client
+    // transport for a circuit listen addr. Three findings baked in:
+    //   * Reserve via `add_listening_address(.../p2p-circuit)` (resolves on NewListenAddr), NOT
+    //     `enable_relay` — the vendored enable_relay's completion channel is never drained.
+    //   * A relay must have a CONFIRMED EXTERNAL ADDRESS or the voucher is empty and the client
+    //     fails with NoAddressesInReservation. In prod the eligibility gate guarantees this
+    //     (willingToRelay ⟹ publiclyReachable ⟹ has external addrs); here we inject one.
+    //   * Exercises the real relay_policy.json opt-in read path.
+    // Slow (two real nodes + a reservation handshake), so #[ignore]'d:
+    //   cargo test --lib relay_reservation_yields_a_circuit_addr -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "slow (~10s, spins up two real libp2p nodes + a relay reservation)"]
+    async fn relay_reservation_yields_a_circuit_addr() {
+        // A: willing relay server (policy opt-in written to a temp data dir).
+        let dir = std::env::temp_dir().join(format!("ts_m1_relay_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("relay_policy.json"), br#"{"willing":true}"#).unwrap();
+        assert!(read_relay_policy(Some(&dir)), "policy read should be willing");
+        let a = start(Some(dir.clone())).await.unwrap();
+        let b = start(None).await.unwrap();
+
+        let port = a
+            .ipfs
+            .listening_addresses()
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|m| {
+                m.iter().find_map(|p| match p {
+                    Protocol::Tcp(port) => Some(port),
+                    _ => None,
+                })
+            })
+            .expect("A should have a TCP listener");
+        let a_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", a.peer_id)
+            .parse()
+            .unwrap();
+        // A relay can only issue a USABLE reservation if it has a confirmed external address
+        // to put in the voucher (else the client gets NoAddressesInReservation and the circuit
+        // listener dies). In production this is guaranteed by the eligibility gate — a node
+        // advertises willingToRelay only when publiclyReachable, and a public node HAS external
+        // addrs. AutoNAT can't confirm one on loopback, so we inject it to simulate a public
+        // relay. This is the key R2 invariant: willingToRelay ⟹ has an external address.
+        a.ipfs
+            .add_external_address(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap())
+            .await
+            .expect("add_external_address on the relay");
+
+        // B dials A directly first (so identify exchanges A's relay-HOP protocol).
+        connect(&b.ipfs, &a_addr.to_string()).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Reserve a circuit slot ON A via connexa's listen_on path (the enable_relay API is
+        // incomplete in the vendored crate — its completion channel is never drained). This
+        // resolves on NewListenAddr, i.e. once A grants a usable reservation. Timeout-guarded
+        // so a failed grant surfaces instead of hanging.
+        let circuit: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}/p2p-circuit", a.peer_id)
+            .parse()
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(20), b.ipfs.add_listening_address(circuit))
+            .await
+        {
+            Ok(Ok(id)) => println!("OK: reservation granted, circuit listener {id:?}"),
+            Ok(Err(e)) => panic!("add_listening_address(circuit) errored: {e}"),
+            Err(_) => panic!("add_listening_address(circuit) hung: reservation never granted"),
+        }
+        let listen = b.ipfs.listening_addresses().await.unwrap_or_default();
+        assert!(
+            listen.iter().any(|a| a.to_string().contains("p2p-circuit")),
+            "B should expose a /p2p-circuit listen addr: {listen:?}",
+        );
+        println!("OK: B reserved a relay slot on A. circuit listen addrs = {listen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R2/M3 ship-gate proof — the genuine reachability win, BOX DOWN: a NAT'd holder (B) is
+    // reached by a third node (C) PURELY through a peer relay (A), using only B's announced
+    // circuit addr. C is never given B's direct addr, so success means the relay path works.
+    // Mirrors the production self-reservation: B reserves on A via `reserve_on_relay`, the
+    // circuit addr appears in B's listen set, and C dials it. Run:
+    //   cargo test --lib nat_peer_reachable_through_peer_relay -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "slow (~6s, spins up three real libp2p nodes + a relay reservation)"]
+    async fn nat_peer_reachable_through_peer_relay() {
+        // A: willing, publicly-reachable relay (policy opt-in + injected external addr so the
+        // reservation voucher is populated — see the M1 test).
+        let dir = std::env::temp_dir().join(format!("ts_m3_relay_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("relay_policy.json"), br#"{"willing":true}"#).unwrap();
+        let a = start(Some(dir.clone())).await.unwrap();
+        let b = start(None).await.unwrap(); // NAT'd holder
+        let c = start(None).await.unwrap(); // a peer that wants to reach B
+        let a_pid: PeerId = a.peer_id.parse().unwrap();
+        let b_pid: PeerId = b.peer_id.parse().unwrap();
+
+        let port = a
+            .ipfs
+            .listening_addresses()
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|m| m.iter().find_map(|p| match p {
+                Protocol::Tcp(port) => Some(port),
+                _ => None,
+            }))
+            .expect("A TCP listener");
+        a.ipfs
+            .add_external_address(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap())
+            .await
+            .unwrap();
+
+        // B connects to A and self-reserves via the SAME path production uses.
+        connect(&b.ipfs, &format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", a.peer_id))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _lid = reserve_on_relay(&b.ipfs, a_pid)
+            .await
+            .expect("B should reserve a circuit slot on A");
+
+        // B's announced circuit addr (full, ending in /p2p/<B>) — the ONLY way we hand C to B.
+        let b_circuit = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let addrs = b.ipfs.listening_addresses().await.unwrap_or_default();
+                if let Some(c) = addrs.into_iter().find(|a| a.to_string().contains("p2p-circuit")) {
+                    break c;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("B should expose a circuit listen addr");
+        let b_dialable = with_p2p_suffix(b_circuit, b_pid);
+
+        // C dials B THROUGH A (C never saw B's direct addr). Success = a live C↔B connection.
+        connect(&c.ipfs, &b_dialable.to_string())
+            .await
+            .expect("C should reach NAT'd B through the peer relay A");
+        let reached = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if c.ipfs.is_connected(b_pid).await.unwrap_or(false) {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(reached, "C must be connected to B via the relay");
+        println!("OK: NAT'd B reached by C purely through peer relay A ({b_dialable})");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(test)]
+    fn with_p2p_suffix(mut ma: Multiaddr, peer: PeerId) -> Multiaddr {
+        if !matches!(ma.iter().last(), Some(Protocol::P2p(_))) {
+            ma.push(Protocol::P2p(peer));
+        }
+        ma
+    }
+
+    // R2/M4 — the residual fallback: B reaches NAT'd holder Q WITHOUT Q's circuit addr, by
+    // asking warm peers whether any can relay it to Q (`Relay{target}` → can_reach) and dialing
+    // through the one that says yes (W). Exercises both M4 building blocks — `relay_pull(Some)`
+    // discovery + `dial_via_relay`. Run:
+    //   cargo test --lib relay_fallback_reaches_holder_via_can_reach_peer -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "slow (~6s, three real libp2p nodes + a relay reservation)"]
+    async fn relay_fallback_reaches_holder_via_can_reach_peer() {
+        use crate::peer::{relay_pull, spawn_serve_loop, ServeCtx};
+
+        // W: willing, publicly-reachable relay.
+        let dir = std::env::temp_dir().join(format!("ts_m4_relay_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("relay_policy.json"), br#"{"willing":true}"#).unwrap();
+        let w = start(Some(dir.clone())).await.unwrap();
+        let q = start(None).await.unwrap(); // NAT'd holder
+        let b = start(None).await.unwrap(); // wants to reach Q
+        let w_pid: PeerId = w.peer_id.parse().unwrap();
+        let q_pid: PeerId = q.peer_id.parse().unwrap();
+        let b_pid: PeerId = b.peer_id.parse().unwrap();
+
+        let port = w
+            .ipfs
+            .listening_addresses()
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|m| m.iter().find_map(|p| match p {
+                Protocol::Tcp(port) => Some(port),
+                _ => None,
+            }))
+            .expect("W TCP listener");
+        let w_addr = format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", w.peer_id);
+        w.ipfs
+            .add_external_address(format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap())
+            .await
+            .unwrap();
+
+        // W's serve loop: willing + public, with B and Q warm so it answers their relay probes.
+        let w_warm = Arc::new(crate::WarmSet::default());
+        let w_reach = Arc::new(crate::Reachability::default());
+        for _ in 0..3 {
+            w_reach.observe(true);
+        }
+        spawn_serve_loop(ServeCtx {
+            ipfs: w.ipfs.clone(),
+            held: Arc::new(crate::HeldRoots::load(None)),
+            ipns: Arc::new(crate::IpnsCache::load(None)),
+            book: Arc::new(crate::AddressBook::load(None)),
+            self_peer: w.peer_id.clone(),
+            warm: w_warm.clone(),
+            reach: w_reach,
+            relay_willing: true,
+        });
+
+        // Q connects to W and reserves, so W↔Q is live and Q is dialable through W.
+        connect(&q.ipfs, &w_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        reserve_on_relay(&q.ipfs, w_pid).await.expect("Q reserves on W");
+        w_warm.record(q_pid, "test");
+
+        // B connects to W and warms it (so B will probe W).
+        connect(&b.ipfs, &w_addr).await.unwrap();
+        w_warm.record(b_pid, "test");
+        let b_warm = crate::WarmSet::default();
+        b_warm.record(w_pid, "test");
+
+        // B asks its warm peers whether any can relay it to Q → W answers can_reach.
+        let via = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let replies = relay_pull(&b.ipfs, &b_warm, Some(&q.peer_id)).await;
+                if let Some(r) = replies.into_iter().find(|r| r.can_reach) {
+                    break r.peer;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .expect("a warm peer should report it can relay to Q");
+        assert_eq!(via, w_pid, "W is the relay that can reach Q");
+
+        // B dials Q through W → reaches NAT'd Q (B never had Q's circuit addr).
+        dial_via_relay(&b.ipfs, via, q_pid)
+            .await
+            .expect("relayed dial to Q via W");
+        let reached = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if b.ipfs.is_connected(q_pid).await.unwrap_or(false) {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(reached, "B must reach Q through the can_reach relay W");
+        println!("OK: M4 fallback reached NAT'd Q via the can_reach peer W");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The REAL brittleness guard for ping capture: two live nodes ping each other
