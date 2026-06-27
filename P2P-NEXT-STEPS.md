@@ -48,9 +48,9 @@ Phase 0  (free SPOF relief)                    ✅ shipped
    │
 Phase 1  (request_response protocol) ── the keystone; everything peer-served rides it  ✅ shipped
    │
-   ├── Track R (resilience):  R2 reachability ─→ R3 floor/scale        ◀ YOU ARE HERE (the fork)
+   ├── Track R (resilience):  R2 reachability ✅ ─→ R3 floor/scale (deferred: needs catalog→IPNS)
    │
-   └── Track P (product):     P4 identity ─→ P4.5 user-feeds ─→ P5 friends ─→ P6 social   ◀ run alongside R2
+   └── Track P (product):     P4 identity ─→ P4.5 user-feeds ─→ P5 friends ─→ P6 social   ◀ YOU ARE HERE
                                    │
                               (Browser tier gated on R2 + P4)
 ```
@@ -192,11 +192,45 @@ backfill* (R3). Highest-leverage phase: one behaviour unlocks all three.
 
 ## Track R — Resilience
 
-### R2 — Reachability: peer-provided relay 🟡 (the hard, long-pole leg)
+### R2 — Reachability: peer-provided relay ✅ SHIPPED (client-only)
+
+> **Shipped (M0–M5, uncommitted).** NAT'd peers reach each other through peer-provided
+> relays with no master — proven by `nat_peer_reachable_through_peer_relay` (C reaches a
+> NAT'd holder B purely via peer relay A's circuit addr). Client-only: no server change; the
+> master keeps its clamped coordination relay (see the dual-role note below). 29 unit + 6
+> integration tests green.
+>
+> **What shipped, milestone by milestone:**
+> - **M0 — eligibility gate.** Vendor patch `Ipfs::nat_public()` (AutoNAT verdict as a bool,
+>   no libp2p-type leak) + a debounced `Reachability` (3-consecutive hysteresis) + a ~30s
+>   poll loop; surfaced as `node_info.reachable`.
+> - **M1 — relay server.** `IpfsBuilder::with_relay_server(clamped 128KiB/30s)` gated on
+>   `relay_policy.json` (**opt-in, default off**). Findings: reserve via
+>   `add_listening_address(.../p2p-circuit)` — the vendored `enable_relay` is incomplete
+>   (its completion channel is never drained); a relay must have a confirmed external address
+>   or the voucher is empty (`NoAddressesInReservation`) — guaranteed by the M0 gate.
+> - **M2 — relay wire (refined).** `Req::Relay{target}` / `Resp::Relay{reachable,willing,
+>   can_reach}` — a **targeted `can_reach` query**, not a neighbor-dump (avoids the
+>   social-graph leak AND the privacy-vs-function contradiction). Warm-only serve guard,
+>   `relay_pull`, volatile `RelayView`.
+> - **M3 — self-reservation (the main win).** A NAT'd node holds a circuit reservation on
+>   1–2 willing+reachable relays (`reserve_on_relay`, timeout-guarded); the circuit addr
+>   flows into announce automatically; public nodes hold none.
+> - **M4 — residual fallback.** On a failed direct dial with no known circuit addr, ask warm
+>   peers `Relay{target}` and dial through a `can_reach` one (`dial_via_relay`).
+> - **M5 — instrumentation.** `RelayStats` from `connection_events`: direct vs peer-relay vs
+>   master-relay split + inferred DCUtR upgrades, surfaced in `peer_stats`. A visibility
+>   dashboard, **not** a flip-off gate — the master keeps its coordination relay.
+>
+> **Residuals:** rollout (rebuild + push to the desktop clients); community public relays if
+> the real NAT-heavy population shows thin peer-relay supply (measure via M5).
 
 A perfect DHT that says "peer Y holds X" is useless if Y is NAT'd and your only
 relay was the master. This leg is what makes both-boxes-dead *fetchable*, not just
 discoverable — and it's the genuinely hard part.
+
+_Original design notes (kept as rationale of record; see **Shipped** above for what
+actually landed):_
 
 - **Client AutoNAT (both roles).** A client must know it's publicly reachable
   before it can volunteer as a relay — AutoNAT is the **eligibility gate**. Serve
@@ -218,13 +252,28 @@ discoverable — and it's the genuinely hard part.
   dominate the intersection automatically when present. One mechanism, both cases.
   **Do not ship a global `canRelay` boolean** — it conflates a relation with a
   property.
-- **Demote the master relay, gate full-off on telemetry.** Phase 0 already clamped
-  it to handshake-only. Now instrument **peer-relay coverage + DCUtR upgrade rate**;
-  flip the master relay fully off only when the data shows coverage holds across the
-  real (likely NAT-heavy) population. If supply is thin, keep it clamped longer —
-  the robust fix for a NAT-heavy swarm is **a couple of community-run public
-  relays** (stateless, opt-in, copy-catable — the relay analog of federated
-  trackers; the "dedicated relay infra" deferred in MVP §F).
+- **Demote the master relay — but never conflate its two functions.** "Relay" hides
+  two separate roles, and only one is expensive:
+  1. **Bulk byte transport** (circuit-v2 HOP carrying the *stream*). The costly part.
+     Phase 0 already clamped it to near-nothing (128 KiB / 30s). This is the only role
+     R2 ever considers flipping.
+  2. **Hole-punch coordination** (the DCUtR rendezvous): two NAT'd peers need a shared
+     connection to exchange observed addresses + sync the simultaneous-open. That's a
+     *reservation* carrying a few control bytes — and the Phase-0 clamp was deliberately
+     sized to keep exactly this alive while killing #1. Plus **AutoNAT** (the
+     reachability eligibility gate) and **identify** (`observed_addr`, DCUtR's raw input)
+     — which were never "relay" and stay on **unconditionally**.
+
+  So **do not fully disable `Swarm.RelayService`.** The honest boundary: a node offering
+  *zero* reservation capacity stops being a hole-punch coordinator, which strands the one
+  case peer relays can't always cover — **two symmetric-NAT peers with no shared
+  connection** (the DCUtR punch needs a common rendezvous; if no peer relay sits in the
+  intersection, the pair stays unreachable). The clamped handshake-only reservation is a
+  cheap permanent **coordination floor**; keep it. Instrument **peer-relay coverage +
+  DCUtR upgrade rate** to confirm peers carry the *bulk* path, not to justify removing the
+  master's coordination role. If peer supply is thin, the robust fix for a NAT-heavy swarm
+  is still **a couple of community-run public relays** (stateless, opt-in, copy-catable —
+  the relay analog of federated trackers; the "dedicated relay infra" deferred in MVP §F).
 
 **Ship gate:** NAT'd peers reach each other through peer relays without the master;
 the peers pane shows B↔A traffic, not B↔master. The offload is finally *genuine*.
