@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use cid::Cid;
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use rust_ipfs::builder::IpfsBuilder;
-use rust_ipfs::{AddPeerOpt, Ipfs, Keypair, Multiaddr, PeerId, Protocol};
+use rust_ipfs::{AddPeerOpt, Ipfs, Keypair, Multiaddr, PeerId, Protocol, RequestResponseConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -279,6 +279,14 @@ pub async fn start(data_dir: Option<PathBuf>) -> Result<Node> {
         // warm loop to make the link symmetric (both ends keepalive). See lib.rs.
         .set_idle_connection_timeout(60)
         .fd_limit(rust_ipfs::FDLimit::Max)
+        // Phase-1 peer control plane (P2P-NEXT-STEPS): a single request_response
+        // protocol carrying CBOR Pex/Peers/Ipns queries (see peer.rs). This is the
+        // built-in connexa request_response — NOT the custom-behaviour slot below,
+        // which stays the no-op dummy. Responses are tiny (≤64 PeerRefs), so clamp
+        // the 2 MiB default down to 256 KiB as defense-in-depth.
+        .with_request_response(vec![
+            RequestResponseConfig::new(crate::peer::PROTOCOL).set_max_response_size(256 * 1024),
+        ])
         .with_custom_behaviour(|_| Ok(rust_ipfs::swarm::dummy::Behaviour));
     if let Some(dir) = data_dir {
         std::fs::create_dir_all(&dir).ok();
