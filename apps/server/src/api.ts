@@ -64,40 +64,10 @@ export function createApi(catalog: Catalog, tracker: Tracker, ipns: IpnsStore): 
           uptimeSeconds: Math.round(process.uptime()),
         }),
     },
-    {
-      method: "GET",
-      pattern: /^\/search$/,
-      handler: (_q, res, { url }) => {
-        const q = url.searchParams.get("q") ?? "";
-        const limit = Math.min(200, Math.max(1, +(url.searchParams.get("limit") ?? 50)));
-        send(res, 200, { query: q, results: catalog.search(q, limit) });
-      },
-    },
-    {
-      method: "GET",
-      pattern: /^\/modules$/,
-      handler: (_q, res, { url }) => {
-        const format = url.searchParams.get("format") ?? undefined;
-        const sort = (url.searchParams.get("sort") ?? "latest") as "latest" | "random" | "title";
-        const limit = +(url.searchParams.get("limit") ?? 100);
-        const offset = +(url.searchParams.get("offset") ?? 0);
-        send(res, 200, { results: catalog.list({ format, sort, limit, offset }) });
-      },
-    },
-    {
-      method: "GET",
-      pattern: /^\/formats$/,
-      handler: (_q, res) => send(res, 200, { formats: catalog.formatCounts(), total: catalog.count() }),
-    },
-    {
-      method: "GET",
-      pattern: /^\/module\/(\d+)$/,
-      handler: (_q, res, { url }) => {
-        const id = +url.pathname.split("/")[2];
-        const hit = catalog.get(id);
-        hit ? send(res, 200, hit) : send(res, 404, { error: "not found" });
-      },
-    },
+    // Catalog search/browse moved off HTTP entirely (R1): the catalog DB is published
+    // on IPFS under the master's signed IPNS record and the client queries it lazily
+    // over a Bitswap-backed SQLite VFS. The old /search, /modules, /formats and
+    // /module/:id routes are gone — the box is no longer the catalog dependency.
     // --- Peer-assist tracker (PEER-ASSIST.md §2.2) ---
     {
       method: "POST",

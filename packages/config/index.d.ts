@@ -9,3 +9,4 @@ export const MASTER_PEER_ID: string;
 export const BOOTSTRAP_MULTIADDRS: string[];
 export const STUN_PORT: number;
 export const STUN_ENDPOINT: string;
+export const CATALOG_IPNS_KEY: string;

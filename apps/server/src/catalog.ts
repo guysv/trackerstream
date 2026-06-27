@@ -21,16 +21,6 @@ export interface ModuleRow {
   comment: string;
 }
 
-export interface SearchHit {
-  id: number;
-  filename: string;
-  format: string;
-  title: string;
-  duration: number;
-  channels: number;
-  rootCid: string;
-}
-
 export class Catalog {
   private db: DatabaseSync;
   private insertStmt;
@@ -38,6 +28,11 @@ export class Catalog {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
+    // page_size must be set before any table/WAL exists; it's a silent no-op on an
+    // already-created DB (apply via a one-time REBUILD ingest into a fresh file).
+    // 16 KB = the IPFS page-aligned chunk unit the catalog is published under, so
+    // each SQLite page maps to exactly one stable UnixFS block (R1, see plan).
+    this.db.exec("PRAGMA page_size = 16384;");
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS modules (
@@ -60,10 +55,26 @@ export class Catalog {
       );
       CREATE INDEX IF NOT EXISTS idx_modules_format ON modules(format);
       CREATE INDEX IF NOT EXISTS idx_modules_root ON modules(root_cid);
+      -- Covering indexes for the three browse orders (list()): every browse column
+      -- lives in the index so a listing is index-only — no table scan. Lab: collapses
+      -- browse from ~18k pages (73 MB) to ~16 pages (64 KB) over Bitswap. id is the
+      -- rowid (implicitly present) but is listed to satisfy the ORDER BY tiebreaker.
+      CREATE INDEX IF NOT EXISTS idx_browse_latest ON modules(
+        ingested_at DESC, id DESC, filename, format, title, duration, channels, root_cid);
+      CREATE INDEX IF NOT EXISTS idx_browse_format ON modules(
+        format, ingested_at DESC, id DESC, filename, title, duration, channels, root_cid);
+      CREATE INDEX IF NOT EXISTS idx_browse_title ON modules(
+        title COLLATE NOCASE, id, filename, format, duration, channels, root_cid);
       CREATE VIRTUAL TABLE IF NOT EXISTS modules_fts USING fts5(
         title, filename, instruments, comment,
         content='', tokenize='unicode61'
       );
+      -- Per-term document frequencies (view over the FTS index, no storage): lets
+      -- search() cheaply detect a low-selectivity term and skip global bm25 ranking.
+      CREATE VIRTUAL TABLE IF NOT EXISTS modules_vocab USING fts5vocab('modules_fts', 'row');
+      -- Precomputed aggregates (refreshed at end of ingest) so count()/formatCounts()
+      -- are O(1) lookups, not full-table scans, when queried over the Bitswap VFS.
+      CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
     this.insertStmt = this.db.prepare(`
       INSERT INTO modules
@@ -113,59 +124,43 @@ export class Catalog {
     return row.id;
   }
 
-  search(query: string, limit = 50): SearchHit[] {
-    // FTS5 MATCH over all columns; fall back to a prefix query for bare terms.
-    const q = query.trim();
-    if (!q) return [];
-    const match = q.includes('"') || /[*:^]/.test(q) ? q : q.split(/\s+/).map((t) => `"${t}"*`).join(" ");
-    const rows = this.db
-      .prepare(`
-        SELECT m.id, m.filename, m.format, m.title, m.duration, m.channels, m.root_cid AS rootCid
-        FROM modules_fts f JOIN modules m ON m.id = f.rowid
-        WHERE modules_fts MATCH ?
-        ORDER BY bm25(modules_fts) LIMIT ?
-      `)
-      .all(match, limit) as unknown as SearchHit[];
-    return rows;
-  }
+  // Catalog search/browse/detail are no longer served here (R1): the published DB is
+  // queried by clients over the Bitswap SQLite VFS. The server only writes the catalog
+  // (insert/updateRoot), reports count(), and bakes the aggregates the client reads.
 
-  get(id: number): (SearchHit & { numSamples: number; numInstruments: number; numSubsongs: number; comment: string; instruments: string; sizeBytes: number }) | undefined {
-    return this.db
-      .prepare(`
-        SELECT id, filename, format, title, duration, channels, root_cid AS rootCid,
-               num_samples AS numSamples, num_instruments AS numInstruments,
-               num_subsongs AS numSubsongs, size_bytes AS sizeBytes,
-               instruments, comment
-        FROM modules WHERE id = ?
-      `)
-      .get(id) as never;
-  }
-
-  /** Browse listings: latest / random / by title, optionally filtered by format. */
-  list(opts: { format?: string; sort?: "latest" | "random" | "title"; limit?: number; offset?: number }): SearchHit[] {
-    const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
-    const offset = Math.max(0, opts.offset ?? 0);
-    const order =
-      opts.sort === "random" ? "RANDOM()" : opts.sort === "title" ? "title COLLATE NOCASE" : "ingested_at DESC, id DESC";
-    const where = opts.format ? "WHERE format = ?" : "";
-    const args: (string | number)[] = opts.format ? [opts.format] : [];
-    args.push(limit, offset);
-    return this.db
-      .prepare(`
-        SELECT id, filename, format, title, duration, channels, root_cid AS rootCid
-        FROM modules ${where} ORDER BY ${order} LIMIT ? OFFSET ?
-      `)
-      .all(...args) as unknown as SearchHit[];
-  }
-
-  formatCounts(): { format: string; count: number }[] {
+  private scanFormatCounts(): { format: string; count: number }[] {
     return this.db
       .prepare("SELECT format, COUNT(*) AS count FROM modules GROUP BY format ORDER BY count DESC")
       .all() as unknown as { format: string; count: number }[];
   }
 
   count(): number {
+    const row = this.db.prepare("SELECT value FROM meta WHERE key = 'total'").get() as
+      | { value: string }
+      | undefined;
+    if (row) return +row.value;
+    return this.scanCount();
+  }
+
+  private scanCount(): number {
     return (this.db.prepare("SELECT COUNT(*) AS n FROM modules").get() as { n: number }).n;
+  }
+
+  /** Recompute the precomputed aggregates (total + per-format counts) from the
+   *  live tables. Called at the end of ingest, just before the DB is snapshotted
+   *  and published, so the meta table the client reads is always current. */
+  refreshMeta(): void {
+    const total = this.scanCount();
+    const counts = this.scanFormatCounts();
+    const up = this.db.prepare("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    up.run("total", String(total));
+    up.run("format_counts", JSON.stringify(counts));
+  }
+
+  /** Fold the WAL back into the main DB file so an on-disk copy of it is a
+   *  self-contained, consistent snapshot (used before the publish-to-IPFS copy). */
+  checkpoint(): void {
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
   }
 
   close(): void {

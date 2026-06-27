@@ -1,6 +1,10 @@
-// Catalog/search client — the control plane (HTTP). Module *bytes* never come
-// from here; search/browse results carry a root CID the data plane resolves P2P.
-import { API_BASE_URL } from "@trackerstream/config";
+// Catalog/search client. The catalog SQLite DB is published on IPFS under the
+// master's signed IPNS record (R1); the embedded node lazily queries it over a
+// Bitswap-backed SQLite VFS (only the pages a query touches are fetched), so the
+// catalog needs no HTTP control plane. Module *bytes* never come from here either;
+// results carry a root CID the data plane resolves P2P.
+import { invoke } from "@tauri-apps/api/core";
+import { CATALOG_IPNS_KEY } from "@trackerstream/config";
 
 export interface ModuleHit {
   id: number;
@@ -26,32 +30,32 @@ export interface FormatCount {
   count: number;
 }
 
-async function api<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE_URL}${path}`);
-  if (!res.ok) throw new Error(`catalog ${path}: ${res.status}`);
-  return res.json() as Promise<T>;
+// One Tauri command answers every catalog query: it resolves the catalog IPNS name
+// to the current DB CID (local cache -> tracker -> peer-pull) and runs the query over
+// the Bitswap VFS, returning the same JSON shapes the old HTTP /catalog API did.
+function query<T>(req: Record<string, unknown>): Promise<T> {
+  return invoke<T>("catalog_query", { name: CATALOG_IPNS_KEY, req });
 }
 
 export const search = (q: string, limit = 60): Promise<ModuleHit[]> =>
-  api<{ results: ModuleHit[] }>(`/search?q=${encodeURIComponent(q)}&limit=${limit}`).then(
-    (r) => r.results,
-  );
+  query<{ results: ModuleHit[] }>({ op: "search", q, limit }).then((r) => r.results);
 
 export const listModules = (opts: {
   format?: string;
   sort?: "latest" | "random" | "title";
   limit?: number;
   offset?: number;
-}): Promise<ModuleHit[]> => {
-  const p = new URLSearchParams();
-  if (opts.format) p.set("format", opts.format);
-  p.set("sort", opts.sort ?? "latest");
-  p.set("limit", String(opts.limit ?? 100));
-  p.set("offset", String(opts.offset ?? 0));
-  return api<{ results: ModuleHit[] }>(`/modules?${p}`).then((r) => r.results);
-};
+}): Promise<ModuleHit[]> =>
+  query<{ results: ModuleHit[] }>({
+    op: "list",
+    format: opts.format,
+    sort: opts.sort ?? "latest",
+    limit: opts.limit ?? 100,
+    offset: opts.offset ?? 0,
+  }).then((r) => r.results);
 
-export const getModule = (id: number): Promise<ModuleDetail> => api<ModuleDetail>(`/module/${id}`);
+export const getModule = (id: number): Promise<ModuleDetail> =>
+  query<ModuleDetail>({ op: "get", id });
 
 export const getFormats = (): Promise<{ formats: FormatCount[]; total: number }> =>
-  api(`/formats`);
+  query({ op: "formats" });

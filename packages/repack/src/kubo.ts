@@ -5,6 +5,8 @@
 // matching codec + sha2-256 so kubo stores them under the exact same CID,
 // keeping the DAG self-verifying end to end.
 
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
 import { CID } from "multiformats/cid";
 import type { Block, BlockGetter } from "./dag.ts";
 
@@ -43,6 +45,82 @@ export class KuboRpc {
   async blockGet(cid: CID): Promise<Uint8Array> {
     const res = await this.post(`block/get?arg=${cid.toString()}`);
     return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /** Add a whole file as a UnixFS DAG (the catalog publish path, R1). For stable
+   *  cross-rebake block reuse the catalog is added page-aligned + raw-leaves so each
+   *  SQLite page = one fixed block (lab: 92–96% reuse on an incremental rebake).
+   *  Returns the root CID; pins it on the master by default (master-as-seeder). */
+  async addFile(
+    path: string,
+    opts: { chunker?: string; rawLeaves?: boolean; cidVersion?: number; pin?: boolean } = {},
+  ): Promise<CID> {
+    const chunker = opts.chunker ?? "size-262144";
+    const rawLeaves = opts.rawLeaves ?? false;
+    const cidVersion = opts.cidVersion ?? 0;
+    const pin = opts.pin ?? true;
+    const bytes = await readFile(path);
+    const form = new FormData();
+    form.append("file", new Blob([bytes as BlobPart]), basename(path));
+    const res = await this.post(
+      `add?chunker=${chunker}&raw-leaves=${rawLeaves}&cid-version=${cidVersion}&pin=${pin}`,
+      form,
+    );
+    // kubo streams newline-delimited JSON; the final object carries the root Hash.
+    const last = (await res.text()).trim().split("\n").filter(Boolean).pop();
+    if (!last) throw new Error("kubo add: empty response");
+    const { Hash } = JSON.parse(last) as { Hash: string };
+    return CID.parse(Hash);
+  }
+
+  /** Ensure a named ed25519 IPNS key exists; returns its PeerId in base58 (`12D3…`)
+   *  form — the form the desktop client parses (`PeerId::from_str`) and verifies
+   *  records against. Idempotent: an existing key is looked up, not recreated. */
+  async keyGen(name: string, type = "ed25519"): Promise<string> {
+    try {
+      const res = await this.post(`key/gen?arg=${encodeURIComponent(name)}&type=${type}&ipns-base=b58mh`);
+      const { Id } = (await res.json()) as { Id: string };
+      return Id;
+    } catch (e) {
+      if (String(e).includes("already exists")) return this.keyId(name);
+      throw e;
+    }
+  }
+
+  /** PeerId (base58) of an existing named key. */
+  async keyId(name: string): Promise<string> {
+    const { Keys } = (await (await this.post("key/list?ipns-base=b58mh")).json()) as {
+      Keys: { Name: string; Id: string }[] | null;
+    };
+    const k = (Keys ?? []).find((x) => x.Name === name);
+    if (!k) throw new Error(`kubo key/list: no key named ${name}`);
+    return k.Id;
+  }
+
+  /** Sign + publish an IPNS record (bumps the sequence) pointing `key` at `cid`.
+   *  `lifetime` is the record validity window the client enforces as the EOL. */
+  async namePublish(cid: CID | string, opts: { key?: string; lifetime?: string } = {}): Promise<void> {
+    const key = opts.key ?? "self";
+    const lifetime = opts.lifetime ?? "48h";
+    await this.post(
+      `name/publish?arg=/ipfs/${cid.toString()}&key=${encodeURIComponent(key)}&lifetime=${lifetime}&allow-offline=true`,
+    );
+  }
+
+  /** Fetch the latest SIGNED IPNS record protobuf for a name, base64 (standard) —
+   *  exactly the form the tracker's IpnsStore holds and the client's `verify_b64`
+   *  decodes. kubo returns the value as base64 in a Type-5 (Value) routing event.
+   *  NOTE: kubo gates routing/get to ONLINE mode (it 500s on an --offline daemon);
+   *  the master daemon is always online so this returns its own record from local. */
+  async routingGet(name: string): Promise<string> {
+    const arg = name.startsWith("/ipns/") ? name : `/ipns/${name}`;
+    const res = await this.post(`routing/get?arg=${encodeURIComponent(arg)}`);
+    for (const line of (await res.text()).trim().split("\n")) {
+      if (!line.trim()) continue;
+      const msg = JSON.parse(line) as { Type?: number; Extra?: string };
+      if (msg.Type === 5 && msg.Extra) return msg.Extra; // Type 5 = Value; Extra = base64(record)
+    }
+    throw new Error(`kubo routing/get ${arg}: no Value in response`);
   }
 
   async pinAdd(cid: CID, recursive = true): Promise<void> {

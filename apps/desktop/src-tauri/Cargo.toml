@@ -21,6 +21,10 @@ tauri-build = { version = "2", features = [] }
 # Test-only: forge signed IPNS records (rust-ipns::Record::new takes a chrono
 # Duration). Not in the shipping binary.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Test-only: name `Chunker` to add the catalog DAG page-aligned (16 KB) in the
+# box-down VFS test, matching the production publish layout. Same version the
+# vendored rust-ipfs pins, so no extra build.
+rust-unixfs = "0.5.1"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -52,6 +56,13 @@ serde_ipld_dagcbor = "0.6"
 rand = "0.9"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing = "0.1"
+# Catalog-over-IPNS lazy query (R1): a read-only SQLite VFS that serves DB pages over
+# Bitswap so a client fetches only the pages a query touches, not the whole catalog.
+# `bundled` statically links one SQLite (FTS5 on by default); sqlite-vfs has NO
+# libsqlite3-sys dep and resolves the C symbols against rusqlite's bundled copy, so the
+# two unify to a single sqlite (lab spike `scratchpad/lab/vfs_spike` proved the link).
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+sqlite-vfs = "0.2.0"
 
 # Patched rust-ipfs (per-peer bitswap byte attribution — see patches/). The source
 # is materialized to vendor/rust-ipfs by scripts/prepare-ipfs.sh, which MUST run
