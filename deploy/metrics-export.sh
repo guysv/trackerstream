@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 #
-# Export trackerstream /healthz as Prometheus textfile metrics — NO app changes.
-# Polls the local API and atomically writes a .prom file that the Prometheus
-# node_exporter "textfile" collector picks up. Dependency-light: bash + curl + jq.
+# Export trackerstream node liveness as Prometheus textfile metrics — NO app changes.
+# Polls the local tsnode RPC (node/status) and atomically writes a .prom file that the
+# Prometheus node_exporter "textfile" collector picks up. Dependency-light: bash + curl + jq.
 #
 #   bash deploy/metrics-export.sh        # writes $TEXTFILE
 #
 # Run on a short interval via trackerstream-metrics.timer (every ~1 min).
+#
+# The Node.js API (/healthz) was retired with the Go cutover; liveness now comes from the
+# tsnode node/status RPC (the same endpoint the client status pane reads).
 #
 # --- Wiring node_exporter ---------------------------------------------------
 # Install node_exporter and point its textfile collector at $TEXTFILE_DIR:
@@ -15,15 +18,16 @@
 #     # (Debian's default ExecStart already uses ARGS from /etc/default/prometheus-node-exporter;
 #     #  add:  ARGS="--collector.textfile.directory=/var/lib/node_exporter/textfile_collector" )
 # Prometheus then scrapes node_exporter (:9100) and these gauges appear as
-# trackerstream_up, trackerstream_modules, etc.
+# trackerstream_up, trackerstream_peers, etc.
 #
 # --- Wiring a simple uptime/health check (no Prometheus) --------------------
-# An external uptime monitor (UptimeRobot, Healthchecks.io, a cron curl) can hit
-# the same endpoint directly:  curl -fsS http://<host>:8080/healthz  (HTTP 200 =
-# up). Or alert on `trackerstream_up 0` / stale file mtime if scraping node_exporter.
+# An external uptime monitor can hit the RPC directly:
+#     curl -fsS -X POST http://127.0.0.1:5001/api/v0/node/status   (HTTP 200 = up)
+# Or alert on `trackerstream_up 0` / stale file mtime if scraping node_exporter.
 set -euo pipefail
 
-HEALTHZ_URL="${HEALTHZ_URL:-http://127.0.0.1:8080/healthz}"
+# tsnode RPC is POST-only (kubo-compatible /api/v0). Default mirrors the node unit's TS_RPC.
+STATUS_URL="${STATUS_URL:-http://127.0.0.1:5001/api/v0/node/status}"
 TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
 TEXTFILE="${TEXTFILE:-$TEXTFILE_DIR/trackerstream.prom}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-5}"
@@ -40,19 +44,21 @@ emit() {
   printf '# HELP %s %s\n# TYPE %s gauge\n%s %s\n' "$1" "$2" "$1" "$1" "$3" >> "$TMP"
 }
 
-# Scrape /healthz. On any failure (down, timeout, bad JSON) we still emit a
+# Scrape node/status. On any failure (down, timeout, bad JSON) we still emit a
 # valid file with trackerstream_up 0 so "down" is observable, not just absent.
-if json="$(curl -fsS --max-time "$CURL_TIMEOUT" "$HEALTHZ_URL" 2>/dev/null)" \
+if json="$(curl -fsS -X POST --max-time "$CURL_TIMEOUT" "$STATUS_URL" 2>/dev/null)" \
    && echo "$json" | jq -e . >/dev/null 2>&1; then
-  # Pull counts defensively: missing keys -> 0. /healthz shape:
-  #   { "modules": N, "uptimeSeconds": N, ... }
-  modules="$(echo "$json"   | jq -r '.modules       // 0 | floor' 2>/dev/null || echo 0)"
-  uptime="$(echo "$json"    | jq -r '.uptimeSeconds // 0 | floor' 2>/dev/null || echo 0)"
-  emit trackerstream_up            "1 if the trackerstream API /healthz responded with valid JSON" 1
-  emit trackerstream_modules       "Number of catalog modules"   "$modules"
-  emit trackerstream_uptime_seconds "API process uptime in seconds" "$uptime"
+  # Pull counts defensively: missing keys -> 0. node/status shape:
+  #   { "Peers": N, "CatalogPeers": N, "Pins": N, "TotalIn": N, "TotalOut": N, ... }
+  peers="$(echo "$json"         | jq -r '.Peers        // 0 | floor' 2>/dev/null || echo 0)"
+  catalog_peers="$(echo "$json" | jq -r '.CatalogPeers // 0 | floor' 2>/dev/null || echo 0)"
+  pins="$(echo "$json"          | jq -r '.Pins         // 0 | floor' 2>/dev/null || echo 0)"
+  emit trackerstream_up           "1 if the trackerstream node RPC responded with valid JSON" 1
+  emit trackerstream_peers        "Connected libp2p peers"                "$peers"
+  emit trackerstream_catalog_peers "Peers subscribed to the catalog topic" "$catalog_peers"
+  emit trackerstream_pins         "Pinned roots (corpus + catalog)"        "$pins"
 else
-  emit trackerstream_up "1 if the trackerstream API /healthz responded with valid JSON" 0
+  emit trackerstream_up "1 if the trackerstream node RPC responded with valid JSON" 0
 fi
 
 mv "$TMP" "$TEXTFILE"

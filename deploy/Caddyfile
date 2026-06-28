@@ -1,9 +1,11 @@
-# trackerstream HTTP API reverse proxy (TLS termination).
+# trackerstream TLS endpoint (static).
 #
-# Caddy fronts the control-plane API: it terminates TLS on :443 with an
-# automatic Let's Encrypt cert (renewed automatically) and reverse-proxies to the
-# API bound on 127.0.0.1:8080. The API itself is NOT exposed externally (serve.ts
-# binds 127.0.0.1, ufw denies :8080) — every request reaches it through Caddy.
+# The Node.js control-plane API was retired with the Go cutover: catalog/search and
+# IPNS distribution moved entirely into libp2p (custom DHT + gossipsub on tsnode), and
+# clients no longer make any HTTPS request to the box. Caddy is kept ONLY to hold a
+# valid cert + a 200 on :443 for the domain (uptime probes, ACME renewal) — there is no
+# backend to proxy anymore. coturn/STUN (:3478) and the libp2p swarm (:4001) are direct,
+# not behind Caddy.
 #
 # This is a TEMPLATE: deploy/setup-tls.sh renders ${TS_DOMAIN} (envsubst) to the
 # literal hostname into /etc/caddy/Caddyfile before starting Caddy. To run by hand:
@@ -14,10 +16,8 @@
 
 ${TS_DOMAIN} {
 	encode zstd gzip
-	reverse_proxy 127.0.0.1:8080 {
-		health_uri /healthz
-		health_interval 30s
-	}
+	respond /healthz "ok" 200
+	respond "trackerstream" 200
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options nosniff

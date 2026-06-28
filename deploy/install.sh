@@ -20,9 +20,12 @@ NODE_MAJOR="${NODE_MAJOR:-24}"
 KUBO_VERSION="${KUBO_VERSION:-0.42.0}"
 PUBLIC_IP="${PUBLIC_IP:-5.75.131.145}"
 PUBLIC_IP6="${PUBLIC_IP6:-2a01:4f8:1c1f:9120::1}"
-API_PORT="${API_PORT:-8080}"
 SWARM_PORT=4001
 STUN_PORT=3478
+# Stable identities the custom node must reproduce (packages/config). The cutover imports
+# these from the kubo warm-standby so already-shipped clients keep resolving.
+MASTER_PEER_ID="${MASTER_PEER_ID:-12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL}"
+CATALOG_IPNS_KEY="${CATALOG_IPNS_KEY:-12D3KooWDb53qFZvANj5kDCr3riMhT2HJG32i5xqFKhvBtzh7wPC}"
 
 echo "=== [1/8] toolchain ==="
 if ! command -v node >/dev/null || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 23 ]; then
@@ -41,7 +44,21 @@ if [ "$(ipfs version -n 2>/dev/null || true)" != "$KUBO_VERSION" ]; then
   install -m755 "$tmp/kubo/ipfs" /usr/local/bin/ipfs
   rm -rf "$tmp"
 fi
-echo "ipfs $(ipfs version -n)"
+echo "ipfs $(ipfs version -n)  (warm-standby; the live master is tsnode)"
+
+echo "=== [2b/8] tsnode (custom go-libp2p+boxo node) ==="
+# Prefer the prebuilt static binary shipped in the artifact (deploy/build-tsnode.sh);
+# fall back to building from source if a Go toolchain is present. The cutover
+# (deploy/cutover-tsnode.sh) wires it as the live master; install.sh only places it.
+TSNODE_BIN="$(dirname "$0")/dist/tsnode-linux-amd64"
+if [ -f "$TSNODE_BIN" ]; then
+  install -m755 "$TSNODE_BIN" /usr/local/bin/tsnode
+elif command -v go >/dev/null; then
+  ( cd "$(dirname "$0")/../node" && go build -trimpath -ldflags "-s -w" -o /usr/local/bin/tsnode ./cmd/tsnode )
+else
+  echo "WARN: no deploy/dist/tsnode-linux-amd64 and no Go toolchain — run deploy/build-tsnode.sh first" >&2
+fi
+command -v tsnode >/dev/null && echo "tsnode installed at $(command -v tsnode)"
 
 echo "=== [3/8] install server tree -> /opt/trackerstream ==="
 if [ "$PREFIX" != "/opt/trackerstream" ]; then
@@ -137,9 +154,8 @@ install -m644 "$PREFIX/deploy/journald-trackerstream.conf" /etc/systemd/journald
 systemctl restart systemd-journald
 systemctl daemon-reload
 systemctl enable --now trackerstream-ipfs.service
-systemctl enable --now trackerstream-api.service
 systemctl enable --now trackerstream-ingest.timer
-# Scheduled ops (D3): daily backup + ~1-min /healthz metrics export.
+# Scheduled ops (D3): daily backup + ~1-min node/status metrics export.
 systemctl enable --now trackerstream-backup.timer
 systemctl enable --now trackerstream-metrics.timer
 
@@ -148,15 +164,14 @@ ufw allow OpenSSH >/dev/null 2>&1 || true
 ufw allow "$SWARM_PORT"/tcp >/dev/null 2>&1 || true
 ufw allow "$SWARM_PORT"/udp >/dev/null 2>&1 || true
 ufw allow "$STUN_PORT" >/dev/null 2>&1 || true
-ufw allow "$API_PORT"/tcp >/dev/null 2>&1 || true
 yes | ufw enable >/dev/null 2>&1 || true
 
 echo "=== [8/8] status ==="
-systemctl --no-pager --lines=0 status trackerstream-ipfs trackerstream-api coturn 2>/dev/null | grep -E "●|Active:" || true
+systemctl --no-pager --lines=0 status trackerstream-ipfs coturn 2>/dev/null | grep -E "●|Active:" || true
 echo
 echo "DONE. Master peer id:"
 sudo -u trackerstream env IPFS_PATH="$IPFS_PATH" ipfs id -f '<id>\n' 2>/dev/null || echo "(start trackerstream-ipfs first)"
 echo
 echo "Next: sync corpus from workstation (deploy/sync-archive.sh), then:"
 echo "  systemctl start trackerstream-ingest   # build CID-DAGs, pin, catalog"
-echo "  curl localhost:$API_PORT/healthz"
+echo "  curl -X POST localhost:5001/api/v0/node/status   # node liveness"

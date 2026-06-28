@@ -35,7 +35,16 @@ echo "=== catalog (online-safe backup via sqlite .backup) ==="
 sqlite3 "$DATA/catalog/catalog.db" ".backup '$OUT/catalog.db'"
 
 echo "=== pinset (recursive root CIDs) ==="
-IPFS_PATH="$DATA/ipfs" ipfs pin ls --type=recursive --quiet > "$OUT/pinset.txt" 2>/dev/null || true
+# Prefer the live master's RPC pin/ls (tsnode or kubo daemon); fall back to the kubo CLI for
+# the warm-standby repo. The pinset is just root CIDs — blocks are re-pinnable from the
+# archive — so either source is equivalent for restore.
+RPC="${TS_RPC:-127.0.0.1:5001}"
+if curl -fsS -X POST "http://$RPC/api/v0/pin/ls?type=recursive" 2>/dev/null \
+     | jq -r '.Keys // {} | keys[]' 2>/dev/null > "$OUT/pinset.txt" && [ -s "$OUT/pinset.txt" ]; then
+  :
+else
+  IPFS_PATH="$DATA/ipfs" ipfs pin ls --type=recursive --quiet > "$OUT/pinset.txt" 2>/dev/null || true
+fi
 wc -l < "$OUT/pinset.txt" | xargs echo "pinned roots:"
 
 echo "=== config ==="
