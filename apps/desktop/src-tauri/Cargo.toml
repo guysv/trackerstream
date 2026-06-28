@@ -19,12 +19,9 @@ tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 # Test-only: forge signed IPNS records (rust-ipns::Record::new takes a chrono
-# Duration). Not in the shipping binary.
+# Duration). Not in the shipping binary. (The client-seam integration test in tests/ uses the
+# main deps — reqwest/serde/tokio/serde_json — directly.)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# Test-only: name `Chunker` to add the catalog DAG page-aligned (16 KB) in the
-# box-down VFS test, matching the production publish layout. Same version the
-# vendored rust-ipfs pins, so no extra build.
-rust-unixfs = "0.5.1"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -32,11 +29,12 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-deep-link = "2"
-rust-ipfs = "0.15"
-# IPNS record decode + signature verify (off-DHT resolution of the future IPNS
-# catalog). Already a transitive dep of the vendored rust-ipfs, so this just
-# surfaces it directly — same version, no extra build. See PEER-ASSIST.md §9.
+# The libp2p/IPFS node is now an external Go sidecar (tsnode) driven over RPC (src/rpc.rs,
+# src/sidecar.rs) — no in-process rust-ipfs, no vendored fork, no patches.
+# IPNS record decode + signature verify (the trust anchor; the Go node signs byte-compatibly).
 rust-ipns = { version = "0.8.1", default-features = false, features = ["libp2p"] }
+# PeerId / Keypair types for IPNS verify (rust-ipns's libp2p feature pulls this in; surface it).
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid"] }
 base64 = "0.22"
 sha2 = "0.11.0"
 futures = "0.3.32"
@@ -63,11 +61,4 @@ tracing = "0.1"
 # two unify to a single sqlite (lab spike `scratchpad/lab/vfs_spike` proved the link).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 sqlite-vfs = "0.2.0"
-
-# Patched rust-ipfs (per-peer bitswap byte attribution — see patches/). The source
-# is materialized to vendor/rust-ipfs by scripts/prepare-ipfs.sh, which MUST run
-# before cargo (wired into tauri's beforeDev/BuildCommand; run it by hand for a
-# bare `cargo build`). Mirrors the libopenmpt vendor-patch workflow.
-[patch.crates-io]
-rust-ipfs = { path = "vendor/rust-ipfs" }
 

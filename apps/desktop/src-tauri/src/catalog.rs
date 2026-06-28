@@ -6,7 +6,7 @@
 //! not the ~3 MB DB. (phiresky's sql.js-httpvfs idea, over Bitswap instead of HTTP range.)
 //!
 //! The crux is the sync→async bridge: `sqlite-vfs`'s `read_exact_at` is synchronous,
-//! but the only way to a block is async (`Ipfs::cat_unixfs(..).range(..)`). We run the
+//! but the only way to a block is async (the sidecar RPC `cat?offset&length`). We run the
 //! whole `rusqlite` open+query on a `spawn_blocking` thread and `block_on` a captured
 //! runtime handle for each ranged read — never blocking an async worker.
 
@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use cid::Cid;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use rust_ipfs::Ipfs;
+use crate::rpc::NodeRpc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenOptions, Vfs, WalDisabled};
@@ -35,7 +35,6 @@ const CHUNK: u64 = 16 * 1024;
 const PREFETCH_CHUNKS: u64 = 15;
 /// Max concurrent leaf fetches per prefetch batch (Bitswap wants to the master).
 const FETCH_CONCURRENCY: usize = 16;
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const VFS_NAME: &str = "ipfs-catalog";
 /// Absolute ceiling on a term's document frequency for bm25 ranking; on small catalogs
 /// the relative (fraction-of-total) guard in `is_selective` dominates. See that fn.
@@ -53,7 +52,7 @@ struct IpfsVfs;
 
 #[derive(Clone)]
 struct OpenCtx {
-    ipfs: Ipfs,
+    rpc: NodeRpc,
     rt: Handle,
     cid: Cid,
 }
@@ -75,7 +74,7 @@ struct Cache {
 
 /// One open catalog DB, bound to a resolved root CID.
 struct CatalogFile {
-    ipfs: Ipfs,
+    rpc: NodeRpc,
     rt: Handle,
     cid: Cid,
     size: u64,
@@ -91,20 +90,14 @@ impl CatalogFile {
     /// Fetch `[start, end)` of the file via a ranged UnixFS cat (walks only the leaves
     /// overlapping the range). Blocks the current (spawn_blocking) thread on the runtime.
     fn fetch_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
-        let ipfs = self.ipfs.clone();
+        let rpc = self.rpc.clone();
         let cid = self.cid;
         let bytes = self
             .rt
-            .block_on(async move {
-                ipfs.cat_unixfs(cid)
-                    .range(start..end)
-                    .set_local(false)
-                    .timeout(READ_TIMEOUT)
-                    .await
-            })
+            .block_on(async move { rpc.cat(&cid.to_string(), start, end - start).await })
             .map_err(|e| io::Error::other(format!("cat {cid} [{start}..{end}): {e}")))?;
         FETCHED_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     /// Ensure every chunk in `[first, last]` is cached. Missing chunks (plus a prefetch
@@ -128,25 +121,22 @@ impl CatalogFile {
             (first..=hi).filter(|c| !cache.chunks.contains_key(c)).collect()
         };
 
-        let ipfs = self.ipfs.clone();
+        let rpc = self.rpc.clone();
         let cid = self.cid;
         let size = self.size;
         let fetched: Vec<io::Result<(u64, Vec<u8>)>> = self.rt.block_on(async move {
             use futures::StreamExt;
             futures::stream::iter(missing.into_iter().map(|c| {
-                let ipfs = ipfs.clone();
+                let rpc = rpc.clone();
                 async move {
                     let start = c * CHUNK;
                     let end = ((c + 1) * CHUNK).min(size);
-                    let bytes = ipfs
-                        .cat_unixfs(cid)
-                        .range(start..end)
-                        .set_local(false)
-                        .timeout(READ_TIMEOUT)
+                    let bytes = rpc
+                        .cat(&cid.to_string(), start, end - start)
                         .await
                         .map_err(|e| io::Error::other(format!("cat chunk {c} of {cid}: {e}")))?;
                     FETCHED_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    Ok((c, bytes.to_vec()))
+                    Ok((c, bytes))
                 }
             }))
             .buffer_unordered(FETCH_CONCURRENCY)
@@ -247,7 +237,7 @@ impl Vfs for IpfsVfs {
         // Probe the SQLite header for the exact file size (page_size * page_count) so
         // xFileSize doesn't have to fetch the whole DAG.
         let probe = CatalogFile {
-            ipfs: ctx.ipfs.clone(),
+            rpc: ctx.rpc.clone(),
             rt: ctx.rt.clone(),
             cid: ctx.cid,
             size: u64::MAX,
@@ -264,7 +254,7 @@ impl Vfs for IpfsVfs {
         };
         let page_count = u32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]) as u64;
         Ok(CatalogFile {
-            ipfs: ctx.ipfs,
+            rpc: ctx.rpc,
             rt: ctx.rt,
             cid: ctx.cid,
             size: page_size * page_count,
@@ -328,11 +318,11 @@ pub enum CatalogReq {
 /// Resolve + open the catalog over the VFS and answer a query. Runs on a blocking
 /// thread (rusqlite is sync; the VFS block_on's per page read). Returns JSON matching
 /// the frontend response shapes so the Svelte call sites are unchanged.
-pub async fn run_query(ipfs: Ipfs, cid: Cid, req: CatalogReq) -> Result<Value, String> {
+pub async fn run_query(rpc: NodeRpc, cid: Cid, req: CatalogReq) -> Result<Value, String> {
     let rt = Handle::current();
     tokio::task::spawn_blocking(move || {
         ensure_registered();
-        OPEN_CTX.with(|c| *c.borrow_mut() = Some(OpenCtx { ipfs, rt, cid }));
+        OPEN_CTX.with(|c| *c.borrow_mut() = Some(OpenCtx { rpc, rt, cid }));
         let result = (|| {
             let conn = Connection::open_with_flags_and_vfs(
                 cid.to_string(),
@@ -511,180 +501,4 @@ fn formats(conn: &Connection) -> rusqlite::Result<Value> {
         .collect::<rusqlite::Result<_>>()?;
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM modules", [], |r| r.get(0))?;
     Ok(json!({ "formats": formats, "total": total }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::StreamExt;
-    use rust_ipfs::unixfs::UnixfsStatus;
-    use rust_unixfs::file::adder::Chunker;
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    /// Build a synthetic catalog DB (the columns/indexes/fts/meta the ported queries
-    /// hit) at `path`, rollback-journal so it opens read-only over the VFS. Row 7's
-    /// title carries a unique token so search is exactly-1; meta carries the aggregates.
-    fn build_catalog(path: &str, rows: i64) {
-        let db = rusqlite::Connection::open(path).unwrap();
-        db.execute_batch(
-            "PRAGMA page_size=4096; PRAGMA journal_mode=DELETE;
-             CREATE TABLE modules(id INTEGER PRIMARY KEY, source TEXT UNIQUE, filename TEXT,
-               format TEXT, title TEXT, duration REAL, channels INTEGER, num_samples INTEGER,
-               num_instruments INTEGER, num_subsongs INTEGER, root_cid TEXT, num_blocks INTEGER,
-               size_bytes INTEGER, instruments TEXT, comment TEXT, ingested_at INTEGER);
-             CREATE INDEX idx_browse_latest ON modules(
-               ingested_at DESC, id DESC, filename, format, title, duration, channels, root_cid);
-             CREATE VIRTUAL TABLE modules_fts USING fts5(
-               title, filename, instruments, comment, content='', tokenize='unicode61');
-             CREATE VIRTUAL TABLE modules_vocab USING fts5vocab('modules_fts','row');
-             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        let formats = ["mod", "it", "xm", "s3m"];
-        {
-            let tx = db.unchecked_transaction().unwrap();
-            for i in 1..=rows {
-                let fmt = formats[(i as usize) % formats.len()];
-                let title = if i == 7 {
-                    "track neonunicorn rare".to_string()
-                } else {
-                    format!("common track {i}")
-                };
-                let filename = format!("f{i}.{fmt}");
-                let instruments = format!("bass kick snare sample{i:05}");
-                db.execute(
-                    "INSERT INTO modules(source,filename,format,title,duration,channels,num_samples,
-                       num_instruments,num_subsongs,root_cid,num_blocks,size_bytes,instruments,comment,ingested_at)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                    rusqlite::params![
-                        format!("s{i}"), filename, fmt, title, 100.0 + i as f64, 4i64, 8i64, 4i64,
-                        1i64, format!("bafkreiroot{i}"), 3i64, 1000i64, instruments, "", 1_700_000_000i64 + i
-                    ],
-                )
-                .unwrap();
-                let id = db.last_insert_rowid();
-                db.execute(
-                    "INSERT INTO modules_fts(rowid,title,filename,instruments,comment) VALUES(?1,?2,?3,?4,?5)",
-                    rusqlite::params![id, title, filename, format!("bass kick snare sample{i:05}"), ""],
-                )
-                .unwrap();
-            }
-            tx.commit().unwrap();
-        }
-        // Precomputed aggregates (what the client's formats()/count() read).
-        let mut stmt = db
-            .prepare("SELECT format, COUNT(*) c FROM modules GROUP BY format ORDER BY c DESC")
-            .unwrap();
-        let counts: Vec<Value> = stmt
-            .query_map([], |r| Ok(json!({ "format": r.get::<_, String>(0)?, "count": r.get::<_, i64>(1)? })))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        drop(stmt);
-        db.execute("INSERT INTO meta VALUES('format_counts', ?1)", [serde_json::to_string(&counts).unwrap()])
-            .unwrap();
-        db.execute("INSERT INTO meta VALUES('total', ?1)", [rows.to_string()]).unwrap();
-        drop(db); // flush + close; a clean rollback-journal file remains
-    }
-
-    /// Add a file to a node as a page-aligned (16 KB) UnixFS DAG; return its root CID.
-    async fn add_catalog(node: &crate::ipfs::Node, path: &str) -> Cid {
-        let mut add = node
-            .ipfs
-            .add_unixfs(std::path::PathBuf::from(path))
-            .chunk(Chunker::Size(16 * 1024))
-            .pin(true);
-        let mut root = None;
-        while let Some(status) = add.next().await {
-            match status {
-                UnixfsStatus::CompletedStatus { path, .. } => root = path.root().cid().copied(),
-                UnixfsStatus::FailedStatus { error, .. } => panic!("add_unixfs failed: {error}"),
-                _ => {}
-            }
-        }
-        root.expect("add_unixfs yielded a root CID")
-    }
-
-    /// R1.1 ship-gate (folds the old R1.2): node A publishes the catalog DAG; node B —
-    /// holding none of it — resolves it over Bitswap from A and answers search/browse/
-    /// detail/formats correctly, fetching ≪ the whole DB. Two real in-process nodes, no
-    /// tracker, mirroring `peer_to_peer_queries_survive_a_dead_box`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "slow (~5s, spins up two real libp2p nodes + builds a catalog DB)"]
-    async fn catalog_queries_lazily_over_bitswap_from_a_peer() {
-        const ROWS: i64 = 5000;
-        let path = std::env::temp_dir().join(format!("ts-catalog-test-{}.db", std::process::id()));
-        let path = path.to_str().unwrap().to_string();
-        build_catalog(&path, ROWS);
-        let db_size = std::fs::metadata(&path).unwrap().len();
-        assert!(db_size > 512 * 1024, "test DB should span many blocks, got {db_size} bytes");
-
-        // Node A holds the catalog DAG; node B connects to A and holds none of it.
-        let a = crate::ipfs::start(None).await.unwrap();
-        let cid = add_catalog(&a, &path).await;
-        let b = crate::ipfs::start(None).await.unwrap();
-        let port = a
-            .ipfs
-            .listening_addresses()
-            .await
-            .unwrap()
-            .iter()
-            .find_map(|m| m.iter().find_map(|p| match p {
-                rust_ipfs::Protocol::Tcp(port) => Some(port),
-                _ => None,
-            }))
-            .expect("A TCP listener");
-        crate::ipfs::connect(&b.ipfs, &format!("/ip4/127.0.0.1/tcp/{port}/p2p/{}", a.peer_id))
-            .await
-            .unwrap();
-
-        // All queries run on B, sourcing every page from A over Bitswap.
-        let q = |req| run_query(b.ipfs.clone(), cid, req);
-
-        // search: the unique token resolves to exactly row 7.
-        let hits = tokio::time::timeout(
-            Duration::from_secs(30),
-            q(CatalogReq::Search { q: "neonunicorn".into(), limit: Some(20) }),
-        )
-        .await
-        .expect("search within 30s")
-        .expect("search ok");
-        let results = hits["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1, "one match for the unique token");
-        assert_eq!(results[0]["id"].as_i64(), Some(7));
-
-        // browse latest: 5 rows, newest (highest ingested_at == highest id) first.
-        let list = q(CatalogReq::List { format: None, sort: Some("latest".into()), limit: Some(5), offset: None })
-            .await
-            .expect("list ok");
-        let rows = list["results"].as_array().unwrap();
-        assert_eq!(rows.len(), 5);
-        assert_eq!(rows[0]["id"].as_i64(), Some(ROWS), "latest first");
-
-        // detail by id, measuring partiality: a point lookup fetches ≪ the whole DB.
-        FETCHED_BYTES.store(0, Ordering::SeqCst);
-        let detail = q(CatalogReq::Get { id: 7 }).await.expect("get ok");
-        assert_eq!(detail["format"].as_str(), Some("s3m")); // 7 % 4 == 3 -> formats[3]
-        assert!(detail["title"].as_str().unwrap().contains("neonunicorn"));
-        let fetched = FETCHED_BYTES.load(Ordering::SeqCst);
-        assert!(fetched > 0, "the query actually fetched pages over Bitswap");
-        assert!(
-            fetched < db_size,
-            "detail lookup must fetch only touched pages ({fetched} B), not the whole DB ({db_size} B)",
-        );
-
-        // formats: aggregates served from the meta table.
-        let fmts = q(CatalogReq::Formats {}).await.expect("formats ok");
-        assert_eq!(fmts["total"].as_i64(), Some(ROWS));
-        assert!(fmts["formats"].as_array().unwrap().iter().any(|f| f["format"] == "s3m"));
-
-        println!(
-            "OK: B answered search/browse/detail/formats over Bitswap from A; \
-             detail fetched {fetched} B of a {db_size} B catalog ({}%)",
-            fetched * 100 / db_size
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
 }
