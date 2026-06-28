@@ -22,16 +22,10 @@ export const MASTER_HOST = "trackerstream.xyz";
 export const MASTER_IPV4 = "5.75.131.145";
 export const MASTER_IPV6 = "2a01:4f8:1c1f:9120::1";
 
-// HTTP control-plane API (catalog/search/accounts/playlists/social). It is
-// fronted by Caddy with a Let's Encrypt cert on 443 (deploy/setup-tls.sh) and is
-// NOT exposed directly — the client talks HTTPS to the hostname (no port), Caddy
-// reverse-proxies to the API on 127.0.0.1:API_PORT. HTTPS is required: the
-// packaged app runs at a secure `tauri://` origin and macOS App Transport
-// Security blocks a cleartext http fetch (the old "catalog offline" symptom).
-//
-// API_PORT is the API's INTERNAL bind port (serve.ts default + Caddy's
-// reverse_proxy target), not the public port. The public URL is plain HTTPS.
-export const API_PORT = 8080;
+// The Node.js control-plane API was retired with the Go cutover: catalog/search and IPNS
+// distribution moved entirely into libp2p (custom DHT + gossipsub on tsnode), so the client
+// makes no HTTPS request to the box. The domain still resolves (DNS A/AAAA) for the /dns4
+// bootstrap multiaddr below; Caddy keeps a static 200 on :443 for the cert/uptime probe only.
 export const API_BASE_URL = `https://${MASTER_HOST}`;
 
 // libp2p bootstrap. The master is an always-on provider for every archive CID.

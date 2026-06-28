@@ -2,11 +2,10 @@
   "name": "@trackerstream/server",
   "version": "0.0.0",
   "private": true,
-  "description": "trackerstream control plane: catalog/search API, ingest->CID-DAG pipeline, master pin",
+  "description": "trackerstream control plane: ingest->CID-DAG pipeline, master pin, catalog->IPNS publish",
   "type": "module",
   "scripts": {
-    "ingest": "node --experimental-sqlite bin/ingest.ts",
-    "serve": "node --experimental-sqlite bin/serve.ts"
+    "ingest": "node --experimental-sqlite bin/ingest.ts"
   },
   "dependencies": {
     "@trackerstream/config": "workspace:*",

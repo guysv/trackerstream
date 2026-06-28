@@ -2,7 +2,6 @@
 export const MASTER_HOST: string;
 export const MASTER_IPV4: string;
 export const MASTER_IPV6: string;
-export const API_PORT: number;
 export const API_BASE_URL: string;
 export const LIBP2P_SWARM_PORT: number;
 export const MASTER_PEER_ID: string;
