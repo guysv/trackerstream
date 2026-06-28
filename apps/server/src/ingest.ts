@@ -33,11 +33,6 @@ export interface IngestOpts {
   /** Publish the catalog DB to IPFS under the master-signed IPNS key at the end of
    *  ingest (R1). Default true; set false for dev slices. */
   publish?: boolean;
-  /** Live API server to POST the freshly-signed IPNS record to (its in-memory +
-   *  persisted IpnsStore is what clients resolve against). */
-  apiPublishUrl?: string;
-  /** Bearer token for POST /ipns (matches the server's TS_IPNS_TOKEN). */
-  ipnsToken?: string;
   onProgress?: (s: IngestStats) => void;
 }
 
@@ -200,8 +195,9 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
 }
 
 /** Publish the freshly-ingested catalog DB to IPFS under the master-signed IPNS
- *  key, then push the signed record to the live tracker so thin clients can resolve
- *  it (R1). Snapshots the DB to a sibling file first — never adds the live path. */
+ *  key (R1). The node's name/publish signs the record and distributes it itself —
+ *  DHT PutValue + gossipsub push — so clients resolve it over libp2p with no HTTP
+ *  hop. Snapshots the DB to a sibling file first — never adds the live path. */
 async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
   const snapshot = `${opts.dbPath}.snapshot`;
   copyFileSync(opts.dbPath, snapshot);
@@ -220,14 +216,17 @@ async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
     });
     const peerId = await rpc.keyGen(CATALOG_KEY_NAME); // idempotent; base58 PeerId
     await rpc.namePublish(cid, { key: CATALOG_KEY_NAME, lifetime: CATALOG_LIFETIME });
+    // Verify the publish landed on the node's own resolve path (DHT + gossipsub). The node
+    // signed/stored/distributed the record in namePublish above; there is no separate HTTP
+    // cache to feed anymore (the API server is retired).
     const record = await rpc.routingGet(peerId);
+    if (!record) throw new Error(`publish verify: routingGet(${peerId}) returned no record`);
     console.log(`catalog published: cid=${cid} ipns=${peerId}`);
     if (!CATALOG_IPNS_KEY) {
       console.log(`  -> set CATALOG_IPNS_KEY="${peerId}" in packages/config and ship a client build`);
     } else if (CATALOG_IPNS_KEY !== peerId) {
       console.error(`  !! config CATALOG_IPNS_KEY (${CATALOG_IPNS_KEY}) != master key (${peerId}); clients will resolve the wrong name`);
     }
-    await pushIpnsRecord(opts, peerId, record);
   } finally {
     try {
       unlinkSync(snapshot);
@@ -235,14 +234,4 @@ async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
       /* snapshot already gone -> fine */
     }
   }
-}
-
-/** POST a signed IPNS record to the live API server's IpnsStore (GET /ipns/<key>
- *  is the tracker step of the client's resolve chain; the store persists it). */
-async function pushIpnsRecord(opts: IngestOpts, key: string, record: string): Promise<void> {
-  const base = opts.apiPublishUrl ?? "http://127.0.0.1:8080";
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (opts.ipnsToken) headers.authorization = `Bearer ${opts.ipnsToken}`;
-  const res = await fetch(`${base}/ipns`, { method: "POST", headers, body: JSON.stringify({ key, record }) });
-  if (!res.ok) throw new Error(`POST ${base}/ipns -> ${res.status} ${await res.text()}`);
 }
