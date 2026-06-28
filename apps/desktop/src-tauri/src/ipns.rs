@@ -1,49 +1,19 @@
-//! IPNS resolution for the thin client (PEER-ASSIST.md §9 / C2). The node runs no
-//! DHT and no pubsub, so it can't resolve `/ipns/<name>` the usual way. Instead it
-//! fetches the latest SIGNED record from our tracker server (`GET /ipns/<name>`)
-//! and verifies the signature LOCALLY against the name's public key — the server
-//! is an untrusted cache, the signature is the trust anchor, so no peer (or the
-//! server) can forge a newer record. This is the naming half of master-independent
-//! catalog recovery; it stays inert until the catalog is published as IPNS.
+//! Signed-IPNS verification — the trust anchor of master-independent catalog resolution. The
+//! tsnode sidecar resolves `/ipns/<name>` (gossipsub catalog topic + custom DHT) and hands back
+//! a SIGNED record; this module verifies the signature LOCALLY against the name's public key, so
+//! the node (like the old tracker) is an untrusted cache — no peer or node can forge a newer
+//! record. The Go node SIGNS byte-compatibly (boxo `ipns`); this Rust path VERIFIES (rust_ipns).
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use cid::Cid;
-use rust_ipfs::PeerId;
-use serde::Deserialize;
+use libp2p_identity::PeerId;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Deserialize)]
-struct IpnsResponse {
-    record: String, // base64 of the signed IPNS record protobuf
-}
-
-/// Fetch the latest signed record for `name` from the tracker, verify it (signature +
-/// EOL), and return BOTH the raw base64 record (so the caller can cache it) and the CID
-/// it points at. `name` is the publisher PeerId (the form our master publishes under).
-/// Errors on a missing/forged/expired record so callers can fall back to the master.
-pub(crate) async fn fetch_record(name: &str) -> Result<(String, Cid)> {
-    let url = format!("{}/ipns/{name}", crate::tracker::api_base());
-    let resp: IpnsResponse = reqwest::Client::new()
-        .get(&url)
-        // Bounded so resolve falls through to the cache/peer fallbacks fast when the
-        // box is down or slow (the record is tiny; this is a single small GET).
-        .timeout(std::time::Duration::from_secs(4))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let b64 = resp.record.trim().to_string();
-    let cid = verify_b64(name, &b64)?;
-    Ok((b64, cid))
-}
-
 /// Decode a base64-encoded signed record and verify it (signature + EOL), returning the
-/// CID it points at. Shared by `fetch_record` (fresh from the tracker) and the on-disk
-/// IPNS cache (lib.rs IpnsCache) — a cached entry is re-verified on every read, so a
-/// stale/expired/forged cache entry fails here and the caller falls through to the
-/// tracker. No network — pure decode + verify.
+/// CID it points at. Used by lib.rs's resolve (fresh from `routing/get`) and the on-disk IPNS
+/// cache — a cached entry is re-verified on every read, so a stale/expired/forged entry fails
+/// here and the caller falls through. No network — pure decode + verify.
 pub(crate) fn verify_b64(name: &str, b64: &str) -> Result<Cid> {
     verify_b64_seq(name, b64).map(|(cid, _)| cid)
 }
@@ -99,7 +69,7 @@ fn verify_record_seq(name: &str, bytes: &[u8]) -> Result<(Cid, u64)> {
 mod tests {
     use super::*;
     use chrono::Duration;
-    use rust_ipfs::Keypair;
+    use libp2p_identity::Keypair;
 
     const CID: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
@@ -195,5 +165,20 @@ mod tests {
         let kp = Keypair::generate_ed25519();
         let name = kp.public().to_peer_id().to_string();
         assert!(verify_b64(&name, &b64(&signed(&kp, CID, -10))).is_err());
+    }
+
+    // CROSS-STACK GATE: a record signed by the Go node (tsnode, boxo `ipns.NewRecord`) must
+    // verify under this Rust `verify_b64` — the load-bearing interop of the Go-everywhere
+    // rewrite. The fixture is produced by `node`'s TestDumpRustFixture (deterministic 0x42
+    // seed, value `/ipfs/<fixtureCID>`, EOL 2125 so it never expires). Regenerate with
+    // `TS_DUMP_FIXTURE=1 go -C node test -run TestDumpRustFixture -v` if the format changes.
+    #[test]
+    fn verifies_a_record_signed_by_the_go_node() {
+        const GO_NAME: &str = "12D3KooWC4T1AXU2s2YBgGJ2FeaYVtsKoHZWJeubnWe9SnuSE7Zb";
+        const GO_RECORD_B64: &str = "CkEvaXBmcy9iYWZrcmVpZ2gyYWtpc2NhaWxkY3FhYnN5ZzNkZnI2Y2h1M2ZncHJlZ2l5bXNjazdlN2FxYTRzNTJ6eRJACHH9JpgtFOgtn5mbBFsCtOQHhDp5lMg5SW1qJCyTbDl8/XLcEnKvGhqk9JWjkb5YDqwwhX6AY7Ir9PAZN/yoBRgAIhQyMTI1LTAxLTAxVDAwOjAwOjAwWigBMIDwksvdCEJAnQAyRdz8Du1E/D49Thql3BeHc/wCGAUvLFS08wYojNG+/mOmn1g/OxLA7xZEd/zt5Osg4xhtMqhKAI8/kr/PDUqNAaVjVFRMGwAAAEXZZLgAZVZhbHVlWEEvaXBmcy9iYWZrcmVpZ2gyYWtpc2NhaWxkY3FhYnN5ZzNkZnI2Y2h1M2ZncHJlZ2l5bXNjazdlN2FxYTRzNTJ6eWhTZXF1ZW5jZQFoVmFsaWRpdHlUMjEyNS0wMS0wMVQwMDowMDowMFpsVmFsaWRpdHlUeXBlAA==";
+        const FIXTURE_CID: &str = "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";
+        let cid = verify_b64(GO_NAME, GO_RECORD_B64)
+            .expect("Go-signed IPNS record must verify under the Rust path");
+        assert_eq!(cid.to_string(), FIXTURE_CID);
     }
 }

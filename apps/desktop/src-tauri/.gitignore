@@ -7,6 +7,8 @@
 /gen/schemas
 
 # Patched rust-ipfs source, materialized by scripts/prepare-ipfs.sh (the committed
-# diff lives in patches/; the full vendored tree + downloaded .crate are not).
-/vendor/
-*.crate
+
+
+# tsnode sidecar binaries (built per-host-triple by scripts/prepare-sidecar.sh)
+binaries/
+.tsnode-*.stamp

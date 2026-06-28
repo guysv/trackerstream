@@ -5,16 +5,16 @@
   "type": "module",
   "scripts": {
     "build:worklet": "node scripts/build-worklet.mjs",
-    "prepare:ipfs": "bash src-tauri/scripts/prepare-ipfs.sh",
-    "predev": "pnpm prepare:ipfs && node scripts/build-worklet.mjs",
+    "predev": "pnpm prepare:sidecar && node scripts/build-worklet.mjs",
     "dev": "vite dev",
-    "prebuild": "pnpm prepare:ipfs && node scripts/build-worklet.mjs",
+    "prebuild": "pnpm prepare:sidecar && node scripts/build-worklet.mjs",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "test": "node scripts/build-worklet.mjs && node test/fence-test.mjs && node test/worklet-harness.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "prepare:sidecar": "bash src-tauri/scripts/prepare-sidecar.sh"
   },
   "license": "AGPL-3.0-or-later",
   "dependencies": {
