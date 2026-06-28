@@ -1,7 +1,7 @@
 # trackerstream — P2P next steps (roadmap)
 
-**North star.** The single box (master kubo + `apps/server` tracker, same machine)
-becomes a **seeder + bootstrap, not a dependency.** Resilience comes from the
+**North star.** The single box (now one `tsnode` Go binary — go-libp2p + boxo — that
+both seeds and bootstraps) becomes a **seeder + bootstrap, not a dependency.** Resilience comes from the
 swarm, not from infrastructure redundancy — because *one box is a feature*
 (copyleft, one-command deploy, cheapest possible to run). The target is **zero
 perceived downtime**: if the box reboots — or disappears entirely — the swarm
@@ -11,15 +11,20 @@ This supersedes nothing in [`PEER-ASSIST.md`](PEER-ASSIST.md); it sequences the
 work *after* it. PEER-ASSIST built the tracker + warm-set + IPNS readiness; this
 doc is how that hardens into a swarm that outlives its origin.
 
-**The Node backend is transitional.** Two processes share the box: the **master kubo**
-(seeder + libp2p bootstrap — *permanent*) and the **`apps/server` Node service** (catalog
-HTTP API + tracker + IPNS dumb-store — *scaffolding*). The long-term target is to **dissolve
-the Node service entirely**, replacing each of its jobs with a P2P protocol: **R1** removes
-the **catalog API** (clients query the IPNS-published DB directly); Phase 1's PEX + `Peers`
-already cover **membership + holder-discovery** when it's down; what's left for later is the
-**presence / interest table** and the **blind mailbox** (P5). End state: the box runs *only* a
-kubo. Design accordingly — **don't add new hard dependencies on the Node service**; every new
-capability should degrade to peer-served.
+**The backend was transitional — and now it's one binary we own, run on both ends.** Historically
+*three* stacks were in play: the **master kubo** (Go seeder + libp2p bootstrap), the **`apps/server`
+Node service** (catalog HTTP API + tracker + IPNS dumb-store — *scaffolding*), and a *third* on the
+desktop — an embedded rust-ipfs/connexa node. **R4 collapsed all of it into a single custom Go binary,
+`tsnode` (go-libp2p + boxo), run as BOTH the box master (`--role server`) and the Tauri client sidecar
+(`--role client`)** — see the rewritten R4 below. kubo is removed (disabled warm-standby for rollback),
+rust-ipfs is removed, and the Node service is **fully dissolved**: **R1 ✅** removed the catalog API
+(clients query the IPNS-published DB directly), the tracker routes were deleted at cutover, and the
+**HTTP API server was retired entirely** — catalog naming + distribution are now pure libp2p (a custom
+private DHT + an IPNS-over-gossipsub topic, both native because we own both ends). Membership +
+holder-discovery moved from Phase-1 PEX/`Peers` into the custom DHT routing table + presence topic;
+what's left for the product track is the **presence / interest table** and the **blind mailbox** (P5),
+on the same primitives. End state, now real: the box runs *only* `tsnode` (+ an ingest CLI timer).
+Design accordingly — **the control plane is libp2p; do not reintroduce a server dependency.**
 
 Status legend: ▶️ do-now · 🟡 core · 🟢 demand-driven / later · ⚪ deferred.
 
@@ -59,7 +64,8 @@ Phase 0  (free SPOF relief)                    ✅ shipped
 Phase 1  (request_response protocol) ── the keystone; everything peer-served rides it  ✅ shipped
    │
    ├── Track R (resilience):  R2 reachability ✅ (independent, client-only)
-   │                          R1 catalog→IPNS ▶️ ─→ R3 floor/scale   ◀ R1 IS THE NEXT RESILIENCE DO-NOW
+   │                          R1 catalog→IPNS ✅ ─→ R4 Go everywhere: one tsnode binary ✅ (dissolves kubo AND rust-ipfs)
+   │                          R3 fan-archive-across-peers (R1-gated, independent of R4)
    │
    └── Track P (product):     P4 identity ─→ P4.5 user-feeds ─→ P5 friends ─→ P6 social
                                    │
@@ -203,17 +209,50 @@ backfill* (R3). Highest-leverage phase: one behaviour unlocks all three.
 
 ## Track R — Resilience
 
-### R1 — Catalog → IPNS: the catalog as a pinned, self-certifying artifact ▶️ (the missing link)
+### R1 — Catalog → IPNS: the catalog as a pinned, self-certifying artifact ✅ SHIPPED
 
-> **The prerequisite everything IPNS-shaped waits on.** Phase 1 built the entire *client*
-> IPNS plane — verify → cache → peer-pull (`ipns.rs` + `IpnsCache` + `peer::ipns_pull`) — and
-> the server dumb-store (`GET/POST /ipns`). It is **dormant**: nothing publishes the catalog
-> as IPNS, no master key signs anything, the frontend never calls `resolve_ipns`
-> (`lib.rs:803-806`). R1 lights it up. It also gives **R3** its anchor (the catalog is the
-> hottest root, pinned first), so **R3 cannot start until R1 lands** — this is the
-> "needs catalog→IPNS" deferral the roadmap keeps citing. **R2 shipped ahead of R1** because
-> it was independent and client-only; R1 is server + master work and was correctly deferred
-> until the client plane existed to consume it.
+> **Shipped** (commit `ee6ee11`, branch `feat/r1-catalog-ipns`; deployed to prod). The catalog
+> is now a master-signed IPNS-pointed SQLite artifact that clients **query lazily over a
+> Bitswap-backed `sqlite-vfs`**, fetching only the pages a query touches — and the `/catalog`
+> HTTP routes are **hard-cut**. This lit up the entire dormant Phase-1 IPNS plane
+> (verify → cache → peer-pull) end to end.
+>
+> **What shipped, milestone by milestone (all four met their gates):**
+> - **R1.0 — publisher + signing (server/master).** Schema tuned for index-only access
+>   (`page_size=16384`, covering indexes for the three browse orders, a `meta` count/format
+>   table, a bm25 low-selectivity guard); snapshot via checkpoint + `copyFileSync` (no VACUUM);
+>   new `KuboRpc.addFile`/`keyGen`/`namePublish`/`routingGet`; persisted `IpnsStore`; the
+>   ingest hook publishes (seq++) and `POST /ipns`es the signed record. `CATALOG_IPNS_KEY` is in
+>   `packages/config`. Validated against real kubo 0.42 — `ipfs name inspect --verify` reports
+>   `Valid: true`, the record survives an API restart.
+> - **R1.1 — lazy-query VFS (the headline).** Vendor patch `UnixfsCat::range` (`patches/0003`);
+>   `rusqlite`(bundled)+`sqlite-vfs`; `catalog.rs` — a read-only Bitswap VFS with a page cache,
+>   **concurrent prefetch** (`buffer_unordered`), and a sync→async bridge (`spawn_blocking` +
+>   `Handle::block_on`); the 4 queries ported to Rust (same SQL); `catalog_query` Tauri command;
+>   frontend `invoke()` cutover + a stale-result guard. *Gate met:* the box-down test
+>   (`catalog_queries_lazily_over_bitswap_from_a_peer`) — node B, holding **none** of the DAG,
+>   answers search/browse/detail/formats over Bitswap from A, fetching **~1% of the DB** for a
+>   detail lookup. (Folded the old R1.2 — blocks-from-a-peer — into this test.)
+> - **R1.3 — chunk-stability + prefetch + tuning.** Page-aligned **dag-pb** leaves (16 KB) —
+>   *not* `--raw-leaves` (the vendored rust-unixfs visitor can't walk raw `bafkrei…` leaves; this
+>   was the "catalog offline" bug). One-time prod conversion to `page_size=16384`. Concurrent
+>   prefetch + bounded bm25 probe cut a broad search **41 s → ~8 s cold, ~80 ms warm**.
+> - **R1.4 — flip default + hard-cut.** `catalog.ts` calls `invoke("catalog_query", …)` only; the
+>   `/search`, `/modules`, `/module/:id`, `/formats` routes and dead query methods are deleted and
+>   deployed. The box now serves only publish + tracker + IPNS.
+>
+> **~~R1.2~~ DROPPED** (folded into R1.1). True box-down catalog *completeness* needs replication
+> (R3), not a milestone here; the realistic model is master-as-seeder + opportunistic peer cache.
+>
+> **Residuals / spin-offs — all closed by R4 (Go everywhere):**
+> - **Per-search resolve round-trip** (each query resolved `CATALOG_IPNS_KEY` before opening the
+>   VFS). The Phase-1 doorbell wanted to push the record on an app-topic; the two-stack interop
+>   that blocked it (connexa↔kubo gossipsub never proven, the kubo-plugin CBOR route byte-identical
+>   but a daemon fork) **evaporated** once both ends are the same Go binary. R4 ships
+>   **IPNS-over-gossipsub** on a custom catalog topic — clients hold the record push-style, **zero**
+>   per-query resolve.
+> - **Signing went through kubo** (`key/gen` + `name/publish`). R4 moved it in-process to boxo
+>   `ipns` (byte-compatible with the client's `verify_b64`, which stays the trust anchor).
 
 **The idea (confirmed direction): publish the catalog *as a SQLite file* on IPFS, point a
 master-signed IPNS record at it, let clients pin + query it locally.** Today the catalog is a
@@ -428,33 +467,142 @@ actually landed):_
 **Ship gate:** NAT'd peers reach each other through peer relays without the master;
 the peers pane shows B↔A traffic, not B↔master. The offload is finally *genuine*.
 
-### R3 — Cold-content floor + structured discovery 🟢 (demand-driven; **gated on R1**)
+### R4 — Go everywhere: one `tsnode` binary (dissolve kubo AND rust-ipfs) ✅ SHIPPED
 
-> **Prerequisite: R1.** "Catalog first" is only meaningful once the catalog *is* a
-> self-certifying IPNS-pointed root to pin — which is exactly what R1 delivers. R3 starts
-> after R1 (+ any current work), before the P track.
+> **Shipped (phases A–D), branch `feat/go-tsnode`; cutover live on prod 2026-06-27/28.** The box and
+> the desktop client now run the **same custom Go binary, `tsnode`** (go-libp2p host + boxo data layer),
+> as `--role server` and `--role client`. kubo is removed (kept disabled as a one-command warm-standby
+> rollback), the embedded rust-ipfs/connexa node is removed, and the Node service — tracker **and** the
+> HTTP API — is fully retired. Catalog naming + distribution are pure libp2p: a **custom private DHT**
+> (`/trackerstream/kad/1.0.0`) + an **IPNS-over-gossipsub** catalog topic, both native because we own
+> both ends.
 
-- **Collaborative pinning.** Voluntarily pin hot/at-risk roots — **catalog first**
-  (hottest root, self-certifying — its IPNS pointer + pinned blocks come from R1) — onto
-  clients as replicas. Sets the floor on what
-  "zero downtime" can mean (PEER-ASSIST §9). The presence table yields a live
-  replication factor; alert if it drops below a floor.
-- **Structured discovery, only if scale demands it.** PEX is neighborhood-bounded:
-  great for popular roots, can miss a *rare-but-existing* root outside your horizon
-  during a box outage. If/when that bites:
-  - **First:** rendezvous-hashing over the PEX-gossiped roster (hash root → K
-    responsible peers who index its holders) — a one-hop "DHT-lite" reusing
-    membership you already have. Right for thousands of nodes.
-  - **Only at millions:** a **custom-kad protocol id** (`/trackerstream/kad/1.0.0`)
-    for O(log n) routing. Note: this is the private-DHT option that **keeps QUIC**
-    (it's a routing-layer protocol string, not pnet's transport-layer XOR — pnet
-    and QUIC are fundamentally incompatible and not patchable). The master stays a
-    seeder, so it needn't speak the custom protocol; no kubo fork needed. Clients'
-    routing tables hold only `/trackerstream/kad` speakers → trackerstream-only by
-    construction, no crawl, no G1.
+**Why this replaced "R4 = Rust master."** The original R4 tried to port the *master* onto the clients'
+rust-ipfs/connexa stack. That stack proved too immature for the **load-bearing seeder** — we'd already
+vendor-patched it three times — so R4-in-Rust was **aborted** and its branch discarded. The pivot
+(user-directed): instead of porting the master *down* onto the fragile client stack, **assemble one
+binary we own from boxo + go-libp2p and run it on *both* ends.** boxo is the Go data layer kubo itself
+is built from, so the seeder/blockstore is battle-tested at scale **by construction** — the single
+load-bearing unknown that gated the Rust plan ("Bitswap-at-scale") simply **dissolves**.
 
-**Ship gate:** catalog + hot content survive even cold; rare-content discovery has a
-structured fallback when the swarm is large enough to need one.
+**What the pivot buys (vs. both the old kubo+rust split and the aborted Rust-master plan).**
+- **The three rust-ipfs vendor patches dissolve into native Go APIs.** Per-peer Bitswap attribution
+  (patch 0001) → `metrics.BandwidthCounter`; AutoNAT verdict (patch 0002) → `EvtLocalReachabilityChanged`;
+  ranged UnixFS reads (patch 0003) → boxo's seekable reader / `cat?offset&length`. Because we *assemble*
+  our own binary importing boxo as a library, **there is no vendored-fork-patch workflow left at all** —
+  every customization is our own code calling public APIs.
+- **Custom DHT, native and private.** `dht.ProtocolPrefix("/trackerstream")` → `/trackerstream/kad/1.0.0`.
+  Routing tables admit only peers that speak the custom protocol (gated via identify), so public IPFS
+  nodes (`/ipfs/kad`) can connect inbound but are **never** added to the table — trackerstream-only **by
+  construction**, no crawl, no G1, and **QUIC is kept** (a routing-layer protocol string, not pnet's
+  transport-layer XOR). This is the "native custom-kad" the old R4.4 wanted, now just *how the node is
+  built*. Corollary: **PEX is app-peers-only for free** — peer exchange reads the DHT routing table
+  (trackerstream nodes only) + the presence topic (trackerstream subscribers only); the public randos in
+  the libp2p peerstore are never exchanged.
+- **IPNS-over-gossipsub kills the per-search resolve round-trip.** The master signs in-process (boxo
+  `ipns.NewRecord`, byte-compatible with the Rust `verify_b64` that **stays** the trust anchor) and
+  pushes the record on a custom catalog topic; subscribers hold it push-style and resolve with **zero**
+  DHT round-trip. The custom DHT is the box-down fallback resolve. (This realizes the Phase-1 doorbell
+  natively.)
+- **One self-introspectable codebase**, with a kubo-compatible `/api/v0` RPC so the ingest (`KuboRpc`)
+  and the Rust client port across a narrow seam.
+
+**Phases (all shipped + verified).**
+- **A — tsnode core** (`node/`, own go.mod). Host assembly (tcp+quic, identify, ping), custom-prefix
+  kad-DHT, gossipsub (catalog + presence topics), circuit-relay v2 (client + clamped server),
+  AutoRelay/autonat/dcutr, BandwidthCounter; boxo bitswap (client+server), persistent
+  blockstore/datastore, unixfs add + ranged cat, ipns sign/verify; the trackerstream control plane
+  (warm set, presence, held-roots, relay selection, peerstore, IPNS cache); kubo-compatible RPC. *Gate
+  (Go tests):* custom-DHT providers + isolation from `/ipfs/kad`, gossipsub delivery, ranged cat,
+  block put/get CID-parity, a tsnode-signed IPNS record verifies under the Rust `verify_b64`.
+- **B — server master cutover.** Replaced kubo with `tsnode --role server` on the box; imported the two
+  ed25519 identities (swarm + catalog key) so already-shipped clients keep resolving; ingest publishes
+  in-process (DHT + gossipsub); **deleted the Node tracker**. Zero-downtime alt-port re-ingest (1453
+  modules, root CIDs md5-identical) then port-swap; kubo kept disabled as warm-standby rollback.
+- **C — client sidecar.** Bundled `tsnode` as a Tauri `externalBin`; the Rust backend spawns it,
+  health-checks the RPC, kills it on exit, and drives every call (block fetch, ranged catalog reads,
+  dial/warm, peers pane) over the local kubo-compatible RPC. **Deleted** `peer.rs`/`pinglog.rs`/
+  `tracker.rs`, the `vendor/` + `patches/` trees, and the rust-ipfs deps; `ipns.rs` verify stays as the
+  trust anchor.
+- **D — custom DHT + IPNS topics end-to-end.** Clients subscribe to the catalog topic (zero per-search
+  resolve); custom-DHT provider discovery for cold roots box-down.
+
+**Post-cutover hardening (this session).** Raised rcmgr/connmgr limits for the inbound swarm; persisted
+the DHT record store (`dht.Datastore`) so IPNS/provider records survive restart; gave the client sidecar
+a built-in default bootstrap (it had been spawning with none → "catalog offline") + a cold-start resolve
+retry; auto-reap a sidecar orphaned by an abnormally-killed app (stale datastore lock). **Retired the
+HTTP API server entirely** on prod — catalog resolve is pure libp2p, metrics repointed to tsnode
+`node/status`, Caddy reduced to a static 200 for the cert/uptime probe.
+
+**Two load-bearing bugs found + fixed (Go regression tests in `node/`).**
+- **Never pass `dht.BootstrapPeers` to `dht.New`** — it dials during `libp2p.New`, *before* `bitswap.New`
+  registers its connection notifiee, so Bitswap never learns the peer is connected and every `block/get`
+  hangs (broadcast-want reaches nobody). Connect to bootstrap explicitly *after* Bitswap is up.
+- **`readNamedFile` (RPC block/put/add) must dispatch on Content-Type** before the multipart parser,
+  which otherwise drains a raw body and stores an empty (un-servable) block. Real kubo clients use
+  multipart so prod was unaffected; raw-body callers hit it.
+
+**Residuals.** The desktop release/codesign+notarize pipeline is greenfield (no desktop CI yet — the one
+genuinely new surface; the binary is ~30 MB stripped, one triple per install via `externalBin`). AutoNAT
+hysteresis on the Go side (reachability flaps) and decay of stale public-swarm connections are minor
+follow-ups. R3 (cold-tail replication) is unchanged and independent.
+
+**How it connects to the rest of the R leg.**
+- **Consumes R1** byte-for-byte: same published artifact + client VFS; it swapped the *publisher*
+  (kubo → in-process boxo `ipns`) and the *delivery* of the pointer (per-search resolve → gossipsub push).
+- **Absorbed the old R4.4 (custom-kad).** Native + private by construction (above) — not a milestone,
+  just how tsnode's DHT is configured. Routing and replication were always separate concerns; the old
+  kubo constraint was the only thing that bundled kad into R3.
+- **Doesn't touch R2.** Reachability re-implemented on the Go node (circuit-relay v2 + AutoRelay + DCUtR);
+  the master keeps its clamped coordination relay.
+- **Realizes the Phase-1 doorbell** as the catalog gossipsub topic — push-native, not pull-on-resolve.
+
+**Ship gate (met).** A client searches with **zero per-query name resolution** (record pushed over the
+catalog topic, signed in-process by boxo `ipns`); and the box runs as a **single Go binary** that seeds,
+signs, announces, and coordinates relay, with kubo removed and box-reboot recovery intact.
+
+
+### R3 — Fanning the archive across peers ▶️ (next resilience do-now; **gated on R1 ✅**)
+
+> **Prerequisite: R1 (done); independent of R4 (done).** R3 is now scoped down to one question:
+> **how do we spread the actual archive — the cold module corpus, ~100× the catalog — across
+> peers so it survives a dead box?** The structured-*discovery* half (custom-kad) was absorbed into
+> **R4** and shipped — the `tsnode` master speaks `/trackerstream/kad/1.0.0` natively, so routing
+> exists (routing ≠ replication; the old kubo constraint is the only thing that ever bundled them).
+> What's left here is purely the **data-distribution policy**: who holds which bytes, and how much.
+> With R4 shipped, **R3 is the next resilience do-now.**
+
+This is the one leg that addresses the **irreducible gap** (§0): truly *cold* content — held
+only by the master, never streamed by anyone — is unfetchable while the box is down. No discovery
+or relay fixes a block that exists in one place. The only lever is **replication**, and R3 is the
+decision of *how to place* those replicas. The catalog (R1) is already covered — lazy VFS + its
+hot pages swarm-cache, and it's tiny; **R3 is about the archive bytes**, which are big, cold, and
+mostly held only by the master today.
+
+**The design space (this is the decision R3 makes):**
+- **Opportunistic / interest-driven** — peers pin what they (or their friends) actually play,
+  plus a voluntary disk budget of at-risk roots. Simple, zero-coordination, naturally weights hot
+  content — but leaves the **cold tail** (rarely-played modules) with replication factor ~1
+  (master only), so box-down they're still gone. Good floor, no guarantee.
+- **Deterministic sharding (HRW / rendezvous)** — `hash(root)` → the K peers responsible for
+  holding it, computed over the PEX-gossiped roster. Gives an *even, predictable* spread with a
+  target replication factor across the **whole** corpus, cold tail included — at the cost of
+  peers holding bytes they never play, and re-balancing churn as the roster changes. This is the
+  "fan the entire archive across the swarm" model; it pairs naturally with R4's custom kad (same
+  HRW responsibility function can drive both placement and lookup).
+- **Hybrid (likely answer)** — opportunistic for hot content (free, already happening via the
+  warm-set), deterministic K-replication only for the **at-risk cold tail** the presence table
+  flags as under-replicated. Spend coordination only where opportunism leaves a hole.
+
+**What R3 ships regardless of the model chosen:** a live **replication-factor** signal (from the
+presence table — who holds what, how many copies) with an **alert when an at-risk root drops
+below a floor**, an **opt-in disk budget** per client, and the **placement policy** (one of the
+above) that decides what each client pins. **Catalog-first** stays the seed rule (hottest,
+self-certifying root from R1).
+
+**Ship gate:** the archive's at-risk cold tail has a measured replication factor above its floor
+across live peers — so box-down, the corpus (not just the hot/warm slice) is still fetchable from
+the swarm; the chosen placement policy holds the factor without manual intervention.
 
 ---
 
@@ -648,16 +796,21 @@ Great for zero-install reach; weakest tier for both-boxes-dead. Slots in after R
 ## Recommended order
 
 ```
-Phase 0 ─→ Phase 1 ─→ ┌─ R2 ✅ ─→ R1 (catalog→IPNS; lights up the dormant IPNS plane) ─→ R3
+Phase 0 ─→ Phase 1 ─→ ┌─ R2 ✅ ─→ R1 ✅ (catalog→IPNS) ─→ R4 ✅ (Go everywhere: one tsnode binary; kubo + rust-ipfs dissolved)
+                      │                                   └─ R3 (fan archive across peers; R1-gated, independent of R4) ▶️
                       └─ P4  (in parallel: cheap, non-retrofittable, unblocks P5/P6) ─→ P4.5 ─→ P5 ─→ P6
 Browser: whenever reach matters, after R2 + P4.
 ```
 
-**With R2 shipped, the next resilience step is R1** — the catalog→IPNS migration. It's the
-keystone that lights up the entire dormant Phase-1 IPNS plane (verify/cache/peer-pull all
-built, all idle) *and* unblocks R3 (collaborative pinning needs a self-certifying catalog
-root). Run **P4 alongside** as before — it's small, non-retrofittable, and unblocks the
-product track, and it shares no critical path with R1.
+**R4 is shipped** — the box and client are now one `tsnode` (go-libp2p + boxo) binary; kubo and
+rust-ipfs are both gone, the Node tracker + HTTP API are fully dissolved, and the custom DHT +
+IPNS-over-gossipsub that the old plan chased are native (no two-stack interop, no vendor patches,
+no Bitswap-at-scale unknown — boxo *is* what kubo is built from). **The next resilience step is now
+R3** — fanning the cold archive across peers (the one remaining lever on the §0 irreducible gap):
+gated only on R1 (done), independent of R4. Run **P4 alongside** as before — small,
+non-retrofittable, unblocks the product track, no shared critical path. The live follow-ups on R4
+itself are operational, not architectural: the desktop release/codesign pipeline, AutoNAT
+hysteresis, public-connection decay.
 
 ---
 
@@ -668,15 +821,23 @@ product track, and it shares no critical path with R1.
   thin (no G1 crawl), and stays additive (master keeps its public role). The DHT's
   only edge — guaranteed reach to rare content with no central index — is a
   degraded-mode-only slice covered by tracker (up) + PEX (down), at far lower cost.
-- **pnet is out; custom-kad is the private-DHT option if ever needed.** pnet's
+- **pnet is out; custom-kad is the private-DHT option — now SHIPPED, native.** pnet's
   transport-XOR is fundamentally incompatible with QUIC and not patchable; it also
   costs the master its public role. Custom-kad-protocol-id keeps QUIC and the seeder
-  model.
-- **Pubsub: pull + doorbell for IPNS, gossipsub for chat.** Push-mesh is wrong for a
-  once-per-rebake record (standing cost > rare poll) and right for many-writer
-  real-time chat. Same record/identity primitives, transport chosen by workload. The
-  trigger to add gossipsub is the first frequently-changing multi-writer object —
-  which is per-track chat, not the catalog.
+  model. **Realized in R4 (not a milestone, just how tsnode is built):** the master
+  speaks `/trackerstream/kad/1.0.0` as a first-class routing node and routing tables admit
+  only custom-protocol speakers, so the overlay is trackerstream-only by construction — no
+  kubo fork, no clients-only overlay. Routing and replication were always separate concerns;
+  the old kubo constraint was the only thing that bundled kad into R3.
+- **Pubsub: doorbell-push for IPNS, gossipsub-mesh for chat.** Still settled: don't run a
+  heavy push *mesh* for a once-per-rebake record. **Refined by R1, realized by R4:** the
+  per-search *resolve* round-trip turned out to be the real cost — on the read side, not the
+  write side — so the Phase-1 **doorbell** (a low-rate record push on an app-specific topic,
+  bumped only on rebake) is the right tool, and **R4 made it native**: the `tsnode` master signs
+  in-process (boxo `ipns`) and publishes to a custom catalog topic; clients hold the record
+  push-style and never resolve per query. That is *not* the heavy many-writer mesh — that one is
+  still reserved for the first frequently-changing multi-writer object, i.e. **per-track chat
+  (P6)**, not the catalog. Same record/identity primitives; transport chosen by workload.
 - **Relay ability is relational** (live common neighbors), not a node flag.
 - **Sign device certs; never copy `Ik`.** Preserves revocation.
 - **User data is per-device CRDT feeds, merged — not a shared writable name.** An IPNS
@@ -706,9 +867,22 @@ product track, and it shares no critical path with R1.
 7. User feeds (P4.5): playlist concurrency — do two devices ever edit the **same** playlist
    simultaneously (→ sequence-CRDT now), or is it different-device-different-time
    (→ OR-set/LWW is enough for v1)?
-8. Catalog→IPNS (R1): do page-aligned (or CDC) chunks of the SQLite file stay stable enough
-   across rebakes that the hot index pages keep their CIDs (swarm cache survives) and a query
-   touches a handful of pages — or do we need format/id shards? (Settle empirically in R1.3.)
-9. Catalog→IPNS (R1): is Bitswap per-page latency low enough (with read-ahead + page cache) to
-   make the lazy VFS the **frontend default**, demoting the HTTP catalog API to
-   bootstrap/fallback — or does HTTP stay the primary fast-path while the box is up? (R1.1/R1.4.)
+8. ~~Catalog→IPNS (R1): chunk stability across rebakes vs. needing shards?~~ **Answered (R1.3):**
+   page-aligned **dag-pb** leaves (16 KB, `page_size=16384`, no VACUUM) keep unchanged pages
+   byte-stable; a query touches a handful of pages. (`--raw-leaves` is *out* — the vendored
+   rust-unixfs visitor can't walk raw leaves.) No shards needed at current scale.
+9. ~~Catalog→IPNS (R1): is Bitswap per-page latency low enough to make the lazy VFS the frontend
+   default?~~ **Answered (R1.4):** yes — with concurrent prefetch + page cache the lazy VFS is the
+   default and the HTTP `/catalog` routes are hard-cut. Broad search ~8 s cold / ~80 ms warm.
+10. ~~**R4 (the gate):** does connexa's Bitswap-serving + blockstore hold up at ~100× the corpus,
+    i.e. can a Rust master replace kubo as the **seeder**?~~ **Moot — the Go-everywhere pivot
+    dissolved it.** R4 didn't port the seeder onto connexa; it built `tsnode` on **boxo**, the
+    exact data layer kubo is built from, so seeder/blockstore scale is battle-tested by
+    construction. The "Rust master at scale" unknown no longer exists.
+11. **R4 containment (still worth a periodic empirical check):** the custom DHT prefix keeps the
+    routing table trackerstream-only by construction, but confirm no subsystem dials outward on
+    its own. Current observation post-cutover: public IPFS nodes *connect inbound* to the
+    well-known PeerId/port (they're in the libp2p peerstore) but are **excluded from the DHT
+    routing table** and never exchanged via PEX/presence. For *true* network privacy (not just
+    routing isolation) a PNET/new-identity pass is the lever — deferred; public inbound
+    connections are currently left to decay.
