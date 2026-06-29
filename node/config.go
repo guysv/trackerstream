@@ -14,10 +14,9 @@ import (
 // (a private routing table — libp2p only routes to peers speaking the matching protocol,
 // so no public-IPFS crawl). The catalog topic carries the signed IPNS record push-style.
 const (
-	DHTPrefix     protocol.ID = "/trackerstream"
-	CatalogTopic              = "/trackerstream/catalog/1.0.0"
-	PresenceTopic             = "/trackerstream/presence/1.0.0"
-	PeerProtocol  protocol.ID = "/trackerstream/peer/1.0.0"
+	DHTPrefix    protocol.ID = "/trackerstream"
+	CatalogTopic             = "/trackerstream/catalog/1.0.0"
+	PeerProtocol protocol.ID = "/trackerstream/peer/1.0.0"
 )
 
 // Role selects the node posture: the server master is a DHT server + seeder + relay

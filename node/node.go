@@ -262,7 +262,7 @@ func (n *Node) Pins() *Pinset { return n.pins }
 // Control exposes the control plane (reachability, relay stats, warm set) for node/status.
 func (n *Node) Control() *control { return n.control }
 
-// PubSub exposes the gossipsub wrapper (catalog/presence topics).
+// PubSub exposes the gossipsub wrapper (catalog topic).
 func (n *Node) PubSub() *PubSub { return n.pubsub }
 
 // ImportKey brings an `ipfs key export` blob into the keystore under name (the prod swarm +

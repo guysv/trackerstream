@@ -67,7 +67,6 @@ func (c *control) start(ctx context.Context) error {
 	}()
 
 	c.node.host.Network().Notify(c.notifiee())
-	go c.presenceLoop(ctx)
 	go c.keepaliveLoop(ctx)
 	return nil
 }
@@ -185,25 +184,3 @@ func (c *control) keepaliveLoop(ctx context.Context) {
 	}
 }
 
-// presenceLoop beacons our liveness + held roots on the gossipsub presence topic. Coarser
-// than the old 30s tracker heartbeat (deliberate — rich presence was always going to be
-// friend-to-friend encrypted, never the tracker).
-func (c *control) presenceLoop(ctx context.Context) {
-	if c.node.pubsub == nil {
-		return
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(jitter(60*time.Second, 15*time.Second)):
-		}
-		var roots []string
-		if c.node.pins != nil {
-			for _, r := range c.node.pins.Roots() {
-				roots = append(roots, r.String())
-			}
-		}
-		_ = c.node.pubsub.PublishPresence(ctx, c.node.ID(), roots, time.Now())
-	}
-}

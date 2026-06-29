@@ -5,21 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// PubSub wraps gossipsub for the two trackerstream topics we own: the catalog topic (signed
-// IPNS records pushed publish-style — kills the per-search resolve round-trip) and the
-// presence topic (coarse liveness, replacing the tracker heartbeat). Because both ends run
-// our binary on a topic we name, this is fully under our control.
+// PubSub wraps gossipsub for the catalog topic we own: signed IPNS records pushed
+// publish-style — kills the per-search resolve round-trip. Because both ends run our binary
+// on a topic we name, this is fully under our control.
 type PubSub struct {
-	ps       *pubsub.PubSub
-	catalog  *pubsub.Topic
-	presence *pubsub.Topic
+	ps      *pubsub.PubSub
+	catalog *pubsub.Topic
 
 	mu       sync.Mutex
 	onRecord func(name string, record []byte) // catalog-record sink (the client IPNS cache)
@@ -32,13 +29,6 @@ type catalogMsg struct {
 	Record []byte `json:"record"`
 }
 
-// presenceMsg is the coarse liveness beacon on the presence topic.
-type presenceMsg struct {
-	Peer  string   `json:"peer"`
-	Roots []string `json:"roots,omitempty"` // root CIDs this peer holds (provider hint)
-	TS    int64    `json:"ts"`
-}
-
 func newPubSub(ctx context.Context, h host.Host) (*PubSub, error) {
 	ps, err := pubsub.NewGossipSub(ctx, h)
 	if err != nil {
@@ -47,9 +37,6 @@ func newPubSub(ctx context.Context, h host.Host) (*PubSub, error) {
 	p := &PubSub{ps: ps}
 	if p.catalog, err = ps.Join(CatalogTopic); err != nil {
 		return nil, fmt.Errorf("join catalog topic: %w", err)
-	}
-	if p.presence, err = ps.Join(PresenceTopic); err != nil {
-		return nil, fmt.Errorf("join presence topic: %w", err)
 	}
 	return p, nil
 }
@@ -98,15 +85,6 @@ func (p *PubSub) PublishIPNS(ctx context.Context, name string, record []byte) er
 		return err
 	}
 	return p.catalog.Publish(ctx, data)
-}
-
-// PublishPresence beacons our liveness + held roots on the presence topic.
-func (p *PubSub) PublishPresence(ctx context.Context, self peer.ID, roots []string, now time.Time) error {
-	data, err := json.Marshal(presenceMsg{Peer: self.String(), Roots: roots, TS: now.Unix()})
-	if err != nil {
-		return err
-	}
-	return p.presence.Publish(ctx, data)
 }
 
 // CatalogPeers lists peers currently subscribed to the catalog topic (gossipsub mesh view).
