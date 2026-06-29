@@ -2,7 +2,8 @@
 Description=trackerstream master node (tsnode) — custom go-libp2p+boxo: DHT bootstrap + Bitswap seeder + IPNS publisher + relay
 After=network-online.target
 Wants=network-online.target
-# Mutually exclusive with the kubo warm-standby: only one may bind :4001/:5001.
+# Mutually exclusive with the kubo warm-standby: only one master at a time (both bind
+# the RPC :5001 the ingest/metrics expect; swarm ports differ — tsnode :5478, kubo :4001).
 Conflicts=trackerstream-ipfs.service
 
 [Service]
@@ -13,7 +14,9 @@ Group=trackerstream
 # warm-standby's /srv/trackerstream/ipfs, which is preserved for rollback.
 Environment=TS_ROLE=server
 Environment=TS_REPO=/srv/trackerstream/tsnode
-Environment=TS_SWARM_PORT=4001
+# Non-default swarm port (was :4001) — private overlay, sheds cached public-IPFS
+# scanners. Keep in sync with packages/config LIBP2P_SWARM_PORT + the client bootstrap.
+Environment=TS_SWARM_PORT=5478
 # Kubo-compatible RPC on the same loopback addr the ingest + API expect (KUBO_API).
 Environment=TS_RPC=127.0.0.1:5001
 ExecStart=/usr/local/bin/tsnode --role server

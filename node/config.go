@@ -40,7 +40,8 @@ type Config struct {
 }
 
 // DefaultConfig builds a config for a role. swarmPort 0 = OS-assigned (ephemeral);
-// the server master pins 4001 to match the kubo deployment it replaces.
+// the server master pins its swarm port via TS_SWARM_PORT (deploy sets :5478 — a
+// non-default port, since the overlay is private and never on the public IPFS DHT).
 func DefaultConfig(role Role, repo string, swarmPort int) Config {
 	return Config{
 		Role:     role,

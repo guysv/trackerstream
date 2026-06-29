@@ -27,7 +27,9 @@ const MASTER_PEER_ID: &str = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9Xv
 /// sidecar's default bootstrap list.
 const MASTER_HOST: &str = "trackerstream.xyz";
 const MASTER_IPV4: &str = "5.75.131.145";
-const MASTER_SWARM_PORT: u16 = 4001;
+// Non-default swarm port (mirror of packages/config LIBP2P_SWARM_PORT). Off :4001 so
+// public-IPFS scanners that cached the master's old IP:4001 no longer reach it.
+const MASTER_SWARM_PORT: u16 = 5478;
 
 /// The master's PeerId string (TS_PROVIDER override or the hardcoded default), for tagging the
 /// master row in the peers pane.

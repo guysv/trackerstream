@@ -20,7 +20,11 @@ NODE_MAJOR="${NODE_MAJOR:-24}"
 KUBO_VERSION="${KUBO_VERSION:-0.42.0}"
 PUBLIC_IP="${PUBLIC_IP:-5.75.131.145}"
 PUBLIC_IP6="${PUBLIC_IP6:-2a01:4f8:1c1f:9120::1}"
-SWARM_PORT=4001
+# Non-default swarm port (was the IPFS default :4001) — see packages/config
+# LIBP2P_SWARM_PORT. Private overlay, so moving off :4001 sheds cached public-IPFS
+# scanners. Drives the kubo warm-standby's Addresses.Swarm/Announce + the ufw rule;
+# tsnode reads its own TS_SWARM_PORT from trackerstream-node.service. Keep all in sync.
+SWARM_PORT=5478
 STUN_PORT=3478
 # Stable identities the custom node must reproduce (packages/config). The cutover imports
 # these from the kubo warm-standby so already-shipped clients keep resolving.
@@ -161,6 +165,10 @@ systemctl enable --now trackerstream-metrics.timer
 
 echo "=== [7/8] firewall (ufw) ==="
 ufw allow OpenSSH >/dev/null 2>&1 || true
+# Close the old IPFS-default :4001 (we moved the swarm to $SWARM_PORT). Idempotent —
+# 'ufw delete' on a non-existent rule is a no-op. Keeps a rerun from leaving the old hole.
+ufw delete allow 4001/tcp >/dev/null 2>&1 || true
+ufw delete allow 4001/udp >/dev/null 2>&1 || true
 ufw allow "$SWARM_PORT"/tcp >/dev/null 2>&1 || true
 ufw allow "$SWARM_PORT"/udp >/dev/null 2>&1 || true
 ufw allow "$STUN_PORT" >/dev/null 2>&1 || true

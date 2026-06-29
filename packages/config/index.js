@@ -35,7 +35,11 @@ export const API_BASE_URL = `https://${MASTER_HOST}`;
 // trackerstream.xyz at dial time and a master IP change needs NO client rebuild.
 // The literal /ip4 + /ip6 entries follow as a fallback only (used if DNS is
 // momentarily unavailable); keep them pointed at the current master.
-export const LIBP2P_SWARM_PORT = 4001;
+// Moved off the IPFS default :4001 to a non-default port: the master runs a PRIVATE
+// overlay (custom DHT prefix, never republished to the public DHT), so the only reason
+// public-IPFS nodes dial it was their cached `IP:4001` from its prior life as a public
+// kubo node. A non-default port sheds that entire cached-scanner population at once.
+export const LIBP2P_SWARM_PORT = 5478;
 export const MASTER_PEER_ID = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL"; // master identity (stable across IP moves)
 export const BOOTSTRAP_MULTIADDRS = MASTER_PEER_ID
   ? [

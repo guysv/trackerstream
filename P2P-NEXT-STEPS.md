@@ -562,7 +562,17 @@ catalog topic, signed in-process by boxo `ipns`); and the box runs as a **single
 signs, announces, and coordinates relay, with kubo removed and box-reboot recovery intact.
 
 
-### R3 — Fanning the archive across peers ▶️ (next resilience do-now; **gated on R1 ✅**)
+### R3 — Fanning the archive across peers ⏸️ ON HOLD (gated on R1 ✅, but deferred — see below)
+
+> **ON HOLD (2026-06-29).** Not a sequencing/dependency block — a cost-benefit one. The master
+> now runs as a **private overlay on `:5478` with ~0 peers** (we moved off the public `:4001` and
+> shed the public-IPFS swarm on purpose). R3 spends bandwidth + peer disk to *distribute the cold
+> corpus across the swarm* — but with no swarm to distribute to, that machinery costs more than it
+> buys: replicas would land nowhere, and the placement/PEX/re-balance churn runs against an empty
+> roster. **Replication only pays once there's a real peer population to hold the replicas.**
+> Revisit R3 when concurrent client count is non-trivial (a handful of always-on peers, not zero).
+> Until then the master-pinned blockstore (GC-disabled, durable) + backups are the availability
+> floor, and that's adequate at this scale. Everything below is the design we'll pick up *then*.
 
 > **Prerequisite: R1 (done); independent of R4 (done).** R3 is now scoped down to one question:
 > **how do we spread the actual archive — the cold module corpus, ~100× the catalog — across
@@ -570,7 +580,8 @@ signs, announces, and coordinates relay, with kubo removed and box-reboot recove
 > **R4** and shipped — the `tsnode` master speaks `/trackerstream/kad/1.0.0` natively, so routing
 > exists (routing ≠ replication; the old kubo constraint is the only thing that ever bundled them).
 > What's left here is purely the **data-distribution policy**: who holds which bytes, and how much.
-> With R4 shipped, **R3 is the next resilience do-now.**
+> With R4 shipped, R3 *was* the next resilience do-now — now **on hold** (see the banner above):
+> 0-peer overlay means replication has nowhere to land.
 
 This is the one leg that addresses the **irreducible gap** (§0): truly *cold* content — held
 only by the master, never streamed by anyone — is unfetchable while the box is down. No discovery
@@ -797,7 +808,7 @@ Great for zero-install reach; weakest tier for both-boxes-dead. Slots in after R
 
 ```
 Phase 0 ─→ Phase 1 ─→ ┌─ R2 ✅ ─→ R1 ✅ (catalog→IPNS) ─→ R4 ✅ (Go everywhere: one tsnode binary; kubo + rust-ipfs dissolved)
-                      │                                   └─ R3 (fan archive across peers; R1-gated, independent of R4) ▶️
+                      │                                   └─ R3 (fan archive across peers; R1-gated, independent of R4) ⏸️ ON HOLD (0-peer overlay)
                       └─ P4  (in parallel: cheap, non-retrofittable, unblocks P5/P6) ─→ P4.5 ─→ P5 ─→ P6
 Browser: whenever reach matters, after R2 + P4.
 ```
@@ -805,12 +816,15 @@ Browser: whenever reach matters, after R2 + P4.
 **R4 is shipped** — the box and client are now one `tsnode` (go-libp2p + boxo) binary; kubo and
 rust-ipfs are both gone, the Node tracker + HTTP API are fully dissolved, and the custom DHT +
 IPNS-over-gossipsub that the old plan chased are native (no two-stack interop, no vendor patches,
-no Bitswap-at-scale unknown — boxo *is* what kubo is built from). **The next resilience step is now
-R3** — fanning the cold archive across peers (the one remaining lever on the §0 irreducible gap):
-gated only on R1 (done), independent of R4. Run **P4 alongside** as before — small,
-non-retrofittable, unblocks the product track, no shared critical path. The live follow-ups on R4
-itself are operational, not architectural: the desktop release/codesign pipeline, AutoNAT
-hysteresis, public-connection decay.
+no Bitswap-at-scale unknown — boxo *is* what kubo is built from). The next resilience step *would*
+be **R3** — fanning the cold archive across peers (the one remaining lever on the §0 irreducible
+gap) — but it's **on hold (2026-06-29)**: the master now runs a private `:5478` overlay with ~0
+peers, so replication has nowhere to land and would cost more than it buys. Revisit once there's a
+real peer population. Until then the master-pinned, GC-disabled blockstore + backups are the
+availability floor. **Run P4** as the actual do-now — small, non-retrofittable, unblocks the product
+track, no shared critical path. The live follow-ups on R4 itself are operational, not architectural:
+the desktop release/codesign pipeline, AutoNAT hysteresis, public-connection decay (now resolved by
+the port move — public scanners shed, conns dropped ~2100→0).
 
 ---
 
