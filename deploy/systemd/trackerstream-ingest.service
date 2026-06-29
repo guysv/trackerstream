@@ -1,7 +1,11 @@
 [Unit]
 Description=trackerstream corpus ingest (build CID-DAGs, pin, catalog) — re-runnable
-After=trackerstream-ipfs.service
-Requires=trackerstream-ipfs.service
+# The live master is tsnode (trackerstream-node). Must NOT depend on the kubo warm
+# standby (trackerstream-ipfs): kubo Conflicts= tsnode, so requiring it here would
+# evict tsnode on every ingest run — this is exactly what silently rolled prod back
+# to kubo at the first nightly ingest after cutover.
+After=trackerstream-node.service
+Requires=trackerstream-node.service
 
 [Service]
 Type=oneshot

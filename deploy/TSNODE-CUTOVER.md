@@ -6,9 +6,10 @@ kubo is **kept installed but stopped** as a warm-standby rollback — its repo
 (`/srv/trackerstream/ipfs`, incl. `keystore/`) is the rollback identity and is never touched.
 
 tsnode runs from its **own** repo (`/srv/trackerstream/tsnode`) with a re-ingested blockstore
-(CID parity), so the two masters never share a datastore. Both bind `:4001` (swarm) and
-`127.0.0.1:5001` (kubo-compatible RPC), so they are mutually exclusive (the systemd units
-`Conflicts=` each other).
+(CID parity), so the two masters never share a datastore. They both bind the kubo-compatible
+RPC `127.0.0.1:5001` (so they are mutually exclusive — the systemd units `Conflicts=` each
+other); their swarm ports differ — tsnode on `:5478` (the live, client-facing port, moved off
+the IPFS default to shed cached public-IPFS scanners), kubo on `:4001`.
 
 ## What changed in the box
 - `apps/server` no longer runs an HTTP **tracker** (presence/roster/peers + sweep deleted).
