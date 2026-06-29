@@ -7,8 +7,8 @@ import (
 )
 
 // jitter returns base ± up to spread, using crypto/rand (Math.random is unavailable to us
-// here and we want no shared PRNG state across goroutines). Used to de-synchronize keepalive
-// and presence loops so warm peers don't reconnect in a thundering herd.
+// here and we want no shared PRNG state across goroutines). Used to de-synchronize the
+// keepalive loop so warm peers don't reconnect in a thundering herd.
 func jitter(base, spread time.Duration) time.Duration {
 	if spread <= 0 {
 		return base
