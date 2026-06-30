@@ -7,7 +7,9 @@ package tsnode
 import (
 	"fmt"
 
+	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	mh "github.com/multiformats/go-multihash"
 )
 
 // Custom protocol / topic identifiers. The DHT prefix yields `/trackerstream/kad/1.0.0`
@@ -17,7 +19,22 @@ const (
 	DHTPrefix    protocol.ID = "/trackerstream"
 	CatalogTopic             = "/trackerstream/catalog/1.0.0"
 	PeerProtocol protocol.ID = "/trackerstream/peer/1.0.0"
+	// FwdProtocol is the public, content-addressed block-forwarding stream (R5; see fwd.go).
+	FwdProtocol protocol.ID = "/trackerstream/fwd/1.0.0"
 )
+
+// donorRendezvous is the stable CID that publicly-reachable donors Provide so a NAT'd peer's
+// AutoRelay peer source can discover them (R5 Phase B). Deterministic — every node computes the
+// same key from the same constant string; nothing is ever bitswapped for it.
+var donorRendezvous = mustDonorRendezvous()
+
+func mustDonorRendezvous() cid.Cid {
+	h, err := mh.Sum([]byte("trackerstream/donors/v1"), mh.SHA2_256, -1)
+	if err != nil {
+		panic(err)
+	}
+	return cid.NewCidV1(cid.Raw, h)
+}
 
 // Role selects the node posture: the server master is a DHT server + seeder + relay
 // server + IPNS publisher; the client is a lazy fetcher + DHT client + AutoRelay.

@@ -51,6 +51,7 @@ type Node struct {
 	pubsub   *PubSub
 	pins     *Pinset
 	control  *control
+	fwd      *fwdState            // block-forwarding donor state (rate cap + bounded cache)
 	seeds    map[peer.ID]struct{} // bootstrap (seed) peer IDs — excluded from peer-provider dialing
 }
 
@@ -82,8 +83,8 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
 		libp2p.BandwidthReporter(bwc),
-		libp2p.EnableNATService(),    // AutoNAT (reachability)
-		libp2p.EnableHolePunching(),  // DCUtR
+		libp2p.EnableNATService(),   // AutoNAT (reachability)
+		libp2p.EnableHolePunching(), // DCUtR
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			// Server is always public → forced ModeServer (deterministic, no AutoNAT wait).
 			// Clients run ModeAuto: the NATed majority stay clients, but a peer AutoNAT confirms
@@ -130,12 +131,15 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		// the reachable minority offload bulk for others. Infinite limits are required: any finite
 		// limit flags the connection Limited and bitswap won't traverse it (it's a binary gate).
 		opts = append(opts, libp2p.EnableRelayService(relay.WithInfiniteLimits()))
-		// AutoRelay: reserve a slot on the seed so a NATed client gets a /p2p-circuit address (the
-		// DCUtR coordination path). AutoRelay runs only while reachability is Private/Unknown and
-		// stops once Public — the mirror of the relay-service gate above. Static relay = the
-		// bootstrap seed(s). Skipped when there's no bootstrap (ephemeral/in-memory test nodes).
+		// AutoRelay: reserve a slot so a NATed client gets a /p2p-circuit address (the DCUtR
+		// coordination path) AND keeps a live connection to its donor (which the block-forwarder
+		// rides). The peer source yields the bootstrap seed(s) FIRST (preserving master-as-relay),
+		// then reachable peer donors discovered via the donorRendezvous (R5 Phase B). AutoRelay runs
+		// only while reachability is Private/Unknown and stops once Public — the mirror of the
+		// relay-service gate. Skipped when there's no bootstrap (ephemeral/in-memory test nodes).
 		if len(bootstrap) > 0 {
-			opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(bootstrap))
+			self, _ := peer.IDFromPrivateKey(priv)
+			opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(donorPeerSource(&idht, self, bootstrap)))
 		}
 		// UPnP / NAT-PMP: opportunistically map the swarm ports on a UPnP-capable home
 		// router so a NATed client becomes directly reachable — no relay/DCUtR needed.
@@ -175,7 +179,12 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	// Bitswap serves from the blockstore AND fetches; the DHT is the content router for
 	// provider discovery, but wants also broadcast to connected peers (the offload path).
 	bswap := bitswap.New(ctx, net, idht, bstore)
-	bserv := blockservice.New(bstore, bswap)
+	// Wrap the exchange so EVERY blockservice fetch (block/get, batch, and the catalog DAG-walk
+	// sessions) gains the block-forwarding fallback (R5) — one chokepoint, not per-handler. The donor's
+	// own transitive fetch passes a no-forward context to stay raw. `fex.n` is late-bound below (the
+	// node doesn't exist yet); no fetch runs until New returns.
+	fex := &fwdExchange{SessionExchange: bswap}
+	bserv := blockservice.New(bstore, fex)
 
 	keystore, err := NewKeystore(cfg.RepoPath)
 	if err != nil {
@@ -203,14 +212,22 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		ipns:     newIpnsStore(),
 		pubsub:   ps,
 		pins:     pins,
+		fwd:      newFwdState(),
 		seeds:    map[peer.ID]struct{}{},
 	}
 	for _, ai := range bootstrap {
 		n.seeds[ai.ID] = struct{}{}
 	}
+	fex.n = n // late-bind: the assisted exchange can now reach the node (forwarding + suppression)
 	n.control = newControl(n)
 	if err := n.control.start(ctx); err != nil {
 		return nil, fmt.Errorf("control plane: %w", err)
+	}
+	// Block-forwarding donor handler (R5) — CLIENTS only. The master seed never forwards: it serves
+	// its OWN pinned content via bitswap but is not a proxy for peer-to-peer user traffic. handleFwd
+	// further gates on public reachability, so only public client donors actually carry forwarding.
+	if cfg.Role == RoleClient {
+		n.host.SetStreamHandler(FwdProtocol, n.handleFwd)
 	}
 	// Zero-resolve wiring (Phase D): every signed catalog record pushed on the gossipsub topic
 	// is validated + stored locally (newest-seq wins), so a client's `routing/get` answers
@@ -224,7 +241,9 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	if err := n.pubsub.SubscribeCatalog(ctx); err != nil {
 		return nil, fmt.Errorf("catalog subscribe: %w", err)
 	}
-	// Reprovide pinned roots to the custom DHT (Provide.Strategy=roots; 22h in prod).
+	// Reprovide pinned roots to the custom DHT (Provide.Strategy=roots; 22h in prod). The loop also
+	// advertises the donor rendezvous (R5) while this node is a public CLIENT donor — the seed never
+	// advertises itself as a donor, because it never forwards.
 	go n.reprovideLoop(ctx, 22*time.Hour)
 
 	// Dial the configured bootstrap peers (the box) AFTER Bitswap is up, so its connection
@@ -360,9 +379,22 @@ func (n *Node) DialProviders(ctx context.Context, c cid.Cid) int {
 		if p.ID == self {
 			continue
 		}
+		// Discovery hint: a NAT'd provider advertises a /…/p2p/<B>/p2p-circuit/… addr — B is its
+		// donor (every tsnode runs both the clamped relay AND the forwarder). Keep B warm so a later
+		// FwdFetch for this provider's interior blocks (never on the DHT) has a live forwarder.
+		for _, a := range p.Addrs {
+			if b, ok := relayHopID(a); ok && b != self {
+				if _, isSeed := n.seeds[b]; !isSeed {
+					n.control.Warm(b)
+				}
+			}
+		}
 		if _, isSeed := n.seeds[p.ID]; isSeed {
 			continue
 		}
+		// Remember this content provider so GetBlockAssisted can suppress forwarding once we hold a
+		// direct (hole-punched) connection to it — letting direct take over the instant it forms.
+		n.fwd.recordProvider(p.ID)
 		if n.host.Network().Connectedness(p.ID) == network.Connected {
 			mu.Lock()
 			connected++
