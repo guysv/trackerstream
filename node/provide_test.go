@@ -163,14 +163,16 @@ func TestCatCatalogAdvertisesLeafPages(t *testing.T) {
 	if len(got) != len(blob) {
 		t.Fatalf("cat returned %d bytes, want %d", len(got), len(blob))
 	}
-	pieces := n.Pins().CountByKind()[KindCatalogPiece]
-	fmt.Printf("PROVIDE CatCatalog tagged %d leaf pages as catalog pieces\n", pieces)
+	kinds := n.Pins().CountByKind()
+	pieces := kinds[KindCatalogPiece]
+	fmt.Printf("PROVIDE CatCatalog tagged %d leaf pages + %d catalog source root\n", pieces, kinds[KindRoot])
 	if pieces < 2 {
 		t.Fatalf("expected several leaf pages advertised, got %d", pieces)
 	}
-	// The interior root must NOT be tagged as a catalog piece (it has links).
-	if k := n.Pins().CountByKind(); k[KindRoot] != 0 {
-		t.Fatalf("interior nodes should not be advertised, got %d roots", k[KindRoot])
+	// The catalog root is advertised once as a source (the dialable rendezvous); interior index
+	// nodes are NOT (only the root + leaf pages).
+	if kinds[KindRoot] != 1 {
+		t.Fatalf("expected exactly the catalog root advertised as source, got %d", kinds[KindRoot])
 	}
 
 	// Re-read: dedup — no new pieces.

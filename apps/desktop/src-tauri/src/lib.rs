@@ -336,6 +336,15 @@ async fn catalog_query(
     state: State<'_, NodeState>,
 ) -> Result<serde_json::Value, String> {
     let cid = resolve_ipns_name(&name, &cache, &state.rpc).await?;
+    // Surface non-seed catalog sources in the background so page reads can pull from peers, not
+    // just the seed; the query proceeds immediately (seed stays the fallback).
+    {
+        let rpc = state.rpc.clone();
+        let root = cid.to_string();
+        tauri::async_runtime::spawn(async move {
+            let _ = rpc.dial_providers(&root).await;
+        });
+    }
     catalog::run_query(state.rpc.clone(), cid, req).await
 }
 

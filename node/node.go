@@ -381,6 +381,17 @@ func (n *Node) DialProviders(ctx context.Context, c cid.Cid) int {
 	return connected
 }
 
+// provideCatalogSource advertises the catalog root this node reads, marking us as a holder of
+// catalog content so peers' dial-providers(catalogRoot) discover + connect to us. Deduped; the
+// node holds the root block (the cat reader fetched it), so serving it is honest.
+func (n *Node) provideCatalogSource(c cid.Cid) {
+	if n.pins == nil || n.pins.Has(c) {
+		return
+	}
+	_ = n.pins.Add(context.Background(), c) // KindRoot — "I hold (some of) this catalog"
+	n.provideNow(c)
+}
+
 // provideCatalogPieces records + advertises freshly-fetched catalog page CIDs (the leaf blocks a
 // CatCatalog read touched), skipping any already tracked so a re-read doesn't re-advertise.
 func (n *Node) provideCatalogPieces(cids []cid.Cid) {

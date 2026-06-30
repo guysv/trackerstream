@@ -33,6 +33,10 @@ func (n *Node) CatCatalog(ctx context.Context, c cid.Cid, offset, length int64) 
 	data, err := n.catRead(ctx, rec, c, offset, length)
 	if err == nil {
 		n.provideCatalogPieces(rec.take())
+		// Advertise the catalog root as a source so peers' dial-providers(catalogRoot) can find
+		// + connect to us (clients only know the root, not page CIDs — the root is the dialable
+		// rendezvous, the catalog analog of a track root).
+		n.provideCatalogSource(c)
 	}
 	return data, err
 }
