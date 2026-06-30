@@ -6,6 +6,17 @@
   const rate = (n: number): string => `${fmtBytes(n)}/s`;
   const short = (id: string): string => (id.length > 16 ? `${id.slice(0, 6)}…${id.slice(-6)}` : id);
 
+  // AutoNAT reachability badge: public = directly dialable (UPnP mapped or natively
+  // reachable); private = behind NAT (relay/DCUtR only); undecided while AutoNAT probes.
+  const reachLabel = (r: boolean | null): string =>
+    r === true ? "public" : r === false ? "private" : "checking…";
+  const reachTitle = (r: boolean | null): string =>
+    r === true
+      ? "directly reachable — other peers can dial in (UPnP/port-map or native public IP)"
+      : r === false
+        ? "behind NAT — reachable only via relay + DCUtR hole-punching"
+        : "AutoNAT is still determining reachability";
+
   function rowKey(e: KeyboardEvent, id: string): void {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
@@ -20,11 +31,20 @@
 <div class="peers">
   <div class="phead">
     <span>peers · {peers.connected} connected</span>
+    <span class="spacer"></span>
     {#if peers.offloadDown > 0}
       <span class="offload" title="cumulative download from non-master peers (offload)">
         offload {fmtBytes(peers.offloadDown)}
       </span>
     {/if}
+    <span
+      class="reach"
+      class:public={peers.reachable === true}
+      class:private={peers.reachable === false}
+      title={reachTitle(peers.reachable)}
+    >
+      <span class="rdot"></span>{reachLabel(peers.reachable)}
+    </span>
   </div>
 
   <div class="bw">
@@ -88,9 +108,33 @@
     align-items: baseline;
     gap: 0.5rem;
   }
+  .spacer {
+    flex: 1;
+  }
   .offload {
     color: var(--green, #7dcfa0);
     font-size: 10px;
+  }
+  .reach {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 10px;
+    color: var(--dim);
+    text-transform: lowercase;
+  }
+  .reach.public {
+    color: var(--green, #7dcfa0);
+  }
+  .reach.private {
+    color: var(--amber);
+  }
+  .rdot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex: none;
   }
   .bw {
     display: grid;

@@ -137,6 +137,13 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		if len(bootstrap) > 0 {
 			opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(bootstrap))
 		}
+		// UPnP / NAT-PMP: opportunistically map the swarm ports on a UPnP-capable home
+		// router so a NATed client becomes directly reachable — no relay/DCUtR needed.
+		// When it succeeds AutoNAT flips to Public, which cascades: DHT self-promotion
+		// (ModeAuto) + the infinite-limit client relay activates. Where there's no IGD
+		// (CGNAT, UPnP disabled) it's a silent no-op and we fall back to relay+DCUtR.
+		// Client-only: the server is direct-bound on a public IP with no gateway to map.
+		opts = append(opts, libp2p.NATPortMap())
 	}
 	if cfg.Role == RoleServer {
 		// The master is an always-on bootstrap + seeder facing a large, churny inbound swarm

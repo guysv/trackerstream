@@ -34,6 +34,9 @@ export interface PeerEntry {
 export interface PeerStats {
   connected: number; // currently-connected count (the `peers · N` toggle)
   peers: PeerEntry[]; // connected ∪ ever-transferred (disconnected ones retained)
+  // Our AutoNAT verdict: true = public (directly reachable, e.g. via UPnP), false =
+  // private (behind NAT, relay/DCUtR only), null = undecided. Reachability badge.
+  reachable: boolean | null;
 }
 
 /** Snapshot of per-peer cumulative up/down bytes + connected state (peers pane). */
