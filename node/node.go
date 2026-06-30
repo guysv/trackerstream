@@ -324,6 +324,21 @@ func (n *Node) ProvideCatalogPiece(ctx context.Context, c cid.Cid) error {
 	return nil
 }
 
+// provideCatalogPieces records + advertises freshly-fetched catalog page CIDs (the leaf blocks a
+// CatCatalog read touched), skipping any already tracked so a re-read doesn't re-advertise.
+func (n *Node) provideCatalogPieces(cids []cid.Cid) {
+	if n.pins == nil {
+		return
+	}
+	for _, c := range cids {
+		if n.pins.Has(c) {
+			continue
+		}
+		_ = n.pins.AddCatalogPiece(context.Background(), c)
+		n.provideNow(c)
+	}
+}
+
 // provideNow fires a single best-effort DHT advertisement in the background (the reprovide loop
 // refreshes it on the long interval).
 func (n *Node) provideNow(c cid.Cid) {

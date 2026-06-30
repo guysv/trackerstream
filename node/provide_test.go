@@ -1,6 +1,7 @@
 package tsnode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -54,6 +55,56 @@ func TestPinsetTypedPersistenceAndMigration(t *testing.T) {
 	}
 	if len(p2.Roots()) != 3 {
 		t.Fatalf("reprovide set should contain all 3 CIDs, got %d", len(p2.Roots()))
+	}
+}
+
+// CatCatalog advertises the LEAF page blocks it fetched as catalog pieces (the node-side half of
+// the strategy — the client only knows the catalog root + byte offsets, so per-page providing has
+// to happen here). Interior index nodes are not advertised, and a re-read does not re-advertise.
+func TestCatCatalogAdvertisesLeafPages(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	n, err := New(ctx, DefaultConfig(RoleServer, "", 0))
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	defer n.Close()
+
+	// A multi-block UnixFS file (small chunks → several leaf pages + an interior root). Each
+	// 1KB chunk gets distinct bytes so the leaves are distinct CIDs (identical chunks would
+	// dedup to one block).
+	blob := make([]byte, 8*1024)
+	for i := range blob {
+		blob[i] = byte(i/1024)*37 + byte(i)
+	}
+	root, err := n.AddUnixFS(ctx, bytes.NewReader(blob), AddOptions{ChunkSize: 1024, RawLeaves: false, Pin: false})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	got, err := n.CatCatalog(ctx, root, 0, -1)
+	if err != nil {
+		t.Fatalf("CatCatalog: %v", err)
+	}
+	if len(got) != len(blob) {
+		t.Fatalf("cat returned %d bytes, want %d", len(got), len(blob))
+	}
+	pieces := n.Pins().CountByKind()[KindCatalogPiece]
+	fmt.Printf("PROVIDE CatCatalog tagged %d leaf pages as catalog pieces\n", pieces)
+	if pieces < 2 {
+		t.Fatalf("expected several leaf pages advertised, got %d", pieces)
+	}
+	// The interior root must NOT be tagged as a catalog piece (it has links).
+	if k := n.Pins().CountByKind(); k[KindRoot] != 0 {
+		t.Fatalf("interior nodes should not be advertised, got %d roots", k[KindRoot])
+	}
+
+	// Re-read: dedup — no new pieces.
+	if _, err := n.CatCatalog(ctx, root, 0, -1); err != nil {
+		t.Fatalf("CatCatalog re-read: %v", err)
+	}
+	if again := n.Pins().CountByKind()[KindCatalogPiece]; again != pieces {
+		t.Fatalf("re-read re-advertised pieces: %d -> %d", pieces, again)
 	}
 }
 
