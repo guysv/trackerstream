@@ -35,7 +35,6 @@ type Config struct {
 	RepoPath    string   // datastore + identity.key; "" = ephemeral/in-memory (tests)
 	ListenAddrs []string // libp2p listen multiaddrs
 	Bootstrap   []string // bootstrap multiaddrs (the box, for clients)
-	RelayServer bool     // run the clamped circuit-relay v2 service (server master / willing client)
 }
 
 // DefaultConfig builds a config for a role. swarmPort 0 = OS-assigned (ephemeral);
@@ -51,6 +50,5 @@ func DefaultConfig(role Role, repo string, swarmPort int) Config {
 			fmt.Sprintf("/ip6/::/tcp/%d", swarmPort),
 			fmt.Sprintf("/ip6/::/udp/%d/quic-v1", swarmPort),
 		},
-		RelayServer: role == RoleServer,
 	}
 }

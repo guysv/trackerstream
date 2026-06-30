@@ -13,18 +13,35 @@ import (
 // pinKey namespaces the persisted pinset in the datastore.
 var pinKey = ds.NewKey("/trackerstream/pins")
 
-// Pinset is the durable set of recursively-pinned root CIDs. Pins are the durability
-// contract (the node runs GC-disabled, exactly like kubo `daemon --enable-gc=false`), and —
-// matching kubo's `Provide.Strategy=roots` — only these roots are advertised to the DHT, not
-// every leaf block. Persisted to the datastore so it survives restarts.
+// PinKind tags WHY a CID is held, which drives the reprovide GRANULARITY:
+//   - KindRoot: a durability root (the seed's catalog root + track roots from ingest). Provided.
+//   - KindTrackRoot: a track manifest root a client holds. Provided — peers want the whole track,
+//     so advertising the root is enough; bitswap pulls the interior DAG from the provider. We do
+//     NOT advertise track interior blocks (keeps the DHT light).
+//   - KindCatalogPiece: an individual catalog block a client fetched. Provided — catalog access is
+//     random/partial, so peers sharing pages offloads the seed. These are CACHE (the client may
+//     Remove them when evicting), not a durability promise.
+type PinKind uint8
+
+const (
+	KindRoot PinKind = iota
+	KindTrackRoot
+	KindCatalogPiece
+)
+
+// Pinset is the set of CIDs this node holds and ADVERTISES to the DHT, each tagged with a
+// PinKind. The node runs GC-disabled (like kubo `daemon --enable-gc=false`), so a held block is
+// retained and bitswap-servable regardless; the set is what we reprovide. Persisted across
+// restarts. Only members are advertised — never arbitrary interior blocks (kubo's
+// `Provide.Strategy=roots`, generalised per kind).
 type Pinset struct {
 	mu    sync.RWMutex
-	roots map[cid.Cid]struct{}
+	roots map[cid.Cid]PinKind
 	ds    ds.Batching
 }
 
 func newPinset(store ds.Batching) (*Pinset, error) {
-	p := &Pinset{roots: map[cid.Cid]struct{}{}, ds: store}
+	p := &Pinset{roots: map[cid.Cid]PinKind{}, ds: store}
 	data, err := store.Get(context.Background(), pinKey)
 	if err == ds.ErrNotFound {
 		return p, nil
@@ -32,11 +49,22 @@ func newPinset(store ds.Batching) (*Pinset, error) {
 	if err != nil {
 		return nil, err
 	}
+	// New format: {cid: kind}. Legacy format: [cid,...] (all KindRoot). Try the map first; an
+	// array fails to unmarshal into a map, so the fallback discriminates cleanly.
+	var kinds map[string]PinKind
+	if json.Unmarshal(data, &kinds) == nil {
+		for s, k := range kinds {
+			if c, err := cid.Decode(s); err == nil {
+				p.roots[c] = k
+			}
+		}
+		return p, nil
+	}
 	var saved []string
 	if json.Unmarshal(data, &saved) == nil {
 		for _, s := range saved {
 			if c, err := cid.Decode(s); err == nil {
-				p.roots[c] = struct{}{}
+				p.roots[c] = KindRoot
 			}
 		}
 	}
@@ -45,9 +73,9 @@ func newPinset(store ds.Batching) (*Pinset, error) {
 
 func (p *Pinset) persist(ctx context.Context) error {
 	p.mu.RLock()
-	out := make([]string, 0, len(p.roots))
-	for c := range p.roots {
-		out = append(out, c.String())
+	out := make(map[string]PinKind, len(p.roots))
+	for c, k := range p.roots {
+		out[c.String()] = k
 	}
 	p.mu.RUnlock()
 	data, err := json.Marshal(out)
@@ -57,12 +85,35 @@ func (p *Pinset) persist(ctx context.Context) error {
 	return p.ds.Put(ctx, pinKey, data)
 }
 
-// Add pins a root (idempotent) and persists.
-func (p *Pinset) Add(ctx context.Context, c cid.Cid) error {
+// Add pins a CID as a durability root (idempotent) and persists.
+func (p *Pinset) Add(ctx context.Context, c cid.Cid) error { return p.add(ctx, c, KindRoot) }
+
+// AddTrackRoot records a track manifest root to advertise (whole-track discovery).
+func (p *Pinset) AddTrackRoot(ctx context.Context, c cid.Cid) error {
+	return p.add(ctx, c, KindTrackRoot)
+}
+
+// AddCatalogPiece records an individual catalog block to advertise (page sharing).
+func (p *Pinset) AddCatalogPiece(ctx context.Context, c cid.Cid) error {
+	return p.add(ctx, c, KindCatalogPiece)
+}
+
+func (p *Pinset) add(ctx context.Context, c cid.Cid, k PinKind) error {
 	p.mu.Lock()
-	p.roots[c] = struct{}{}
+	p.roots[c] = k
 	p.mu.Unlock()
 	return p.persist(ctx)
+}
+
+// CountByKind returns how many CIDs are held per kind (for node/status metrics).
+func (p *Pinset) CountByKind() map[PinKind]int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := map[PinKind]int{}
+	for _, k := range p.roots {
+		out[k]++
+	}
+	return out
 }
 
 // Remove unpins a root (idempotent — a missing root is not an error, matching kubo's
