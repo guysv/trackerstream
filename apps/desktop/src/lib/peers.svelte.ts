@@ -27,7 +27,18 @@ export const peers = $state<{
   // Offload proof: cumulative down bytes from NON-master peers. >0 means blocks
   // came from a peer, not the master (PEER-ASSIST.md §B6 / verification).
   offloadDown: number;
-}>({ connected: 0, rows: [], totalDown: 0, totalUp: 0, speedDown: 0, speedUp: 0, offloadDown: 0 });
+  // Our AutoNAT reachability: true public, false private, null undecided.
+  reachable: boolean | null;
+}>({
+  connected: 0,
+  rows: [],
+  totalDown: 0,
+  totalUp: 0,
+  speedDown: 0,
+  speedUp: 0,
+  offloadDown: 0,
+  reachable: null,
+});
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let prev = new Map<string, { down: number; up: number }>();
@@ -107,6 +118,7 @@ async function tick(): Promise<void> {
     peers.speedDown = aggDown;
     peers.speedUp = aggUp;
     peers.offloadDown = offloadDown;
+    peers.reachable = s.reachable;
   } catch {
     // Node not ready yet — keep the last snapshot, retry next tick.
   }

@@ -161,6 +161,9 @@ struct PeerStats {
     connected: usize,
     peers: Vec<PeerEntry>,
     relay: RelayCounts,
+    /// Our own AutoNAT verdict: `Some(true)` public, `Some(false)` private, `None`
+    /// undecided. Drives the peers-pane reachability badge (UPnP/relay/DCUtR outcome).
+    reachable: Option<bool>,
 }
 
 #[tauri::command]
@@ -183,6 +186,11 @@ async fn peer_stats(state: State<'_, NodeState>) -> Result<PeerStats, String> {
             PeerEntry { connected: connected.contains(&id), id, down, up, role }
         })
         .collect();
+    let reachable = match status.as_ref().map(|s| s.reachability.as_str()) {
+        Some("public") => Some(true),
+        Some("private") => Some(false),
+        _ => None,
+    };
     let relay = status
         .map(|s| RelayCounts {
             direct: s.relay_stats.direct,
@@ -191,7 +199,7 @@ async fn peer_stats(state: State<'_, NodeState>) -> Result<PeerStats, String> {
             dcutr_upgrades: 0,
         })
         .unwrap_or_default();
-    Ok(PeerStats { connected: connected.len(), peers, relay })
+    Ok(PeerStats { connected: connected.len(), peers, relay, reachable })
 }
 
 #[derive(Serialize)]
