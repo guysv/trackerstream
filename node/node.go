@@ -51,6 +51,7 @@ type Node struct {
 	pubsub   *PubSub
 	pins     *Pinset
 	control  *control
+	seeds    map[peer.ID]struct{} // bootstrap (seed) peer IDs — excluded from peer-provider dialing
 }
 
 // logf is the node's structured-ish log sink (stderr). Kept trivial; the deploy captures
@@ -195,6 +196,10 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		ipns:     newIpnsStore(),
 		pubsub:   ps,
 		pins:     pins,
+		seeds:    map[peer.ID]struct{}{},
+	}
+	for _, ai := range bootstrap {
+		n.seeds[ai.ID] = struct{}{}
 	}
 	n.control = newControl(n)
 	if err := n.control.start(ctx); err != nil {
@@ -322,6 +327,58 @@ func (n *Node) ProvideCatalogPiece(ctx context.Context, c cid.Cid) error {
 	}
 	n.provideNow(c)
 	return nil
+}
+
+// DialProviders looks up providers of c on the DHT and connects to the NON-seed ones, so a
+// subsequent bitswap fetch can pull from peers instead of only the always-connected seed. This is
+// the "try other peers, fall back to the seed" hook: bitswap won't discover peer providers on its
+// own here (the seed is connected and answers for roots, short-circuiting content routing; interior
+// blocks aren't advertised at all), so we surface peer providers explicitly. The provider record
+// carries each peer's seed-observed addresses — including its LAN address — so same-network peers
+// can connect directly. Best-effort and bounded; returns how many non-seed providers we hold a
+// connection to afterwards. The seed is never dialed here (it's already connected) and stays the
+// fallback once these peers are in the swarm.
+func (n *Node) DialProviders(ctx context.Context, c cid.Cid) int {
+	if n.dht == nil {
+		return 0
+	}
+	self := n.host.ID()
+	fctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	connected := 0
+	for p := range n.dht.FindProvidersAsync(fctx, c, 16) {
+		if p.ID == self {
+			continue
+		}
+		if _, isSeed := n.seeds[p.ID]; isSeed {
+			continue
+		}
+		if n.host.Network().Connectedness(p.ID) == network.Connected {
+			mu.Lock()
+			connected++
+			mu.Unlock()
+			continue
+		}
+		wg.Add(1)
+		go func(ai peer.AddrInfo) {
+			defer wg.Done()
+			cctx, cc := context.WithTimeout(ctx, 8*time.Second)
+			defer cc()
+			if err := n.host.Connect(cctx, ai); err != nil {
+				n.logf("dial provider %s failed: %v", ai.ID, err)
+				return
+			}
+			n.control.Warm(ai.ID) // keep a useful peer source warm
+			mu.Lock()
+			connected++
+			mu.Unlock()
+		}(p)
+	}
+	wg.Wait()
+	return connected
 }
 
 // provideCatalogPieces records + advertises freshly-fetched catalog page CIDs (the leaf blocks a
