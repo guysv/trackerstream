@@ -149,6 +149,20 @@ impl NodeRpc {
         Ok(())
     }
 
+    /// `dial-providers?arg=<cid>` — find the providers of a CID on the DHT and connect to the
+    /// non-seed ones, so the ensuing bitswap fetch pulls from peers (incl. same-LAN) rather than
+    /// only the seed. Fire this at the start of a track fetch; it's best-effort and the fetch
+    /// proceeds regardless (the seed remains the fallback).
+    pub async fn dial_providers(&self, cid: &str) -> Result<()> {
+        self.http
+            .post(self.url(&format!("dial-providers?arg={cid}")))
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("dial-providers {cid}"))?;
+        Ok(())
+    }
+
     /// `swarm/connect?arg=<multiaddr>` — dial a peer (warm-set forming, master keepalive).
     pub async fn swarm_connect(&self, multiaddr: &str) -> Result<()> {
         self.http

@@ -348,6 +348,15 @@ async fn fetch_module(
 ) -> Result<Response, String> {
     let cid: Cid = root.parse().map_err(|e| format!("bad CID {root}: {e}"))?;
     held.mark(&root, false);
+    // Surface non-seed providers in the background so bitswap can pull from peers, not just the
+    // seed — the fetch proceeds immediately (seed stays the fallback).
+    {
+        let rpc = state.rpc.clone();
+        let root = root.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = rpc.dial_providers(&root).await;
+        });
+    }
     let bytes = ipfs::reassemble(&state.rpc, cid)
         .await
         .map_err(|e| format!("fetch_module {root} failed: {e}"))?;
@@ -374,6 +383,15 @@ async fn start_stream(
     streams.0.lock().unwrap().insert(root.clone(), st.clone());
     held.mark(&root, false);
     let held = held.inner().clone();
+    // Surface non-seed providers in the background (peers, incl. same-LAN) so the stream pulls
+    // from them rather than only the seed; streaming starts immediately regardless.
+    {
+        let rpc = rpc.clone();
+        let root = root.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = rpc.dial_providers(&root).await;
+        });
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ipfs::StreamEvent>();
     tauri::async_runtime::spawn(async move {

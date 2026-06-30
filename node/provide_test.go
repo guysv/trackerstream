@@ -11,6 +11,7 @@ import (
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
+	"github.com/libp2p/go-libp2p/core/network"
 )
 
 // Pinset persistence: the legacy flat [cid,...] format migrates to KindRoot, and the typed format
@@ -55,6 +56,79 @@ func TestPinsetTypedPersistenceAndMigration(t *testing.T) {
 	}
 	if len(p2.Roots()) != 3 {
 		t.Fatalf("reprovide set should contain all 3 CIDs, got %d", len(p2.Roots()))
+	}
+}
+
+// DialProviders connects a fetcher to the NON-seed provider of a CID (the seed is excluded), so
+// bitswap can then pull from the peer — the "try other peers" hook. A then serves a block to C
+// that C could only have gotten by connecting to A (they don't share it via the seed here).
+func TestDialProvidersConnectsNonSeedPeer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	seed, err := New(ctx, DefaultConfig(RoleServer, "", 0))
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	defer seed.Close()
+	boot := fmt.Sprintf("%s/p2p/%s", loopbackAddr(t, seed), seed.ID())
+
+	mkClient := func() *Node {
+		cfg := DefaultConfig(RoleClient, "", 0)
+		cfg.Bootstrap = []string{boot}
+		n, err := New(ctx, cfg)
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+		return n
+	}
+	provider := mkClient() // "A" — holds + provides a block
+	defer provider.Close()
+	fetcher := mkClient() // "C" — wants it, should reach A (not the seed) for it
+	defer fetcher.Close()
+
+	if err := waitRoutingTable(ctx, provider, fetcher); err != nil {
+		t.Fatalf("routing table: %v", err)
+	}
+
+	// A block ONLY the provider holds (the seed never has it), advertised by the provider.
+	blk := rawBlock(t, []byte("a block only the non-seed provider holds"))
+	if err := provider.PutBlock(ctx, blk); err != nil {
+		t.Fatalf("provider put: %v", err)
+	}
+	if err := provider.ProvideTrackRoot(ctx, blk.Cid()); err != nil {
+		t.Fatalf("provide: %v", err)
+	}
+
+	// Let the provider record land, then dial providers from the fetcher.
+	deadline := time.Now().Add(20 * time.Second)
+	var connected int
+	for time.Now().Before(deadline) {
+		connected = fetcher.DialProviders(ctx, blk.Cid())
+		if connected > 0 {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	fmt.Printf("DIALPROV fetcher connected to %d non-seed provider(s)\n", connected)
+	if connected == 0 {
+		t.Fatalf("DialProviders did not connect the fetcher to the non-seed provider")
+	}
+	if fetcher.Host().Network().Connectedness(provider.ID()) != network.Connected {
+		t.Fatalf("fetcher should be connected to the provider after DialProviders")
+	}
+	// The seed was excluded (never dialed as a provider).
+	if fetcher.Host().Network().Connectedness(seed.ID()) != network.Connected {
+		t.Fatalf("sanity: fetcher should still be connected to the seed (bootstrap)")
+	}
+
+	// Now the fetcher can bitswap the block — only the provider has it.
+	got, err := fetcher.GetBlock(ctx, blk.Cid())
+	if err != nil {
+		t.Fatalf("fetch after dial: %v", err)
+	}
+	if string(got.RawData()) != string(blk.RawData()) {
+		t.Fatalf("bytes mismatch")
 	}
 }
 

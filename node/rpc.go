@@ -53,6 +53,8 @@ func NewRPCServer(n *Node) *RPCServer {
 	// whole-track granularity, or an individual catalog page at piece granularity.
 	s.mux.HandleFunc("/api/v0/provide/track-root", s.handleProvideTrackRoot)
 	s.mux.HandleFunc("/api/v0/provide/catalog-piece", s.handleProvideCatalogPiece)
+	// Connect to non-seed providers of a CID so bitswap fetches from peers, not just the seed.
+	s.mux.HandleFunc("/api/v0/dial-providers", s.handleDialProviders)
 	return s
 }
 
@@ -423,6 +425,17 @@ func (s *RPCServer) handleProvideCatalogPiece(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, map[string]any{"Provided": c.String(), "Kind": "catalog-piece"})
+}
+
+// handleDialProviders finds + connects the non-seed providers of a CID (peer-source priming).
+func (s *RPCServer) handleDialProviders(w http.ResponseWriter, r *http.Request) {
+	c, err := cid.Decode(r.URL.Query().Get("arg"))
+	if err != nil {
+		rpcErr(w, http.StatusBadRequest, err)
+		return
+	}
+	n := s.node.DialProviders(r.Context(), c)
+	writeJSON(w, map[string]any{"Connected": n})
 }
 
 // readUploadedFile reads the block bytes from a kubo-style multipart upload (the "data"
