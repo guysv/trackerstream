@@ -31,6 +31,7 @@ import (
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
+	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -61,6 +62,26 @@ func (n *Node) logf(format string, args ...any) {
 	log.Printf("[tsnode] "+format, args...)
 }
 
+// hpTracer logs DCUtR hole-punch outcomes so a relay-coordinated punch is distinguishable
+// from a plain direct-dial failure. A "dial provider … all dials failed" with NO matching
+// `[holepunch]` line for that peer means the punch never started (no /p2p-circuit to coordinate
+// through — a remote AutoRelay-reservation gap, not a punch that failed). An explicit
+// `[holepunch] END … success=false` is a genuine failed punch. Constructed before the Node
+// exists, so it logs via the package logger directly (same stderr/journald sink as logf).
+type hpTracer struct{}
+
+func (hpTracer) Trace(e *holepunch.Event) {
+	switch v := e.Evt.(type) {
+	case *holepunch.StartHolePunchEvt:
+		log.Printf("[tsnode] [holepunch] start remote=%s addrs=%v", e.Remote, v.RemoteAddrs)
+	case *holepunch.HolePunchAttemptEvt:
+		log.Printf("[tsnode] [holepunch] attempt=%d remote=%s", v.Attempt, e.Remote)
+	case *holepunch.EndHolePunchEvt:
+		log.Printf("[tsnode] [holepunch] END remote=%s success=%t elapsed=%s err=%q",
+			e.Remote, v.Success, v.EllapsedTime, v.Error)
+	}
+}
+
 // New assembles and starts the node. Cancelling ctx (or calling Close) tears it down.
 func New(ctx context.Context, cfg Config) (*Node, error) {
 	priv, err := loadOrCreateKey(cfg.RepoPath)
@@ -84,7 +105,7 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
 		libp2p.BandwidthReporter(bwc),
 		libp2p.EnableNATService(),   // AutoNAT (reachability)
-		libp2p.EnableHolePunching(), // DCUtR
+		libp2p.EnableHolePunching(holepunch.WithTracer(hpTracer{})), // DCUtR (+ per-attempt trace)
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			// Server is always public → forced ModeServer (deterministic, no AutoNAT wait).
 			// Clients run ModeAuto: the NATed majority stay clients, but a peer AutoNAT confirms
@@ -147,7 +168,11 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		// (ModeAuto) + the infinite-limit client relay activates. Where there's no IGD
 		// (CGNAT, UPnP disabled) it's a silent no-op and we fall back to relay+DCUtR.
 		// Client-only: the server is direct-bound on a public IP with no gateway to map.
-		opts = append(opts, libp2p.NATPortMap())
+		// Gated by cfg.DisableNATPortMap (TS_NO_NATPORTMAP) so a host with a misbehaving
+		// IGD can fall back to pure relay+DCUtR at runtime, no rebuild.
+		if !cfg.DisableNATPortMap {
+			opts = append(opts, libp2p.NATPortMap())
+		}
 	}
 	if cfg.Role == RoleServer {
 		// The master is an always-on bootstrap + seeder facing a large, churny inbound swarm

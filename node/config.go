@@ -52,6 +52,12 @@ type Config struct {
 	RepoPath    string   // datastore + identity.key; "" = ephemeral/in-memory (tests)
 	ListenAddrs []string // libp2p listen multiaddrs
 	Bootstrap   []string // bootstrap multiaddrs (the box, for clients)
+	// DisableNATPortMap turns OFF the client's UPnP/NAT-PMP port mapping (the swarm-port
+	// IGD map from 9f2e8b6). It's an escape hatch for routers where UPnP misbehaves
+	// (duplicate/leaking maps, buggy IGD firmware) — the node then relies purely on
+	// relay+DCUtR for NAT traversal, exactly as it did before that feature landed.
+	// Server-irrelevant (the master never maps). Off by default (mapping stays enabled).
+	DisableNATPortMap bool
 }
 
 // DefaultConfig builds a config for a role. swarmPort 0 = OS-assigned (ephemeral);
