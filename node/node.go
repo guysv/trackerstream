@@ -30,6 +30,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -83,7 +84,11 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		libp2p.EnableNATService(),    // AutoNAT (reachability)
 		libp2p.EnableHolePunching(),  // DCUtR
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
-			mode := dht.ModeClient
+			// Server is always public → forced ModeServer (deterministic, no AutoNAT wait).
+			// Clients run ModeAuto: the NATed majority stay clients, but a peer AutoNAT confirms
+			// is publicly reachable promotes itself to a DHT server — decentralising the table
+			// off the single seed. Relay-only reachability never promotes (stays client).
+			mode := dht.ModeAuto
 			if cfg.Role == RoleServer {
 				mode = dht.ModeServer
 			}
@@ -113,9 +118,24 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 			return idht, err
 		}),
 	}
-	if cfg.RelayServer {
-		// The clamped circuit-relay v2 service (coordination floor; bulk limits applied later).
+	if cfg.Role == RoleServer {
+		// The seed's relay is the CLAMPED coordination floor (default 128KB/2min). It faces the
+		// whole swarm, so it must NOT carry bulk — it exists only as the always-reachable DCUtR
+		// rendezvous. The clamp flags relayed conns Limited, which bitswap refuses (by design).
 		opts = append(opts, libp2p.EnableRelayService())
+	} else {
+		// Clients offer a GENEROUS (infinite-limit) relay — but go-libp2p only STARTS it once
+		// AutoNAT confirms the node is publicly reachable, so the NATed majority never relay and
+		// the reachable minority offload bulk for others. Infinite limits are required: any finite
+		// limit flags the connection Limited and bitswap won't traverse it (it's a binary gate).
+		opts = append(opts, libp2p.EnableRelayService(relay.WithInfiniteLimits()))
+		// AutoRelay: reserve a slot on the seed so a NATed client gets a /p2p-circuit address (the
+		// DCUtR coordination path). AutoRelay runs only while reachability is Private/Unknown and
+		// stops once Public — the mirror of the relay-service gate above. Static relay = the
+		// bootstrap seed(s). Skipped when there's no bootstrap (ephemeral/in-memory test nodes).
+		if len(bootstrap) > 0 {
+			opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(bootstrap))
+		}
 	}
 	if cfg.Role == RoleServer {
 		// The master is an always-on bootstrap + seeder facing a large, churny inbound swarm
@@ -277,16 +297,46 @@ func (n *Node) Pin(ctx context.Context, c cid.Cid) error {
 	if err := n.pins.Add(ctx, c); err != nil {
 		return err
 	}
-	if n.dht != nil {
-		go func() {
-			cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			if err := n.dht.Provide(cctx, c, true); err != nil {
-				n.logf("provide %s failed: %v", c, err)
-			}
-		}()
-	}
+	n.provideNow(c)
 	return nil
+}
+
+// ProvideTrackRoot records + advertises a track manifest root this node holds. Peers want the
+// whole track, so advertising just the root suffices — bitswap pulls the interior DAG from the
+// provider once connected. Interior track blocks are deliberately NOT advertised (DHT stays
+// light). Call this when a client has streamed/cached a track it is willing to serve.
+func (n *Node) ProvideTrackRoot(ctx context.Context, c cid.Cid) error {
+	if err := n.pins.AddTrackRoot(ctx, c); err != nil {
+		return err
+	}
+	n.provideNow(c)
+	return nil
+}
+
+// ProvideCatalogPiece records + advertises a single catalog block this node fetched. Catalog
+// access is random/partial, so peers advertising the pages they hold lets clients fetch catalog
+// pieces from each other and offload the seed. These are cache entries — pair with Unpin to evict.
+func (n *Node) ProvideCatalogPiece(ctx context.Context, c cid.Cid) error {
+	if err := n.pins.AddCatalogPiece(ctx, c); err != nil {
+		return err
+	}
+	n.provideNow(c)
+	return nil
+}
+
+// provideNow fires a single best-effort DHT advertisement in the background (the reprovide loop
+// refreshes it on the long interval).
+func (n *Node) provideNow(c cid.Cid) {
+	if n.dht == nil {
+		return
+	}
+	go func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := n.dht.Provide(cctx, c, true); err != nil {
+			n.logf("provide %s failed: %v", c, err)
+		}
+	}()
 }
 
 // Unpin removes a root pin (idempotent).
