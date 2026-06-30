@@ -136,6 +136,19 @@ impl NodeRpc {
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// `provide/track-root?arg=<cid>` — advertise a track manifest root this node now holds, so
+    /// peers can discover us as a provider of the whole track (bitswap pulls the interior DAG).
+    /// Best-effort: providing failures are non-fatal to playback, so callers may ignore the error.
+    pub async fn provide_track_root(&self, cid: &str) -> Result<()> {
+        self.http
+            .post(self.url(&format!("provide/track-root?arg={cid}")))
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("provide/track-root {cid}"))?;
+        Ok(())
+    }
+
     /// `swarm/connect?arg=<multiaddr>` — dial a peer (warm-set forming, master keepalive).
     pub async fn swarm_connect(&self, multiaddr: &str) -> Result<()> {
         self.http

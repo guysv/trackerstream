@@ -72,6 +72,61 @@ func TestRPCBlockPutGetRoundTrip(t *testing.T) {
 	}
 }
 
+// The content-typed providing RPC seam the Rust client drives: provide/track-root and
+// provide/catalog-piece advertise a held CID at the right granularity and tag the pinset kind.
+func TestRPCProvideTrackRootAndCatalogPiece(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	n, err := New(ctx, DefaultConfig(RoleServer, "", 0))
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	defer n.Close()
+	ts := httptest.NewServer(NewRPCServer(n).Handler())
+	defer ts.Close()
+
+	track := rawBlock(t, []byte("a track manifest root"))
+	piece := rawBlock(t, []byte("a catalog page"))
+	if err := n.PutBlock(ctx, track); err != nil {
+		t.Fatalf("put track: %v", err)
+	}
+	if err := n.PutBlock(ctx, piece); err != nil {
+		t.Fatalf("put piece: %v", err)
+	}
+
+	post := func(path, arg string) {
+		t.Helper()
+		resp, err := http.DefaultClient.Post(ts.URL+path+"?arg="+arg, "", nil)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("POST %s: status %d: %s", path, resp.StatusCode, b)
+		}
+		var out struct{ Provided, Kind string }
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		if out.Provided != arg {
+			t.Fatalf("POST %s: Provided=%q want %q", path, out.Provided, arg)
+		}
+	}
+	post("/api/v0/provide/track-root", track.Cid().String())
+	post("/api/v0/provide/catalog-piece", piece.Cid().String())
+
+	kinds := n.Pins().CountByKind()
+	if kinds[KindTrackRoot] != 1 || kinds[KindCatalogPiece] != 1 {
+		t.Fatalf("pinset kinds wrong after provide RPCs: %v", kinds)
+	}
+
+	// A bad CID is a 400, not a panic.
+	resp, _ := http.DefaultClient.Post(ts.URL+"/api/v0/provide/track-root?arg=not-a-cid", "", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad cid should be 400, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 // The full ingest publish contract over the RPC, exactly as repack's KuboRpc drives it:
 // key/gen(catalog) → add(file) → name/publish(/ipfs/<cid>, key=catalog) → routing/get →
 // base64 record. The returned record must be a real signed IPNS record (decodes to the same

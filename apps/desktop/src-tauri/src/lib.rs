@@ -352,6 +352,9 @@ async fn fetch_module(
         .await
         .map_err(|e| format!("fetch_module {root} failed: {e}"))?;
     held.mark(&root, true);
+    // Advertise the track root now that we hold it — peers can fetch the whole track from us
+    // (best-effort; a providing failure must not fail playback).
+    let _ = state.rpc.provide_track_root(&root).await;
     Ok(Response::new(bytes))
 }
 
@@ -381,7 +384,11 @@ async fn start_stream(
     let etx = tx.clone();
     tauri::async_runtime::spawn(async move {
         match ipfs::stream_v2(&rpc, cid, st, tx).await {
-            Ok(()) => held.mark(&root, true),
+            Ok(()) => {
+                held.mark(&root, true);
+                // Advertise the track root now that we hold the stream (best-effort).
+                let _ = rpc.provide_track_root(&root).await;
+            }
             Err(e) => {
                 let _ = etx.send(ipfs::StreamEvent::Error { message: e.to_string() });
             }

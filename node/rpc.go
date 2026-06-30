@@ -49,6 +49,10 @@ func NewRPCServer(n *Node) *RPCServer {
 	s.mux.HandleFunc("/api/v0/bandwidth/by-peer", s.handleBandwidthByPeer)
 	s.mux.HandleFunc("/api/v0/node/status", s.handleNodeStatus)
 	s.mux.HandleFunc("/api/v0/warm", s.handleWarm)
+	// Content-typed providing (clients advertise what they hold): a track manifest root at
+	// whole-track granularity, or an individual catalog page at piece granularity.
+	s.mux.HandleFunc("/api/v0/provide/track-root", s.handleProvideTrackRoot)
+	s.mux.HandleFunc("/api/v0/provide/catalog-piece", s.handleProvideCatalogPiece)
 	return s
 }
 
@@ -164,7 +168,8 @@ func (s *RPCServer) handleCat(w http.ResponseWriter, r *http.Request) {
 	if l := q.Get("length"); l != "" {
 		length, _ = strconv.ParseInt(l, 10, 64)
 	}
-	data, err := s.node.Cat(r.Context(), c, offset, length)
+	// The cat RPC is the catalog read path: advertise the page blocks we fetch (peer page-sharing).
+	data, err := s.node.CatCatalog(r.Context(), c, offset, length)
 	if err != nil {
 		rpcErr(w, http.StatusInternalServerError, err)
 		return
@@ -390,6 +395,34 @@ func (s *RPCServer) handleWarm(w http.ResponseWriter, r *http.Request) {
 	}
 	s.node.Control().Warm(id)
 	writeJSON(w, map[string]any{"Strings": []string{"warm " + id.String()}})
+}
+
+// handleProvideTrackRoot advertises a track manifest root (whole-track granularity).
+func (s *RPCServer) handleProvideTrackRoot(w http.ResponseWriter, r *http.Request) {
+	c, err := cid.Decode(r.URL.Query().Get("arg"))
+	if err != nil {
+		rpcErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.node.ProvideTrackRoot(r.Context(), c); err != nil {
+		rpcErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, map[string]any{"Provided": c.String(), "Kind": "track-root"})
+}
+
+// handleProvideCatalogPiece advertises an individual catalog block (page granularity).
+func (s *RPCServer) handleProvideCatalogPiece(w http.ResponseWriter, r *http.Request) {
+	c, err := cid.Decode(r.URL.Query().Get("arg"))
+	if err != nil {
+		rpcErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.node.ProvideCatalogPiece(r.Context(), c); err != nil {
+		rpcErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, map[string]any{"Provided": c.String(), "Kind": "catalog-piece"})
 }
 
 // readUploadedFile reads the block bytes from a kubo-style multipart upload (the "data"
