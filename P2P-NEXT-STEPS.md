@@ -467,6 +467,20 @@ actually landed):_
 **Ship gate:** NAT'd peers reach each other through peer relays without the master;
 the peers pane shows B↔A traffic, not B↔master. The offload is finally *genuine*.
 
+### R5 — Validated block-forwarding: close the open-relay hole ▶️ designed → [`P2P-FWD.md`](P2P-FWD.md)
+
+The Go rewrite (R4) reached for the stock primitive — reachable clients run
+`EnableRelayService(WithInfiniteLimits())`, i.e. the **standard, open, opaque** circuit-relay
+hop. That reintroduced exactly the abuse R2 spent five milestones avoiding: a music-network
+seeder becomes a free unbounded proxy for the libp2p internet, forwarding traffic it can't see.
+R5 replaces the donor's *bulk-byte* path with a **public, content-addressed forwarding protocol**
+(`/trackerstream/fwd/1.0.0`): a donor does a rate-capped transitive `blockservice.GetBlock` on a
+caller's behalf and streams back the **hash-verified block** — store-and-forward of verifiable
+blocks, never a tunnel. The clamped stock relay stays (DCUtR coordination only); we **ride stock
+HOP** via `EnableAutoRelayWithPeerSource` (holder reservations keep donor↔holder connections warm,
+which bitswap then rides) — **no ACL, no allowlist; safety is structural, not gated.** Full spec,
+wire format, and ship gate in [`P2P-FWD.md`](P2P-FWD.md).
+
 ### R4 — Go everywhere: one `tsnode` binary (dissolve kubo AND rust-ipfs) ✅ SHIPPED
 
 > **Shipped (phases A–D), branch `feat/go-tsnode`; cutover live on prod 2026-06-27/28.** The box and

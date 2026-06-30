@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	ds "github.com/ipfs/go-datastore"
 	"github.com/ipfs/go-cid"
+	ds "github.com/ipfs/go-datastore"
 )
 
 // pinKey namespaces the persisted pinset in the datastore.
@@ -162,6 +162,18 @@ func (n *Node) reprovideLoop(ctx context.Context, interval time.Duration) {
 				cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				if err := n.dht.Provide(cctx, root, true); err != nil {
 					n.logf("reprovide %s failed: %v", root, err)
+				}
+				cancel()
+			}
+			// Donor rendezvous (R5): advertise iff we're a public CLIENT donor (the seed never forwards,
+			// so it never advertises as a donor). Gating each sweep on the LIVE reachability verdict
+			// means a public→private flap simply stops re-advertising on the next sweep — auto-
+			// deadvertise without bookkeeping. NOT added to the pinset (would pollute pin ls /
+			// verify-pinset); providing a CID we don't hold is fine (it's a peer assertion).
+			if n.cfg.Role == RoleClient && n.control.Reachable() == "public" {
+				cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				if err := n.dht.Provide(cctx, donorRendezvous, true); err != nil {
+					n.logf("reprovide donor-rendezvous failed: %v", err)
 				}
 				cancel()
 			}

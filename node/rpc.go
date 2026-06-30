@@ -148,6 +148,8 @@ func (s *RPCServer) handleBlockGet(w http.ResponseWriter, r *http.Request) {
 		rpcErr(w, http.StatusBadRequest, err)
 		return
 	}
+	// n.GetBlock rides the forwarding-assisted exchange (R5) — bitswap with a block-forwarding
+	// fallback when a peer holds it but isn't directly reachable. Same for the catalog cat path.
 	blk, err := s.node.GetBlock(r.Context(), c)
 	if err != nil {
 		rpcErr(w, http.StatusInternalServerError, err)

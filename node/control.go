@@ -62,6 +62,13 @@ func (c *control) start(ctx context.Context) error {
 				c.reachable = ev.Reachability
 				c.mu.Unlock()
 				c.node.logf("reachability → %s", ev.Reachability)
+				// A publicly-reachable CLIENT is now a usable block-forwarding donor — advertise the
+				// rendezvous so NAT'd peers' AutoRelay peer source can find it (R5). The reprovide
+				// loop refreshes it (and stops on a public→private flap). The seed never advertises as
+				// a donor — it doesn't forward.
+				if ev.Reachability == network.ReachabilityPublic && c.node.cfg.Role == RoleClient {
+					c.node.provideNow(donorRendezvous)
+				}
 			}
 		}
 	}()
@@ -183,4 +190,3 @@ func (c *control) keepaliveLoop(ctx context.Context) {
 		}
 	}
 }
-
