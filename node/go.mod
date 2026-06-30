@@ -145,3 +145,5 @@ require (
 // use requires the separate module, so exclude the rc so `core/*` resolves unambiguously
 // to go-libp2p v0.48.0's embedded packages.
 exclude github.com/libp2p/go-libp2p/core v0.43.0-rc2
+
+replace github.com/libp2p/go-libp2p => github.com/guysv/go-libp2p v0.0.0-20260630232212-5dba8cc89b88
