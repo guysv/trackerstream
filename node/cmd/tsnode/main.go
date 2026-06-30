@@ -27,12 +27,14 @@ func main() {
 	swarmPort := flag.Int("swarm-port", envOrInt("TS_SWARM_PORT", 0), "libp2p swarm port (0 = OS-assigned)")
 	rpcAddr := flag.String("rpc", envOr("TS_RPC", "127.0.0.1:5099"), "kubo-compatible RPC listen addr")
 	bootstrap := flag.String("bootstrap", os.Getenv("TS_BOOTSTRAP"), "comma-separated bootstrap multiaddrs")
+	noNATPortMap := flag.Bool("no-natportmap", envOrBool("TS_NO_NATPORTMAP", false), "disable client UPnP/NAT-PMP port mapping (fall back to relay+DCUtR)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	cfg := tsnode.DefaultConfig(tsnode.Role(*role), *repo, *swarmPort)
+	cfg.DisableNATPortMap = *noNATPortMap
 	if *bootstrap != "" {
 		for _, s := range strings.Split(*bootstrap, ",") {
 			if s = strings.TrimSpace(s); s != "" {
@@ -121,6 +123,17 @@ func envOrInt(key string, def int) int {
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
 			return n
 		}
+	}
+	return def
+}
+
+// envOrBool reads a truthy env var (1/true/yes/on, case-insensitive); anything else is false.
+func envOrBool(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
 	}
 	return def
 }
