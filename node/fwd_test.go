@@ -219,8 +219,14 @@ func TestFwdDonorCachesForwardedBlock(t *testing.T) {
 	if _, err := fetcher.FwdFetch(ctx, blk.Cid()); err != nil {
 		t.Fatalf("first fwd: %v", err)
 	}
-	if donor.fwd.cacheGet(blk.Cid()) == nil {
-		t.Fatalf("donor did not cache the forwarded block")
+	if ok, _ := donor.fwdBstore.Has(ctx, blk.Cid()); !ok {
+		t.Fatalf("donor did not cache the forwarded block in the fwd store")
+	}
+	// Phase 0 regression (the leak this design fixes): the donor's transitive fetch must
+	// land ONLY in the bounded fwd store — blockservice would otherwise have persisted it
+	// into the main GC-disabled leveldb forever.
+	if ok, _ := donor.bstore.Has(ctx, blk.Cid()); ok {
+		t.Fatalf("forwarded block leaked into the donor's main blockstore")
 	}
 }
 

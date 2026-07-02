@@ -55,6 +55,11 @@ func NewRPCServer(n *Node) *RPCServer {
 	s.mux.HandleFunc("/api/v0/provide/catalog-piece", s.handleProvideCatalogPiece)
 	// Connect to non-seed providers of a CID so bitswap fetches from peers, not just the seed.
 	s.mux.HandleFunc("/api/v0/dial-providers", s.handleDialProviders)
+	// Playlists (PLAYLISTS.md): docs travel inline on the gossip topic; these are the
+	// desktop's publish / drain / re-announce seams.
+	s.mux.HandleFunc("/api/v0/playlist/publish", s.handlePlaylistPublish)
+	s.mux.HandleFunc("/api/v0/playlist/records", s.handlePlaylistRecords)
+	s.mux.HandleFunc("/api/v0/playlist/announce", s.handlePlaylistAnnounce)
 	return s
 }
 
@@ -330,6 +335,67 @@ func (s *RPCServer) handleNamePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"Name": pid.String(), "Value": "/ipfs/" + c.String()})
+}
+
+// handlePlaylistPublish signs + distributes a playlist doc:
+// `playlist/publish?key=<name>&seq=<n>&lifetime=<dur>` with the raw doc bytes as the
+// body. The node computes the doc's raw-sha256 CID (integrity anchor), signs the IPNS
+// record, DHT-puts the record, and gossips {name, record, doc} inline. Seq is
+// caller-owned (Rust does max(local, network)+1 — seq recovery).
+func (s *RPCServer) handlePlaylistPublish(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	keyName := q.Get("key")
+	if keyName == "" {
+		rpcErr(w, http.StatusBadRequest, fmt.Errorf("playlist/publish: key required"))
+		return
+	}
+	seq, err := strconv.ParseUint(q.Get("seq"), 10, 64)
+	if err != nil {
+		rpcErr(w, http.StatusBadRequest, fmt.Errorf("playlist/publish: seq required: %w", err))
+		return
+	}
+	lifetime := parseDuration(q.Get("lifetime"), 168*time.Hour)
+	doc, err := io.ReadAll(io.LimitReader(r.Body, playlistDocMax+1))
+	if err != nil {
+		rpcErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(doc) > playlistDocMax {
+		rpcErr(w, http.StatusBadRequest, fmt.Errorf("playlist doc exceeds %d bytes", playlistDocMax))
+		return
+	}
+	pid, rec, err := s.node.PublishPlaylist(r.Context(), keyName, doc, lifetime, seq)
+	if err != nil {
+		rpcErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Record rides back base64 (JSON []byte) — Rust keeps it for the re-announce cycle.
+	writeJSON(w, map[string]any{"Name": pid.String(), "Seq": seq, "Record": rec})
+}
+
+// handlePlaylistRecords drains the bounded relay buffer: `playlist/records?since=<v>`
+// returns entries written after store-version v plus the current version (the next
+// poll's cursor). Record/Doc are base64 (JSON []byte); Rust re-verifies both.
+func (s *RPCServer) handlePlaylistRecords(w http.ResponseWriter, r *http.Request) {
+	since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
+	ver, recs := s.node.playlists.since(since)
+	if recs == nil {
+		recs = []PlaylistRecord{}
+	}
+	writeJSON(w, map[string]any{"Version": ver, "Records": recs})
+}
+
+// handlePlaylistAnnounce re-gossips held {record, doc} pairs verbatim with last-seen
+// suppression — the desktop's jittered re-announce cycle feeds playlists.db through
+// here, so late joiners learn the working set without the node holding durable state.
+func (s *RPCServer) handlePlaylistAnnounce(w http.ResponseWriter, r *http.Request) {
+	var entries []PlaylistRecord
+	if err := json.NewDecoder(io.LimitReader(r.Body, 96<<20)).Decode(&entries); err != nil {
+		rpcErr(w, http.StatusBadRequest, fmt.Errorf("playlist/announce: %w", err))
+		return
+	}
+	announced, suppressed, rejected := s.node.AnnouncePlaylists(r.Context(), entries)
+	writeJSON(w, map[string]any{"Announced": announced, "Suppressed": suppressed, "Rejected": rejected})
 }
 
 // handleRoutingGet mirrors kubo `routing/get?arg=/ipns/<name>` — returns the signed record

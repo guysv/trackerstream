@@ -18,7 +18,10 @@ import (
 const (
 	DHTPrefix    protocol.ID = "/trackerstream"
 	CatalogTopic             = "/trackerstream/catalog/1.0.0"
-	PeerProtocol protocol.ID = "/trackerstream/peer/1.0.0"
+	// PlaylistTopic carries {name, signed IPNS record, playlist doc} envelopes — the doc
+	// travels INLINE (no bitswap fetch path exists for playlists); see playlist.go.
+	PlaylistTopic             = "/trackerstream/playlist/1.0.0"
+	PeerProtocol  protocol.ID = "/trackerstream/peer/1.0.0"
 	// FwdProtocol is the public, content-addressed block-forwarding stream (R5; see fwd.go).
 	FwdProtocol protocol.ID = "/trackerstream/fwd/1.0.0"
 )

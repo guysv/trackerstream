@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/ipfs/boxo/ipns"
 	"github.com/ipfs/boxo/path"
 	"github.com/ipfs/go-cid"
@@ -14,26 +15,35 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+// catalogStoreEnts caps the catalog record store. The topic is untrusted: without a cap,
+// any peer minting fresh keys could push validly-signed records for made-up names and
+// grow every node's map forever. The store legitimately holds a handful of names (the
+// catalog key, self), so 512 is generous.
+const catalogStoreEnts = 512
+
 // ipnsStore caches the latest signed record we've published (or pulled) per IPNS name, so
 // `routing/get` can answer from memory and the gossipsub topic can re-broadcast. Records are
 // also written to the DHT (custom-prefix `/ipns` namespace) as the box-down fallback.
+// LRU-bounded (see catalogStoreEnts).
 type ipnsStore struct {
 	mu      sync.RWMutex
-	records map[string][]byte // base58 name → marshaled signed record
+	records *lru.Cache[string, []byte] // base58 name → marshaled signed record
 }
 
-func newIpnsStore() *ipnsStore { return &ipnsStore{records: map[string][]byte{}} }
+func newIpnsStore() *ipnsStore {
+	c, _ := lru.New[string, []byte](catalogStoreEnts)
+	return &ipnsStore{records: c}
+}
 
 func (s *ipnsStore) get(name string) ([]byte, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rec, ok := s.records[name]
-	return rec, ok
+	return s.records.Get(name)
 }
 
 func (s *ipnsStore) put(name string, rec []byte) {
 	s.mu.Lock()
-	s.records[name] = rec
+	s.records.Add(name, rec)
 	s.mu.Unlock()
 }
 
@@ -60,14 +70,14 @@ func (s *ipnsStore) ingestGossip(name string, rec []byte) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cur, ok := s.records[name]; ok {
+	if cur, ok := s.records.Get(name); ok {
 		if curRec, err := ipns.UnmarshalRecord(cur); err == nil {
 			if curSeq, err := curRec.Sequence(); err == nil && curSeq >= inSeq {
 				return nil // not newer — keep what we have
 			}
 		}
 	}
-	s.records[name] = rec
+	s.records.Add(name, rec)
 	return nil
 }
 
@@ -132,6 +142,13 @@ func signIPNS(key crypto.PrivKey, c cid.Cid, lifetime time.Duration, seq uint64)
 func (n *Node) ResolveIPNS(ctx context.Context, name string) ([]byte, error) {
 	if rec, ok := n.ipns.get(name); ok {
 		return rec, nil
+	}
+	// Playlist names resolve from the playlist buffer too (seq recovery reads its own
+	// name via routing/get before every publish; see PLAYLISTS.md §1).
+	if n.playlists != nil {
+		if rec, ok := n.playlists.getRecord(name); ok {
+			return rec, nil
+		}
 	}
 	pid, err := peer.Decode(name)
 	if err != nil {
