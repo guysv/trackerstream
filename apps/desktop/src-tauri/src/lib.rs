@@ -452,9 +452,14 @@ async fn get_sample(root: String, index: u32, streams: State<'_, Streams>) -> Re
     Ok(Response::new(data))
 }
 
+/// Reveal the app's log directory (where tauri-plugin-log writes `trackerstream.log`), so a
+/// user can grab the file for a bug report without running the app from a terminal.
 #[tauri::command]
-fn debug_log(line: String) {
-    eprintln!("[UIDBG] {line}");
+fn open_logs_dir(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -466,7 +471,33 @@ fn set_playhead(root: String, order: u32, streams: State<'_, Streams>) -> Result
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The client log hub: everything routed through the `log` facade (backend, frontend via
+    // the plugin's JS API, tsnode sidecar output via sidecar.rs) lands in one rotating file
+    // in the OS app-log dir (macOS: ~/Library/Logs/xyz.trackerstream/) plus stdout for dev.
+    // TS_LOG=error|warn|info|debug|trace overrides the level (default: debug in dev builds,
+    // info in release) — a runtime knob, no rebuild needed.
+    let level = std::env::var("TS_LOG")
+        .ok()
+        .and_then(|v| v.parse::<log::LevelFilter>().ok())
+        .unwrap_or(if cfg!(debug_assertions) {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        });
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(level)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("trackerstream".into()),
+                    }),
+                ])
+                .max_file_size(2_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         // Deep links: trackerstream://share/<code> (E2).
         .plugin(tauri_plugin_deep_link::init())
@@ -494,7 +525,7 @@ pub fn run() {
             let peer_id = tauri::async_runtime::block_on(rpc.id())
                 .map_err(|e| format!("tsnode id: {e}"))?
                 .id;
-            eprintln!("[tsnode] sidecar up, peer={peer_id}, rpc={}", sc.rpc_addr());
+            log::info!("sidecar up, peer={peer_id}, rpc={}", sc.rpc_addr());
 
             app.manage(NodeState { rpc, peer_id });
             app.manage(sc); // keep the child alive for the app's lifetime
@@ -516,7 +547,7 @@ pub fn run() {
             get_skeleton,
             get_sample,
             set_playhead,
-            debug_log
+            open_logs_dir
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

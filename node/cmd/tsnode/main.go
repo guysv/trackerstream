@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,6 +22,11 @@ func main() {
 		importKeyCmd(os.Args[2:])
 		return
 	}
+
+	// Drop the stdlib log timestamp: every consumer of our output supplies its own (journald
+	// on the server, the desktop app's log file via tauri-plugin-log on the client), so the
+	// Go-side one only double-stamps every line.
+	log.SetFlags(0)
 
 	role := flag.String("role", envOr("TS_ROLE", "client"), "node role: server|client")
 	repo := flag.String("repo", envOr("TS_REPO", os.Getenv("IPFS_PATH")), "data dir (blockstore + identity.key); empty = ephemeral")

@@ -1,7 +1,12 @@
 <script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
   import { peers, selection, selectPeer } from "$lib/peers.svelte";
   import { fmtBytes } from "$lib/format";
   import PeerDetail from "./PeerDetail.svelte";
+
+  function openLogs(): void {
+    void invoke("open_logs_dir").catch(() => {});
+  }
 
   const rate = (n: number): string => `${fmtBytes(n)}/s`;
   const short = (id: string): string => (id.length > 16 ? `${id.slice(0, 6)}…${id.slice(-6)}` : id);
@@ -45,6 +50,7 @@
     >
       <span class="rdot"></span>{reachLabel(peers.reachable)}
     </span>
+    <button class="logs" onclick={openLogs} title="open the app log folder">logs</button>
   </div>
 
   <div class="bw">
@@ -135,6 +141,21 @@
     border-radius: 50%;
     background: currentColor;
     flex: none;
+  }
+  .logs {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--dim);
+    font: inherit;
+    font-size: 10px;
+    text-transform: lowercase;
+    padding: 0.05rem 0.35rem;
+    cursor: pointer;
+  }
+  .logs:hover {
+    color: var(--fg);
+    border-color: var(--dim);
   }
   .bw {
     display: grid;

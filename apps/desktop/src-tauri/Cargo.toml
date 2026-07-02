@@ -26,6 +26,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+# Client logging hub: every layer (frontend dbg, Rust backend, tsnode sidecar output) funnels
+# through the `log` facade into a rotating file in the OS app-log dir, so a user can hand us
+# logs without running the app from a terminal. Level via TS_LOG (default info; debug in dev).
+tauri-plugin-log = "2"
+log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-deep-link = "2"
@@ -52,8 +57,6 @@ serde_ipld_dagcbor = "0.6"
 # client retry in lockstep, a synchronized herd against the master rcmgr during a
 # correlated outage. See P2P-NEXT-STEPS Phase 0.
 rand = "0.9"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing = "0.1"
 # Catalog-over-IPNS lazy query (R1): a read-only SQLite VFS that serves DB pages over
 # Bitswap so a client fetches only the pages a query touches, not the whole catalog.
 # `bundled` statically links one SQLite (FTS5 on by default); sqlite-vfs has NO
