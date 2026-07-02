@@ -300,14 +300,20 @@ impl Playlists {
         Ok(())
     }
 
-    /// Seq recovery (PLAYLISTS.md §1): `max(local, network) + 1`, so a lost DB with an
-    /// intact keystore can never publish a stale sequence the network silently drops.
+    /// Seq recovery (PLAYLISTS.md §1): `max(local, gossip-buffer) + 1`. Playlists are
+    /// pubsub-only — no DHT — so `routing/get` answers from the node's gossip-warmed
+    /// buffer; it covers a re-imported key whose history arrived via re-announce. A
+    /// never-published playlist (local seq 0) skips the lookup: its key is fresh, there
+    /// is nothing to recover, and the miss would just walk the DHT to a timeout.
     async fn next_seq(&self, name: &str, local_seq: i64) -> u64 {
+        if local_seq <= 0 {
+            return 1;
+        }
         let net_seq = match self.rpc.routing_get(name).await {
             Ok(rec) => ipns::verify_b64_seq(name, &rec).map(|(_, s)| s).unwrap_or(0),
             Err(_) => 0,
         };
-        (local_seq.max(0) as u64).max(net_seq) + 1
+        (local_seq as u64).max(net_seq) + 1
     }
 
     // -- CRUD (Tauri command backends) --
