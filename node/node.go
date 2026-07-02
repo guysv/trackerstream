@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/ipfs/boxo/bitswap"
 	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	"github.com/ipfs/boxo/blockservice"
@@ -51,7 +52,8 @@ type Node struct {
 	ds        ds.Batching
 	keystore  *Keystore
 	ipns      *ipnsStore
-	playlists *playlistStore // bounded playlist relay buffer + announce-suppression ledger
+	playlists *playlistStore                  // bounded playlist relay buffer + announce-suppression ledger
+	plLims    *lru.Cache[peer.ID, *plLimiter] // per-peer playlist-topic rate buckets (first-hop flood cap)
 	pubsub    *PubSub
 	pins      *Pinset
 	control   *control
@@ -258,6 +260,7 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		// Playlist docs are buffered on CLIENTS only: the seed forwards playlist gossip
 		// (it must subscribe to relay the mesh) but saves records alone — never content.
 		playlists: newPlaylistStore(cfg.Role == RoleClient),
+		plLims:    mustLRU[peer.ID, *plLimiter](plPeerLims),
 		pubsub:    ps,
 		pins:      pins,
 		fwd:       newFwdState(),

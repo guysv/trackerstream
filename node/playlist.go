@@ -16,11 +16,13 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/ipfs/boxo/ipns"
 	"github.com/ipfs/go-cid"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 	mh "github.com/multiformats/go-multihash"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -37,7 +39,50 @@ var (
 	// jitter fires first wins, so steady state converges to ~one announce per playlist
 	// per window network-wide instead of holders × playlists.
 	playlistAnnounceWindow = 10 * time.Minute
+
+	// Per-peer playlist-topic rate caps, charged against the peer we RECEIVED from
+	// (first hop): a flood dies at the spammer's own neighbors and never rides the
+	// mesh, while honest relays are never penalized for others' traffic. Bursts are
+	// sized for a whole-library announce (hundreds of messages back-to-back is a
+	// legitimate pattern); sustained rates are what a spammer is pinned to. Sybils
+	// dodge per-peer buckets by minting connections — the bounded stores and the
+	// validator's self-certification remain the real backstop (same doctrine as
+	// fwd.go's limiter).
+	plPeerMsgRate   = rate.Limit(2)         // sustained messages/s per peer
+	plPeerMsgBurst  = 512                   // whole-library announce burst
+	plPeerByteRate  = rate.Limit(256 << 10) // sustained bytes/s per peer
+	plPeerByteBurst = 16 << 20              // a burst of fat (≤1 MiB) docs
 )
+
+const plPeerLims = 4096 // bounded per-peer limiter table (else a Sybil bloats it)
+
+// mustLRU is lru.New minus the impossible error (it only fails on size <= 0).
+func mustLRU[K comparable, V any](size int) *lru.Cache[K, V] {
+	c, _ := lru.New[K, V](size)
+	return c
+}
+
+// plLimiter pairs the two per-peer buckets: message count and payload bytes.
+type plLimiter struct {
+	msgs  *rate.Limiter
+	bytes *rate.Limiter
+}
+
+// plAllow charges one message of `size` bytes against `from`'s buckets. Both must pass;
+// a denied message is Ignored (dropped, unforwarded) rather than Rejected — rate policy
+// is not a protocol violation, and the sender may be an honest node under load.
+func (n *Node) plAllow(from peer.ID, size int) bool {
+	l, ok := n.plLims.Get(from)
+	if !ok {
+		l = &plLimiter{
+			msgs:  rate.NewLimiter(plPeerMsgRate, plPeerMsgBurst),
+			bytes: rate.NewLimiter(plPeerByteRate, plPeerByteBurst),
+		}
+		n.plLims.Add(from, l)
+	}
+	now := time.Now()
+	return l.msgs.AllowN(now, 1) && l.bytes.AllowN(now, size)
+}
 
 // ---- gossip envelope ----
 
@@ -243,8 +288,13 @@ func (s *playlistStore) shouldAnnounce(name string) bool {
 // playlistValidator is the gossipsub topic validator: full self-certification at the
 // mesh edge. Reject = dropped at the FIRST hop and never forwarded (and the sender is
 // penalized by gossipsub's peer scoring) — unlike the catalog path, where validation
-// happens after the mesh has already relayed the message.
-func (n *Node) playlistValidator(_ context.Context, _ peer.ID, m *pubsub.Message) pubsub.ValidationResult {
+// happens after the mesh has already relayed the message. Rate policy runs FIRST
+// (before any decode work) and Ignores rather than Rejects; our own publishes are
+// exempt (a whole-library announce must not throttle itself).
+func (n *Node) playlistValidator(_ context.Context, from peer.ID, m *pubsub.Message) pubsub.ValidationResult {
+	if from != n.host.ID() && !n.plAllow(from, len(m.Data)) {
+		return pubsub.ValidationIgnore
+	}
 	name, rec, doc, err := decodePlaylistMsg(m.Data)
 	if err != nil {
 		return pubsub.ValidationReject
