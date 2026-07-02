@@ -102,6 +102,10 @@ pub struct PlaylistMeta {
     pub is_mine: bool,
     pub held: bool,
     pub published: bool,
+    /// Foreign playlist whose record has passed EOL: still playable and held, but no
+    /// longer propagating (nobody can re-announce it) until its author re-signs. The
+    /// UI nudges toward "duplicate to mine" (fork under a living key).
+    pub dormant: bool,
     pub size_bytes: i64,
     pub last_update_at: i64,
     pub last_played_at: Option<i64>,
@@ -172,8 +176,10 @@ impl Playlists {
                name TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (name, seq)
              );",
         )?;
-        // Migration for pre-holder DBs: add `held` if missing (duplicate-column = fine).
+        // Migrations for older DBs (duplicate-column errors = already applied, fine).
         let _ = conn.execute("ALTER TABLE playlists ADD COLUMN held INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE playlists ADD COLUMN eol INTEGER NOT NULL DEFAULT 0", []);
+        backfill_eol(&conn);
         let budget = std::env::var("TS_PLAYLIST_BUDGET_MB")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
@@ -234,7 +240,7 @@ impl Playlists {
             db.execute("DELETE FROM playlists_fts WHERE name=?1", params![w.name])?;
             return Ok(true);
         }
-        upsert_row(&db, &w.name, &doc, &doc_bytes, Some(&w.record), seq as i64)?;
+        upsert_row(&db, &w.name, &doc, &doc_bytes, Some(&w.record), seq as i64, record_eol_secs(&w.record))?;
         Ok(true)
     }
 
@@ -302,8 +308,8 @@ impl Playlists {
         }
         let db = self.db.lock().unwrap();
         db.execute(
-            "UPDATE playlists SET seq=?2, published=1, record_b64=?3, last_update_at=?4 WHERE name=?1",
-            params![name, seq as i64, record, now_secs()],
+            "UPDATE playlists SET seq=?2, published=1, record_b64=?3, last_update_at=?4, eol=?5 WHERE name=?1",
+            params![name, seq as i64, record, now_secs(), record_eol_secs(&record)],
         )?;
         Ok(())
     }
@@ -345,7 +351,7 @@ impl Playlists {
         validate_doc(&bytes)?;
         {
             let db = self.db.lock().unwrap();
-            upsert_row(&db, &name, &doc, &bytes, None, 0)?;
+            upsert_row(&db, &name, &doc, &bytes, None, 0, 0)?;
             db.execute(
                 "UPDATE playlists SET is_mine=1, key_name=?2 WHERE name=?1",
                 params![name, key_name],
@@ -377,7 +383,7 @@ impl Playlists {
         validate_doc(&bytes)?;
         {
             let db = self.db.lock().unwrap();
-            upsert_row(&db, name, &doc, &bytes, None, -1)?;
+            upsert_row(&db, name, &doc, &bytes, None, -1, -1)?;
         }
         if published {
             self.publish(name).await?;
@@ -438,7 +444,7 @@ impl Playlists {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(
             "SELECT p.name, p.title, p.doc_json, p.is_mine, p.held, p.published, p.size_bytes,
-                    p.last_update_at, p.last_played_at
+                    p.last_update_at, p.last_played_at, p.eol
              FROM playlists_fts f JOIN playlists p ON p.name = f.name
              WHERE playlists_fts MATCH ?1
              ORDER BY bm25(playlists_fts) LIMIT 200",
@@ -458,7 +464,7 @@ impl Playlists {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(&format!(
             "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
-                    last_update_at, last_played_at
+                    last_update_at, last_played_at, eol
              FROM playlists {filter} ORDER BY is_mine DESC, held DESC, last_update_at DESC LIMIT 500",
         ))?;
         let rows = stmt.query_map([], row_meta)?;
@@ -481,7 +487,7 @@ impl Playlists {
         let row = db
             .query_row(
                 "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
-                        last_update_at, last_played_at
+                        last_update_at, last_played_at, eol
                  FROM playlists WHERE name=?1",
                 params![name],
                 row_meta,
@@ -620,6 +626,33 @@ impl Playlists {
     }
 }
 
+/// The record's EOL as unix seconds (0 if it can't be decoded) — stored per row at
+/// ingest/publish so list queries can flag dormancy without decoding records.
+fn record_eol_secs(record_b64: &str) -> i64 {
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(record_b64.trim()) else {
+        return 0;
+    };
+    let Ok(rec) = rust_ipns::Record::decode(&bytes) else { return 0 };
+    rec.validity().map(|v| v.timestamp()).unwrap_or(0)
+}
+
+/// One-time backfill for rows from before the `eol` column existed.
+fn backfill_eol(db: &Connection) {
+    let rows: Vec<(String, String)> = db
+        .prepare("SELECT name, record_b64 FROM playlists WHERE eol=0 AND record_b64 IS NOT NULL")
+        .and_then(|mut st| {
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+    for (name, rec) in rows {
+        let _ = db.execute(
+            "UPDATE playlists SET eol=?2 WHERE name=?1",
+            params![name, record_eol_secs(&rec)],
+        );
+    }
+}
+
 /// Whether a (verified) own record is within the renewal margin of its EOL.
 fn record_near_eol(record_b64: &str) -> bool {
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(record_b64.trim()) else {
@@ -642,6 +675,7 @@ fn upsert_row(
     doc_bytes: &[u8],
     record_b64: Option<&str>,
     seq: i64,
+    eol: i64,
 ) -> rusqlite::Result<()> {
     let tracks_text: String = doc
         .ts
@@ -650,13 +684,14 @@ fn upsert_row(
         .collect::<Vec<_>>()
         .join(" ");
     db.execute(
-        "INSERT INTO playlists(name, title, doc_json, record_b64, seq, size_bytes, last_update_at)
-         VALUES(?1, ?2, ?3, ?4, MAX(?5, 0), ?6, ?7)
+        "INSERT INTO playlists(name, title, doc_json, record_b64, seq, size_bytes, last_update_at, eol)
+         VALUES(?1, ?2, ?3, ?4, MAX(?5, 0), ?6, ?7, MAX(?8, 0))
          ON CONFLICT(name) DO UPDATE SET
            title=excluded.title,
            doc_json=excluded.doc_json,
            record_b64=COALESCE(excluded.record_b64, playlists.record_b64),
            seq=CASE WHEN ?5 < 0 THEN playlists.seq ELSE ?5 END,
+           eol=CASE WHEN ?8 < 0 THEN playlists.eol ELSE ?8 END,
            size_bytes=excluded.size_bytes,
            last_update_at=excluded.last_update_at",
         params![
@@ -666,7 +701,8 @@ fn upsert_row(
             record_b64,
             seq,
             doc_bytes.len() as i64,
-            now_secs()
+            now_secs(),
+            eol
         ],
     )?;
     db.execute("DELETE FROM playlists_fts WHERE name=?1", params![name])?;
@@ -682,13 +718,18 @@ fn row_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistMeta> {
     let tracks = serde_json::from_str::<PlaylistDoc>(&doc_json)
         .map(|d| d.ts.len() as i64)
         .unwrap_or(0);
+    let is_mine = r.get::<_, i64>(3)? != 0;
+    let eol: i64 = r.get(9)?;
     Ok(PlaylistMeta {
         name: r.get(0)?,
         title: r.get(1)?,
         tracks,
-        is_mine: r.get::<_, i64>(3)? != 0,
+        is_mine,
         held: r.get::<_, i64>(4)? != 0,
         published: r.get::<_, i64>(5)? != 0,
+        // Mine rows auto-renew on the announce cycle, so dormancy is a foreign-row
+        // concept: record present, EOL known, and passed.
+        dormant: !is_mine && eol > 0 && eol < now_secs(),
         size_bytes: r.get(6)?,
         last_update_at: r.get(7)?,
         last_played_at: r.get(8)?,
@@ -936,6 +977,27 @@ mod tests {
         pl.decay_expired();
         assert!(pl.get(&w1.name).unwrap().is_some(), "held row must survive decay");
         assert!(pl.get(&w2.name).unwrap().is_none(), "unbacked row must decay at record EOL");
+    }
+
+    // Dormancy: a foreign row whose stored EOL has passed is flagged (still playable,
+    // no longer propagating); fresh records and own rows are never dormant.
+    #[test]
+    fn dormant_flags_expired_foreign_rows() {
+        let pl = mem();
+        let kp = Keypair::generate_ed25519();
+        let w = wire_for(&kp, &doc_bytes("sleepy"), 1);
+        pl.ingest_wire(&w).unwrap();
+        assert!(!pl.get(&w.name).unwrap().unwrap().meta.dormant, "fresh record is not dormant");
+        {
+            let db = pl.db.lock().unwrap();
+            db.execute("UPDATE playlists SET eol=1 WHERE name=?1", params![w.name]).unwrap();
+        }
+        assert!(pl.get(&w.name).unwrap().unwrap().meta.dormant, "expired foreign row is dormant");
+        {
+            let db = pl.db.lock().unwrap();
+            db.execute("UPDATE playlists SET is_mine=1 WHERE name=?1", params![w.name]).unwrap();
+        }
+        assert!(!pl.get(&w.name).unwrap().unwrap().meta.dormant, "own rows auto-renew — never dormant");
     }
 
     #[test]

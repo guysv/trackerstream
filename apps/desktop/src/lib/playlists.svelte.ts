@@ -13,6 +13,9 @@ export interface PlaylistMeta {
   isMine: boolean;
   held: boolean;
   published: boolean;
+  /** Record passed its EOL and only the author can re-sign: still playable, no longer
+   * propagating. The UI nudges toward "duplicate to mine". */
+  dormant: boolean;
   sizeBytes: number;
   lastUpdateAt: number;
   lastPlayedAt: number | null;
