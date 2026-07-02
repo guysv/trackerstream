@@ -19,18 +19,30 @@
   let confirmDelete = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
+  let loadedFor: string | null = null; // last name a fetch completed for (not reactive)
 
   $effect(() => {
     const cur = name;
-    void plState.version;
-    detail = null;
-    confirmShare = false;
-    confirmDelete = false;
-    error = null;
-    if (!cur) return;
+    void plState.version; // re-fetch on mutations AND the periodic sync tick
+    if (!cur) {
+      detail = null;
+      loadedFor = null;
+      return;
+    }
+    if (cur !== loadedFor) {
+      // Switching playlists: clear immediately. A same-name refresh (the 10s sync
+      // tick) keeps the current detail on screen and swaps in place — no flicker.
+      detail = null;
+      confirmShare = false;
+      confirmDelete = false;
+      error = null;
+    }
     plGet(cur)
       .then((d) => {
-        if (name === cur) detail = d;
+        if (name === cur) {
+          detail = d;
+          loadedFor = cur;
+        }
       })
       .catch((e) => (error = String(e)));
   });
