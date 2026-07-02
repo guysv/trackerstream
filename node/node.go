@@ -39,21 +39,24 @@ import (
 // Kademlia DHT, plus boxo's bitswap + blockstore data plane. Higher layers (gossipsub
 // IPNS, unixfs cat, the RPC, the control plane) build on this.
 type Node struct {
-	cfg      Config
-	host     host.Host
-	dht      *dht.IpfsDHT
-	bswap    *bitswap.Bitswap
-	bstore   blockstore.Blockstore
-	bserv    blockservice.BlockService
-	bwc      *metrics.BandwidthCounter
-	ds       ds.Batching
-	keystore *Keystore
-	ipns     *ipnsStore
-	pubsub   *PubSub
-	pins     *Pinset
-	control  *control
-	fwd      *fwdState            // block-forwarding donor state (rate cap + bounded cache)
-	seeds    map[peer.ID]struct{} // bootstrap (seed) peer IDs — excluded from peer-provider dialing
+	cfg       Config
+	host      host.Host
+	dht       *dht.IpfsDHT
+	bswap     *bitswap.Bitswap
+	bstore    blockstore.Blockstore
+	bserv     blockservice.BlockService
+	fwdBstore blockstore.Blockstore     // bounded (entries+TTL) donor-fetch store — never the main leveldb
+	fwdServ   blockservice.BlockService // donor path: reads main→fwd, writes fwd, raw bitswap
+	bwc       *metrics.BandwidthCounter
+	ds        ds.Batching
+	keystore  *Keystore
+	ipns      *ipnsStore
+	playlists *playlistStore // bounded playlist relay buffer + announce-suppression ledger
+	pubsub    *PubSub
+	pins      *Pinset
+	control   *control
+	fwd       *fwdState            // block-forwarding donor state (rate cap + bounded cache)
+	seeds     map[peer.ID]struct{} // bootstrap (seed) peer IDs — excluded from peer-provider dialing
 }
 
 // logf is the node's structured-ish log sink (stderr). Kept trivial; the deploy captures
@@ -104,7 +107,7 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
 		libp2p.BandwidthReporter(bwc),
-		libp2p.EnableNATService(),   // AutoNAT (reachability)
+		libp2p.EnableNATService(),                                   // AutoNAT (reachability)
 		libp2p.EnableHolePunching(holepunch.WithTracer(hpTracer{})), // DCUtR (+ per-attempt trace)
 		libp2p.Routing(func(h host.Host) (routing.PeerRouting, error) {
 			// Server is always public → forced ModeServer (deterministic, no AutoNAT wait).
@@ -200,16 +203,31 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	}
 
 	bstore := blockstore.NewBlockstore(datastore)
+	// Bounded donor-fetch store (Phase 0, PLAYLISTS.md §3): forwarded blocks land here —
+	// NEVER in the main GC-disabled leveldb. Same entry+TTL semantics as the old fwd LRU,
+	// behind the Blockstore interface so a blockservice can write to it.
+	fwdBstore := newLRUBlockstore(fwdCacheSize, fwdCacheTTL)
 	net := bsnet.NewFromIpfsHost(h)
-	// Bitswap serves from the blockstore AND fetches; the DHT is the content router for
-	// provider discovery, but wants also broadcast to connected peers (the offload path).
-	bswap := bitswap.New(ctx, net, idht, bstore)
+	// Bitswap serves from main ∪ fwd (donor-cached blocks are servable to peers) AND fetches;
+	// the DHT is the content router for provider discovery, but wants also broadcast to
+	// connected peers (the offload path).
+	bswap := bitswap.New(ctx, net, idht, &tieredBlockstore{
+		read:  []blockstore.Blockstore{bstore, fwdBstore},
+		write: bstore,
+	})
 	// Wrap the exchange so EVERY blockservice fetch (block/get, batch, and the catalog DAG-walk
 	// sessions) gains the block-forwarding fallback (R5) — one chokepoint, not per-handler. The donor's
 	// own transitive fetch passes a no-forward context to stay raw. `fex.n` is late-bound below (the
 	// node doesn't exist yet); no fetch runs until New returns.
 	fex := &fwdExchange{SessionExchange: bswap}
 	bserv := blockservice.New(bstore, fex)
+	// Donor-path blockservice (fwdServe): reads main→fwd, WRITES fwd (bounded), and rides the
+	// RAW bitswap exchange — never fex — so serving a Fetch can structurally never trigger
+	// another Fetch (anti-amplification by construction; ctxNoForward remains belt-and-braces).
+	fwdServ := blockservice.New(&tieredBlockstore{
+		read:  []blockstore.Blockstore{bstore, fwdBstore},
+		write: fwdBstore,
+	}, bswap)
 
 	keystore, err := NewKeystore(cfg.RepoPath)
 	if err != nil {
@@ -225,20 +243,25 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:      cfg,
-		host:     h,
-		dht:      idht,
-		bswap:    bswap,
-		bstore:   bstore,
-		bserv:    bserv,
-		bwc:      bwc,
-		ds:       datastore,
-		keystore: keystore,
-		ipns:     newIpnsStore(),
-		pubsub:   ps,
-		pins:     pins,
-		fwd:      newFwdState(),
-		seeds:    map[peer.ID]struct{}{},
+		cfg:       cfg,
+		host:      h,
+		dht:       idht,
+		bswap:     bswap,
+		bstore:    bstore,
+		bserv:     bserv,
+		fwdBstore: fwdBstore,
+		fwdServ:   fwdServ,
+		bwc:       bwc,
+		ds:        datastore,
+		keystore:  keystore,
+		ipns:      newIpnsStore(),
+		// Playlist docs are buffered on CLIENTS only: the seed forwards playlist gossip
+		// (it must subscribe to relay the mesh) but saves records alone — never content.
+		playlists: newPlaylistStore(cfg.Role == RoleClient),
+		pubsub:    ps,
+		pins:      pins,
+		fwd:       newFwdState(),
+		seeds:     map[peer.ID]struct{}{},
 	}
 	for _, ai := range bootstrap {
 		n.seeds[ai.ID] = struct{}{}
@@ -265,6 +288,12 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	})
 	if err := n.pubsub.SubscribeCatalog(ctx); err != nil {
 		return nil, fmt.Errorf("catalog subscribe: %w", err)
+	}
+	// Playlist topic (PLAYLISTS.md): validator makes every message self-certifying at the
+	// first hop (signature + EOL + doc-hash-vs-CID); the sink fills the bounded relay
+	// buffer that the desktop drains via `playlist/records`.
+	if err := n.pubsub.SetupPlaylist(ctx, n.playlistValidator, n.playlistSink); err != nil {
+		return nil, fmt.Errorf("playlist topic: %w", err)
 	}
 	// Reprovide pinned roots to the custom DHT (Provide.Strategy=roots; 22h in prod). The loop also
 	// advertises the donor rendezvous (R5) while this node is a public CLIENT donor — the seed never

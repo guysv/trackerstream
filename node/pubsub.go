@@ -11,12 +11,14 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// PubSub wraps gossipsub for the catalog topic we own: signed IPNS records pushed
-// publish-style — kills the per-search resolve round-trip. Because both ends run our binary
-// on a topic we name, this is fully under our control.
+// PubSub wraps gossipsub for the topics we own: the catalog topic (signed IPNS records
+// pushed publish-style — kills the per-search resolve round-trip) and the playlist topic
+// (signed records with the playlist doc INLINE; see playlist.go). Because both ends run
+// our binary on topics we name, the envelopes are fully under our control.
 type PubSub struct {
-	ps      *pubsub.PubSub
-	catalog *pubsub.Topic
+	ps       *pubsub.PubSub
+	catalog  *pubsub.Topic
+	playlist *pubsub.Topic
 
 	mu       sync.Mutex
 	onRecord func(name string, record []byte) // catalog-record sink (the client IPNS cache)
@@ -30,7 +32,9 @@ type catalogMsg struct {
 }
 
 func newPubSub(ctx context.Context, h host.Host) (*PubSub, error) {
-	ps, err := pubsub.NewGossipSub(ctx, h)
+	// 2 MiB max message: a max-size playlist doc (1 MiB, validator-capped) + record +
+	// envelope framing must fit; the gossipsub default is 1 MiB.
+	ps, err := pubsub.NewGossipSub(ctx, h, pubsub.WithMaxMessageSize(2<<20))
 	if err != nil {
 		return nil, err
 	}
@@ -39,6 +43,50 @@ func newPubSub(ctx context.Context, h host.Host) (*PubSub, error) {
 		return nil, fmt.Errorf("join catalog topic: %w", err)
 	}
 	return p, nil
+}
+
+// SetupPlaylist registers the playlist topic validator, joins the topic, and starts
+// draining it into sink. Validator BEFORE Join, so nothing unvalidated ever enters.
+// ALL roles subscribe — gossipsub only forwards on subscribed topics, so the seed's
+// subscription IS its "forward but don't save" role (its sink stores records only).
+func (p *PubSub) SetupPlaylist(ctx context.Context, val pubsub.ValidatorEx, sink func(name string, rec, doc []byte)) error {
+	if err := p.ps.RegisterTopicValidator(PlaylistTopic, val); err != nil {
+		return fmt.Errorf("playlist validator: %w", err)
+	}
+	t, err := p.ps.Join(PlaylistTopic)
+	if err != nil {
+		return fmt.Errorf("join playlist topic: %w", err)
+	}
+	p.playlist = t
+	sub, err := t.Subscribe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		defer sub.Cancel()
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return // ctx cancelled / topic closed
+			}
+			// The validator already accepted this message; decode cannot fail here
+			// short of a race on tunables, so a failure is just dropped.
+			if name, rec, doc, err := decodePlaylistMsg(msg.Data); err == nil {
+				sink(name, rec, doc)
+			}
+		}
+	}()
+	return nil
+}
+
+// PublishPlaylist pushes an encoded {name, record, doc} envelope onto the playlist topic.
+// The local validator runs on our own publishes too — an invalid envelope errors here
+// instead of entering the mesh.
+func (p *PubSub) PublishPlaylist(ctx context.Context, data []byte) error {
+	if p.playlist == nil {
+		return fmt.Errorf("playlist topic not set up")
+	}
+	return p.playlist.Publish(ctx, data)
 }
 
 // OnCatalogRecord registers the sink invoked for every valid-shaped catalog message received

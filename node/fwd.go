@@ -16,7 +16,6 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
-	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/ipfs/boxo/exchange"
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
@@ -31,7 +30,7 @@ import (
 const (
 	fwdMaxFrame  = 4 << 20 // bound the reader: fits any block, caps a malicious varint length prefix
 	fwdMaxCids   = 256     // max CIDs per Fetch (bounds donor fan-out)
-	fwdCacheSize = 512     // forwarded-block cache entries (bounded — the node runs GC-disabled)
+	fwdCacheSize = 512     // fwd blockstore entries (bounded — the node runs GC-disabled; see storeviews.go)
 	fwdGlobalSem = 32      // global concurrent transitive fetches on the DONOR (the real Sybil backstop)
 	fwdPeerLims  = 4096    // bounded per-peer limiter table (else a Sybil bloats it)
 	fwdProvSeen  = 256     // bounded set of discovered content providers (forwarding-suppression input)
@@ -50,13 +49,14 @@ const (
 // Tunables kept as vars so tests can shrink them.
 var (
 	fwdServeTimeout = 15 * time.Second // donor per-cid GetBlock bound + stream deadline
-	fwdCacheTTL     = 2 * time.Minute  // forwarded-block cache entry lifetime
+	fwdCacheTTL     = 2 * time.Minute  // fwd blockstore entry lifetime
 )
 
-// fwdState holds the donor-side rate cap + forwarded-block cache, plus the set of discovered content
-// providers used to suppress forwarding once a hole-punch lands. Built in New().
+// fwdState holds the donor-side rate cap + the set of discovered content providers used to
+// suppress forwarding once a hole-punch lands. Built in New(). The forwarded-block cache
+// is n.fwdBstore (a bounded lruBlockstore) — the write target of n.fwdServ, so the donor's
+// transitive fetches are cached there by blockservice itself, never in the main leveldb.
 type fwdState struct {
-	cache *expirable.LRU[string, []byte]     // cid.KeyString() → raw block; size + TTL bounded
 	sem   chan struct{}                      // donor-side global concurrent-fetch semaphore
 	out   chan struct{}                      // caller-side outbound-forward semaphore (fan-out cap)
 	lims  *lru.Cache[peer.ID, *rate.Limiter] // per-peer token buckets, bounded
@@ -67,7 +67,6 @@ func newFwdState() *fwdState {
 	lims, _ := lru.New[peer.ID, *rate.Limiter](fwdPeerLims)
 	provs, _ := lru.New[peer.ID, struct{}](fwdProvSeen)
 	return &fwdState{
-		cache: expirable.NewLRU[string, []byte](fwdCacheSize, nil, fwdCacheTTL),
 		sem:   make(chan struct{}, fwdGlobalSem),
 		out:   make(chan struct{}, fwdOutSem),
 		lims:  lims,
@@ -90,22 +89,14 @@ func (f *fwdState) allow(p peer.ID, n int) bool {
 	return l.AllowN(time.Now(), n)
 }
 
-func (f *fwdState) cacheGet(c cid.Cid) []byte {
-	if v, ok := f.cache.Get(c.KeyString()); ok {
-		return v
-	}
-	return nil
-}
-
-func (f *fwdState) cachePut(c cid.Cid, data []byte) { f.cache.Add(c.KeyString(), data) }
-
 // fwdRequest is the single request frame (JSON): the caller's wanted CIDs.
 type fwdRequest struct {
 	Cids []string `json:"cids"`
 }
 
-// handleFwd is the donor side. INVARIANT: it calls plain n.GetBlock — NEVER GetBlockAssisted —
-// or a Fetch to A would trigger A→B→C… transitive forwarding recursion.
+// handleFwd is the donor side. INVARIANT: it fetches via n.fwdServ, which rides the RAW
+// bitswap exchange — never the assisted one — so a Fetch to A can structurally never
+// trigger A→B→C… transitive forwarding recursion.
 func (n *Node) handleFwd(s network.Stream) {
 	defer s.Close()
 	// Donor gate: only a publicly-reachable node serves forwarding (the seed never even registers
@@ -155,11 +146,13 @@ func (n *Node) handleFwd(s network.Stream) {
 	}
 }
 
-// fwdServe returns the raw bytes for c from the cache, else a plain transitive bitswap fetch
-// (bounded by the global semaphore + a short timeout). nil = miss. Caches hits.
+// fwdServe returns the raw bytes for c: fwd-cache hit first (no semaphore), else a plain
+// transitive bitswap fetch via n.fwdServ (bounded by the global semaphore + a short
+// timeout), whose result blockservice writes into the BOUNDED fwd store — never the main
+// GC-disabled leveldb (see storeviews.go). nil = miss.
 func (n *Node) fwdServe(c cid.Cid) []byte {
-	if data := n.fwd.cacheGet(c); data != nil {
-		return data
+	if b, err := n.fwdBstore.Get(context.Background(), c); err == nil {
+		return b.RawData() // repeat forward — serve without charging the fetch semaphore
 	}
 	select {
 	case n.fwd.sem <- struct{}{}:
@@ -168,17 +161,15 @@ func (n *Node) fwdServe(c cid.Cid) []byte {
 	}
 	defer func() { <-n.fwd.sem }()
 
-	// ctxNoForward keeps this fetch on RAW bitswap — the donor must never re-forward (anti-
-	// amplification). n.GetBlock rides the assisted exchange, so without this marker it would recurse.
+	// n.fwdServ rides the RAW bitswap exchange, so this fetch structurally cannot re-forward
+	// (anti-amplification by construction); ctxNoForward stays as belt-and-braces.
 	ctx, cancel := context.WithTimeout(ctxNoForward(context.Background()), fwdServeTimeout)
 	defer cancel()
-	b, err := n.GetBlock(ctx, c)
+	b, err := n.fwdServ.GetBlock(ctx, c)
 	if err != nil {
 		return nil
 	}
-	data := b.RawData()
-	n.fwd.cachePut(c, data)
-	return data
+	return b.RawData()
 }
 
 // fwdHit pairs a forwarded block with the donor that served it (so we can keep it warm).
