@@ -294,9 +294,8 @@ save-queue-as-playlist; Share confirm flow; duplicate-to-mine.
 plays on the other.
 
 **Phase 4 — polish.**
-Re-announce tuning; `playlist_sync_status` footer; per-peer validator rate limiting if
-noisy; deep-link `trackerstream://playlist/<name>` (`src/lib/deeplink.ts:7-8` stub
-anticipates exactly this).
+Re-announce tuning; `playlist_sync_status` footer. (Per-peer rate limiting: shipped.
+Deep links: moved to §10 future work — web redirect + fragment payload design.)
 
 ## 9. Decisions log
 
