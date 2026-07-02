@@ -18,6 +18,7 @@
   let confirmShare = $state(false);
   let confirmDelete = $state(false);
   let busy = $state(false);
+  let error = $state<string | null>(null);
 
   $effect(() => {
     const cur = name;
@@ -25,12 +26,13 @@
     detail = null;
     confirmShare = false;
     confirmDelete = false;
+    error = null;
     if (!cur) return;
     plGet(cur)
       .then((d) => {
         if (name === cur) detail = d;
       })
-      .catch(() => {});
+      .catch((e) => (error = String(e)));
   });
 
   async function removeTrack(i: number) {
@@ -44,9 +46,12 @@
   async function share() {
     if (!detail) return;
     busy = true;
+    error = null;
     try {
       await plPublish(detail.name);
       plBump();
+    } catch (e) {
+      error = `share failed: ${e}`;
     } finally {
       busy = false;
       confirmShare = false;
@@ -56,9 +61,12 @@
   async function del() {
     if (!detail) return;
     busy = true;
+    error = null;
     try {
       await plDelete(detail.name);
       plBump();
+    } catch (e) {
+      error = `delete failed: ${e}`;
     } finally {
       busy = false;
       confirmDelete = false;
@@ -67,6 +75,9 @@
 </script>
 
 <div class="pdetail">
+  {#if error}
+    <div class="error">{error}</div>
+  {/if}
   {#if !detail}
     <div class="placeholder">select a playlist</div>
   {:else}
@@ -78,7 +89,11 @@
     </div>
 
     <div class="actions">
-      <button class="play" onclick={() => detail && playPlaylist(detail)} disabled={!detail.items.length}>
+      <button
+        class="play"
+        onclick={() => detail && playPlaylist(detail).catch((e) => (error = String(e)))}
+        disabled={!detail.items.length}
+      >
         ▶ play
       </button>
       {#if detail.isMine}
@@ -144,6 +159,12 @@
     color: var(--dim);
     padding-top: 2rem;
     text-align: center;
+  }
+  .error {
+    color: var(--hot);
+    font-size: 11px;
+    margin-bottom: 0.6rem;
+    word-break: break-word;
   }
   .title {
     color: var(--violet);
