@@ -138,6 +138,10 @@ pub struct PlaylistDetail {
 pub struct SyncStatus {
     pub total: i64,
     pub mine: i64,
+    pub held: i64,
+    pub seen: i64,
+    pub dormant: i64,
+    /// Seen-tier bytes (what the budget governs; library rows are exempt).
     pub bytes: i64,
     pub budget: i64,
 }
@@ -538,12 +542,19 @@ impl Playlists {
 
     pub fn status(&self) -> Result<SyncStatus> {
         let db = self.db.lock().unwrap();
-        let (total, mine, bytes) = db.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(is_mine),0), COALESCE(SUM(size_bytes),0) FROM playlists",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        let now = now_secs();
+        let (total, mine, held, seen, dormant, bytes) = db.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(is_mine), 0),
+                    COALESCE(SUM(held), 0),
+                    COALESCE(SUM(is_mine=0 AND held=0), 0),
+                    COALESCE(SUM(tombstoned=1 OR (is_mine=0 AND eol>0 AND eol<?1)), 0),
+                    COALESCE(SUM(CASE WHEN is_mine=0 AND held=0 THEN size_bytes ELSE 0 END), 0)
+             FROM playlists",
+            params![now],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
-        Ok(SyncStatus { total, mine, bytes, budget: self.budget })
+        Ok(SyncStatus { total, mine, held, seen, dormant, bytes, budget: self.budget })
     }
 
     // -- background loops --

@@ -4,11 +4,14 @@
     plList,
     plCreate,
     plGet,
+    plStatus,
     plState,
     plBump,
     playPlaylist,
     type PlaylistMeta,
+    type PlaylistSyncStatus,
   } from "$lib/playlists.svelte";
+  import { fmtBytes } from "$lib/format";
 
   let {
     query,
@@ -20,6 +23,14 @@
   // Library = mine + held (what you back); discover = the seen tier gossip brought in.
   // A non-empty search spans everything regardless of the toggle.
   let tab = $state<"library" | "discover">("library");
+  let status = $state<PlaylistSyncStatus | null>(null);
+
+  $effect(() => {
+    void plState.version; // same cadence as the list: mutations + the 10s sync tick
+    plStatus()
+      .then((st) => (status = st))
+      .catch(() => (status = null));
+  });
 
   $effect(() => {
     const q = query.trim();
@@ -95,6 +106,15 @@
       </div>
     {/if}
   </div>
+  {#if status}
+    <div class="pfoot">
+      library {status.mine + status.held}
+      ({status.mine} mine · {status.held} held)
+      · seen {status.seen}
+      {#if status.dormant}· <span class="dfoot">{status.dormant} dormant</span>{/if}
+      · {fmtBytes(status.bytes)} / {fmtBytes(status.budget)}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -199,5 +219,17 @@
   .empty.err {
     color: var(--hot);
     word-break: break-word;
+  }
+  .pfoot {
+    padding: 0.35rem 0.8rem;
+    border-top: 1px solid var(--border);
+    color: var(--dim);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .dfoot {
+    color: var(--hot);
   }
 </style>

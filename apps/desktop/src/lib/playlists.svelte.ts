@@ -36,6 +36,10 @@ export interface PlaylistDetail extends PlaylistMeta {
 export interface PlaylistSyncStatus {
   total: number;
   mine: number;
+  held: number;
+  seen: number;
+  dormant: number;
+  /** Seen-tier bytes — what the budget governs (library rows are exempt). */
   bytes: number;
   budget: number;
 }
