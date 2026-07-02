@@ -271,11 +271,11 @@ func (n *Node) playlistSink(name string, rec, doc []byte) {
 }
 
 // PublishPlaylist signs an IPNS record for keyName whose value is the raw-sha256 CID of
-// doc (an integrity anchor, not a fetchable address), stores it, best-effort DHT-puts
-// the record (existence signal + seq recovery — docs never touch the DHT), and gossips
-// the {name, record, doc} envelope. Mirrors PublishIPNS but doc-inline. Returns the
-// publisher PeerId and the marshaled record — the caller (Rust) keeps the record for its
-// re-announce cycle.
+// doc (an integrity anchor, not a fetchable address), stores it, and gossips the
+// {name, record, doc} envelope. Playlists are pubsub+seq ONLY at v1 — deliberately no
+// DHT writes (unlike PublishIPNS): distribution, discovery, and seq recovery all ride
+// the gossip topic and its re-announce cycle. Returns the publisher PeerId and the
+// marshaled record — the caller (Rust) keeps the record for its re-announce cycle.
 func (n *Node) PublishPlaylist(ctx context.Context, keyName string, doc []byte, lifetime time.Duration, seq uint64) (peer.ID, []byte, error) {
 	if len(doc) == 0 || len(doc) > playlistDocMax {
 		return "", nil, fmt.Errorf("playlist doc size %d out of bounds (max %d)", len(doc), playlistDocMax)
@@ -305,13 +305,6 @@ func (n *Node) PublishPlaylist(ctx context.Context, keyName string, doc []byte, 
 	name := pid.String()
 	n.playlists.ingest(name, marshaled, doc, seq)
 
-	// DHT put (record only): best-effort, like PublishIPNS — gossip is the distribution.
-	if n.dht != nil {
-		rk := string(ipns.NameFromPeer(pid).RoutingKey())
-		if err := n.dht.PutValue(ctx, rk, marshaled); err != nil {
-			n.logf("playlist: dht put for %s failed (non-fatal): %v", name, err)
-		}
-	}
 	if n.pubsub != nil {
 		if err := n.pubsub.PublishPlaylist(ctx, encodePlaylistMsg(name, marshaled, doc)); err != nil {
 			n.logf("playlist: gossip push for %s failed (non-fatal): %v", name, err)

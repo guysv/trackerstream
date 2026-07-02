@@ -15,7 +15,7 @@ CID) itself.
 | Actor | Does | Does NOT |
 |---|---|---|
 | Author client | signs records under its own IPNS keys; gossips `{record, doc}` together | — |
-| Seed/master | subscribes to the playlist topic (mesh hub → forwards), keeps a **bounded LRU of records only**, answers DHT record puts/gets | store playlist documents |
+| Seed/master | subscribes to the playlist topic (mesh hub → forwards), keeps a **bounded LRU of records only** | store playlist documents; touch the DHT for playlists |
 | Syncing client | verifies record + doc hash, stores the doc in `playlists.db`, re-announces held playlists (suppressed), evicts LRU past a byte budget | trust the sidecar; fetch anything over bitswap |
 
 ## 1. Naming and document format
@@ -56,9 +56,11 @@ not built.)
 stays at 48h.
 
 **Sequence numbers** are caller-managed (`node/ipns.go:79`). Rust owns the per-playlist
-counter in `playlists.db`. **Seq recovery:** before any publish, resolve your own name
-(`routing/get`, DHT fallback) and use `max(local, network) + 1` — a lost `playlists.db`
-with an intact keystore cannot publish a stale seq.
+counter in `playlists.db`. **Seq recovery:** before republishing an existing playlist,
+resolve your own name (`routing/get`, answered from the node's gossip-warmed buffer) and
+use `max(local, buffer) + 1`. With per-device keys the local counter is normally
+authoritative; the buffer arm covers a re-imported key whose history has re-announced.
+A never-published playlist skips the lookup (fresh key — nothing to recover).
 
 ## 2. Gossip layer (Go node)
 
@@ -120,12 +122,16 @@ dropped, not re-announced.
 - Clients re-announce `{record, doc}` from `playlists.db` (Rust-driven, §4/§5 —
   durable data lives exactly once).
 - The seed re-announces records-only? No — a record without its doc is unusable (there
-  is no fetch path), so the seed does not re-announce at all. It forwards live traffic
-  and serves DHT record lookups; holders do the re-announcing.
+  is no fetch path), so the seed does not re-announce at all. It forwards live traffic;
+  holders do the re-announcing.
 
-**DHT:** records only (they fit the DHT's ~10 KiB record bound; docs never touch it).
-`PublishIPNS` already PutValues (`node/ipns.go:102-107`); serves as the existence signal
-and the seq-recovery source, not as doc distribution.
+**No DHT — pubsub+seq only (v1).** Playlists never touch the DHT: no record puts, no
+provider records, nothing. Distribution, late-joiner discovery, and seq recovery all
+ride the gossip topic and its suppressed re-announce cycle; `routing/get` on a playlist
+name answers from the node's gossip buffer. (The catalog keeps its DHT path unchanged.)
+Consequence, accepted: a playlist's record exists nowhere but in gossip and holders'
+`playlists.db` — if every holder is offline, the playlist is simply gone until one
+returns. That is the v1 contract, stated plainly.
 
 ## 3. What is deliberately NOT built (vs. v1 of this design)
 
@@ -149,7 +155,7 @@ but is no longer load-bearing there); serve view `main ∪ fwd` into `bitswap.Ne
 
 | Endpoint | Purpose |
 |---|---|
-| `playlist/publish?key=<name>&seq=<n>&lifetime=168h` (doc bytes in body) | node computes `cid = raw-sha256(doc)`, signs the record (value `/ipfs/<cid>`), stores it, DHT-puts it, gossips the binary `{name, record, doc}` envelope. Returns `{Name, Seq}`. |
+| `playlist/publish?key=<name>&seq=<n>&lifetime=168h` (doc bytes in body) | node computes `cid = raw-sha256(doc)`, signs the record (value `/ipfs/<cid>`), stores it, gossips the binary `{name, record, doc}` envelope (no DHT). Returns `{Name, Seq, Record}`. |
 | `playlist/records?since=<v>` | drain the ingest buffer as ndjson `{Name, Seq, Record(b64), Doc(b64)}` with a monotonic version counter — cheap no-change poll. |
 | `playlist/announce` (body: `{record, doc}` entries) | Rust-driven re-announce of held playlists, taken verbatim (no re-signing); node applies last-seen suppression before publishing. |
 
@@ -245,12 +251,9 @@ rendered lengths.
 - **Fat-message flood:** 1 MiB cap × flood degree is real but linear; IDONTWANT bounds
   duplicates; suppression bounds steady-state; human-rate updates make it negligible in
   practice.
-- **Availability (accepted):** doc distribution is gossip-only. The DHT keeps records
-  resolvable, but a playlist whose holders are all offline is unrecoverable until one
-  returns. Popularity = durability — the honest P2P contract, stated sharply.
-- **DHT value-store growth on the seed (accepted):** spam record puts land in the seed's
-  leveldb without GC; ~200 B each. Revisit with DHT-put rate limiting if disk metrics
-  notice.
+- **Availability (accepted):** playlists are gossip-only — records AND docs. A playlist
+  whose holders are all offline is unrecoverable until one returns. Popularity =
+  durability — the honest P2P contract, stated sharply.
 - **Multi-device / collaboration (out of scope):** keys live in one keystore; concurrent
   same-name edits race newest-seq-wins wholesale. The `v` field keeps the doc evolvable
   (CRDT ordering keys or an op log would be `v:2`).
@@ -317,3 +320,7 @@ anticipates exactly this).
     while at it (pre-existing unbounded-map wart).
 11. Record stores in-memory on all roles; a restarted client re-learns the working set
     within one re-announce cycle.
+12. **Playlists are pubsub+seq ONLY — zero DHT** (user call, 2026-07-02, reverting the
+    initial best-effort record put). No record puts, no provider records, no holder
+    re-puts. `routing/get` on playlist names answers from the gossip buffer; a
+    never-published playlist publishes seq 1 without any lookup.
