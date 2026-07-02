@@ -119,7 +119,10 @@ pub struct TrackUi {
 pub struct PlaylistDetail {
     #[serde(flatten)]
     pub meta: PlaylistMeta,
-    pub tracks: Vec<TrackUi>,
+    // "items", NOT "tracks": the flattened meta already serializes a `tracks` COUNT —
+    // a same-named field here would emit a duplicate JSON key and the JS side would
+    // see whichever wins, never both.
+    pub items: Vec<TrackUi>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -456,12 +459,12 @@ impl Playlists {
         let doc_json: String =
             db.query_row("SELECT doc_json FROM playlists WHERE name=?1", params![name], |r| r.get(0))?;
         let doc: PlaylistDoc = serde_json::from_str(&doc_json)?;
-        let tracks = doc
+        let items = doc
             .ts
             .into_iter()
             .map(|TrackRef(id, m, t)| TrackUi { id, mod_name: m, title: t })
             .collect();
-        Ok(Some(PlaylistDetail { meta, tracks }))
+        Ok(Some(PlaylistDetail { meta, items }))
     }
 
     pub fn mark_played(&self, name: &str) -> Result<()> {
@@ -690,7 +693,7 @@ mod tests {
         assert!(pl.ingest_wire(&w).unwrap());
         let got = pl.get(&w.name).unwrap().unwrap();
         assert_eq!(got.meta.title, "hello");
-        assert_eq!(got.tracks.len(), 1);
+        assert_eq!(got.items.len(), 1);
         assert!(!got.meta.is_mine);
     }
 
@@ -794,7 +797,28 @@ mod tests {
         pl.ingest_wire(&w).expect("Go-produced playlist wire entry must verify + ingest");
         let got = pl.get(&w.name).unwrap().unwrap();
         assert_eq!(got.meta.title, "go fixture");
-        assert_eq!(got.tracks[0].mod_name, "fix.it");
+        assert_eq!(got.items[0].mod_name, "fix.it");
+    }
+
+    // Live-node harness: run with a local tsnode (`tsnode -rpc 127.0.0.1:47701`) via
+    // `TS_TEST_RPC=127.0.0.1:47701 cargo test --lib live_ -- --ignored --nocapture`.
+    // Exercises the exact command backends the UI invokes, printing the JSON the
+    // frontend would receive.
+    #[tokio::test]
+    #[ignore]
+    async fn live_create_list_get_roundtrip() {
+        let rpc = NodeRpc::new(&std::env::var("TS_TEST_RPC").expect("set TS_TEST_RPC"));
+        let pl = Playlists::open(None, rpc).unwrap();
+        let meta = pl
+            .create("live test".into(), vec![(42, "aurora.it".into(), "Hymn".into())])
+            .await
+            .expect("create");
+        println!("create -> {}", serde_json::to_string(&meta).unwrap());
+        let list = pl.list().unwrap();
+        println!("list -> {}", serde_json::to_string(&list).unwrap());
+        let detail = pl.get(&meta.name).expect("get").expect("row");
+        println!("get -> {}", serde_json::to_string(&detail).unwrap());
+        assert_eq!(detail.items.len(), 1);
     }
 
     #[test]

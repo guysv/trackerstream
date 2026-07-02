@@ -31,14 +31,18 @@
   });
 
   async function createNew() {
-    const meta = await plCreate("new playlist", []);
-    plBump();
-    selectedName = meta.name;
+    try {
+      const meta = await plCreate("new playlist", []);
+      plBump();
+      selectedName = meta.name;
+    } catch (e) {
+      error = `create failed: ${e}`;
+    }
   }
 
   async function play(p: PlaylistMeta) {
     const d = await plGet(p.name);
-    if (d) await playPlaylist(d).catch(() => {});
+    if (d) await playPlaylist(d).catch((e) => (error = String(e)));
   }
 
   const fmtAge = (secs: number) => {
@@ -71,9 +75,11 @@
         <span class="age">{fmtAge(p.lastUpdateAt)}</span>
       </div>
     {/each}
-    {#if !rows.length}
+    {#if error}
+      <div class="empty err">{error}</div>
+    {:else if !rows.length}
       <div class="empty">
-        {#if error}playlists unavailable{:else if query.trim()}no playlists match{:else}
+        {#if query.trim()}no playlists match{:else}
           no playlists yet — ＋ new, or save the queue as one{/if}
       </div>
     {/if}
@@ -152,5 +158,9 @@
     padding: 2rem;
     text-align: center;
     color: var(--dim);
+  }
+  .empty.err {
+    color: var(--hot);
+    word-break: break-word;
   }
 </style>
