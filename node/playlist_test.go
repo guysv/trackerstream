@@ -9,6 +9,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/peer"
 	mh "github.com/multiformats/go-multihash"
+	"golang.org/x/time/rate"
 )
 
 // shrinkAnnounceWindow makes suppression observable inside a test.
@@ -120,6 +121,41 @@ func TestPlaylistValidatorRejectsTamperedDoc(t *testing.T) {
 	}
 	if _, ok := a.playlists.getRecord(name); ok {
 		t.Fatalf("tampered message reached the store")
+	}
+}
+
+// Per-peer rate buckets: burst passes, sustained flood is throttled, byte bucket bounds
+// fat-doc floods independently, and distinct peers get distinct buckets.
+func TestPlaylistRateLimiter(t *testing.T) {
+	oldB, oldR := plPeerMsgBurst, plPeerMsgRate
+	plPeerMsgBurst, plPeerMsgRate = 3, rate.Limit(0.0001) // no refill within the test
+	t.Cleanup(func() { plPeerMsgBurst, plPeerMsgRate = oldB, oldR })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	n := mkEphemeral(t, ctx, RoleClient)
+
+	spammer := peer.ID("spammer-1")
+	for i := 0; i < 3; i++ {
+		if !n.plAllow(spammer, 100) {
+			t.Fatalf("message %d within burst must pass", i+1)
+		}
+	}
+	if n.plAllow(spammer, 100) {
+		t.Fatalf("message beyond burst must be throttled")
+	}
+	if !n.plAllow(peer.ID("honest-2"), 100) {
+		t.Fatalf("another peer must have its own bucket")
+	}
+
+	// Byte bucket is independent: 3 × 8 MiB = 24 MiB exceeds the 16 MiB byte burst
+	// before the (shrunken) 3-message bucket runs out.
+	fat := peer.ID("fatposter-3")
+	if !n.plAllow(fat, 8<<20) || !n.plAllow(fat, 8<<20) {
+		t.Fatalf("two fat docs within byte burst must pass")
+	}
+	if n.plAllow(fat, 8<<20) {
+		t.Fatalf("byte bucket must throttle a fat-doc flood")
 	}
 }
 
