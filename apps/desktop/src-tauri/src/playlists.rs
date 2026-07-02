@@ -152,6 +152,12 @@ pub struct Playlists {
     db: Mutex<Connection>,
     rpc: NodeRpc,
     budget: i64,
+    /// The playlist currently loaded in the player, if any. Pinned rows are exempt
+    /// from budget eviction and decay, and a tombstone keeps them dormant instead of
+    /// deleting — the playing playlist must not vanish out from under the UI. This is
+    /// NOT the held tier: in-memory only, never re-announced, cleared when playback
+    /// moves to another source.
+    pinned: Mutex<Option<String>>,
 }
 
 impl Playlists {
@@ -194,7 +200,7 @@ impl Playlists {
             .unwrap_or(50)
             * 1024
             * 1024;
-        Ok(Self { db: Mutex::new(conn), rpc, budget })
+        Ok(Self { db: Mutex::new(conn), rpc, budget, pinned: Mutex::new(None) })
     }
 
     // -- ingest (the sync loop's per-entry work) --
@@ -247,7 +253,8 @@ impl Playlists {
             // Clearing record_b64 makes the row un-announceable (the deletion is
             // honored on the network) and advancing seq to the tombstone's blocks
             // replayed older records; a genuine author republish (seq+1) revives the
-            // row through the normal upsert path.
+            // row through the normal upsert path. A pinned (playing) seen row is kept
+            // dormant the same way; decay removes it after unpin.
             let in_library: bool = db
                 .query_row(
                     "SELECT is_mine OR held FROM playlists WHERE name=?1",
@@ -257,7 +264,7 @@ impl Playlists {
                 .optional()?
                 .unwrap_or(0)
                 != 0;
-            if in_library {
+            if in_library || self.pinned_name().as_deref() == Some(w.name.as_str()) {
                 db.execute(
                     "UPDATE playlists SET seq=?2, record_b64=NULL, tombstoned=1, published=0,
                        last_update_at=?3 WHERE name=?1",
@@ -282,8 +289,9 @@ impl Playlists {
     }
 
     /// Evict least-recently-updated FOREIGN playlists until under the byte budget.
-    /// Own playlists are never evicted.
+    /// Own playlists are never evicted; neither is the pinned (currently playing) one.
     pub fn enforce_budget(&self) {
+        let pinned = self.pinned_name();
         let db = self.db.lock().unwrap();
         loop {
             let used: i64 = db
@@ -298,8 +306,9 @@ impl Playlists {
             }
             let victim: Option<String> = db
                 .query_row(
-                    "SELECT name FROM playlists WHERE is_mine=0 AND held=0 ORDER BY last_update_at ASC LIMIT 1",
-                    [],
+                    "SELECT name FROM playlists WHERE is_mine=0 AND held=0 AND (?1 IS NULL OR name<>?1)
+                     ORDER BY last_update_at ASC LIMIT 1",
+                    params![pinned],
                     |r| r.get(0),
                 )
                 .optional()
@@ -540,6 +549,16 @@ impl Playlists {
         Ok(())
     }
 
+    /// Pin the playlist the player is currently sourced from (None = playback moved to
+    /// something that isn't a playlist).
+    pub fn pin_playing(&self, name: Option<String>) {
+        *self.pinned.lock().unwrap() = name;
+    }
+
+    fn pinned_name(&self) -> Option<String> {
+        self.pinned.lock().unwrap().clone()
+    }
+
     pub fn status(&self) -> Result<SyncStatus> {
         let db = self.db.lock().unwrap();
         let now = now_secs();
@@ -586,6 +605,7 @@ impl Playlists {
     /// network-wide decay within one record lifetime. Held and mine rows are exempt:
     /// the user chose to keep those, expired record or not.
     pub fn decay_expired(&self) {
+        let pinned = self.pinned_name();
         let seen: Vec<(String, Option<String>)> = {
             let db = self.db.lock().unwrap();
             let Ok(mut stmt) =
@@ -598,6 +618,9 @@ impl Playlists {
                 .unwrap_or_default()
         };
         for (name, rec) in seen {
+            if pinned.as_deref() == Some(name.as_str()) {
+                continue; // playing right now — decays on the first pass after unpin
+            }
             let alive = rec
                 .as_deref()
                 .map(|r| ipns::verify_b64_seq(&name, r).is_ok())
@@ -1052,6 +1075,37 @@ mod tests {
         pl.decay_expired();
         assert!(pl.get(&w1.name).unwrap().is_some(), "held row must survive decay");
         assert!(pl.get(&w2.name).unwrap().is_none(), "unbacked row must decay at record EOL");
+    }
+
+    // Play-time pin: the playlist the player is sourced from can't be evicted, decayed,
+    // or tombstone-deleted (kept dormant instead) while pinned; unpinning restores the
+    // normal seen-tier lifecycle on the next pass.
+    #[test]
+    fn pinned_playing_row_survives_until_unpinned() {
+        let mut pl = mem();
+        pl.budget = 0; // any seen-tier bytes are over budget
+        let kp = Keypair::generate_ed25519();
+        let w = wire_for(&kp, &doc_bytes("playing"), 1);
+        pl.ingest_wire(&w).unwrap();
+        pl.pin_playing(Some(w.name.clone()));
+
+        pl.enforce_budget();
+        assert!(pl.get(&w.name).unwrap().is_some(), "pinned row must survive eviction");
+
+        // Author tombstones it mid-play: kept dormant (like library), not deleted.
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        pl.ingest_wire(&wire_for(&kp, &tomb, 2)).unwrap();
+        let got = pl.get(&w.name).unwrap().expect("pinned row must survive the tombstone");
+        assert!(got.meta.dormant && got.meta.tombstoned);
+
+        pl.decay_expired();
+        assert!(pl.get(&w.name).unwrap().is_some(), "pinned row must survive decay");
+
+        // Playback moves on: the row decays on the next pass (record cleared by the
+        // tombstone → no longer alive).
+        pl.pin_playing(None);
+        pl.decay_expired();
+        assert!(pl.get(&w.name).unwrap().is_none(), "unpinned row resumes normal decay");
     }
 
     // Dormancy: a foreign row whose stored EOL has passed is flagged (still playable,

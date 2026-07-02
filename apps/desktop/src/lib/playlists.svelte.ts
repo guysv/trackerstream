@@ -4,7 +4,7 @@
 // refresh after a mutation.
 import { invoke } from "@tauri-apps/api/core";
 import { getModule, type ModuleHit } from "$lib/catalog";
-import { playList, queue } from "$lib/player.svelte";
+import { playList, queue, setOnQueueSourceChange } from "$lib/player.svelte";
 
 export interface PlaylistMeta {
   name: string;
@@ -83,6 +83,12 @@ if (typeof window !== "undefined") {
   setInterval(plBump, 10_000);
 }
 
+// Play-time pin: while the queue is sourced from a playlist, Rust protects that row
+// from decay / budget eviction / tombstone deletion so it can't vanish under playback
+// (a transient pin — NOT the held tier; nothing is backed or re-announced). Playing
+// anything else, or clearing the queue, releases it.
+setOnQueueSourceChange(() => void invoke("playlist_pin", { name: null }).catch(() => {}));
+
 // Playlist docs carry no root CIDs (by design — tracks resolve via the catalog only at
 // play time), so playing a playlist resolves entries through `getModule` first. Bounded
 // like the results table: a >200-track playlist plays its first 200.
@@ -96,7 +102,8 @@ export async function playPlaylist(detail: PlaylistDetail, index = 0): Promise<v
   ).filter(Boolean) as ModuleHit[];
   if (!hits.length) throw new Error("no playable tracks in playlist");
   const at = Math.max(0, hits.findIndex((h) => h.id === wantedId));
-  playList(hits, at);
+  playList(hits, at); // fires the source-change hook first, releasing any prior pin
+  void invoke("playlist_pin", { name: detail.name }).catch(() => {});
   void invoke("playlist_played", { name: detail.name }).catch(() => {});
 }
 
