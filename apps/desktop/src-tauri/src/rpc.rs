@@ -8,9 +8,23 @@
 //! extensions (`bandwidth/by-peer`, `node/status`, `warm`). The pure local logic — audio
 //! reassembly, the catalog SQLite VFS, IPNS signature verify — stays in Rust and rides on top.
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
+
+/// One playlist entry on the `playlist/records` / `playlist/announce` wire: the IPNS
+/// name, record sequence, and base64 signed record + doc (Go marshals []byte as base64).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistWire {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Seq", default)]
+    pub seq: u64,
+    #[serde(rename = "Record", default)]
+    pub record: String,
+    #[serde(rename = "Doc", default)]
+    pub doc: String,
+}
 
 /// A handle to the local tsnode RPC. Cheap to clone (wraps a reqwest client + base URL).
 #[derive(Clone)]
@@ -244,6 +258,95 @@ impl NodeRpc {
             }
         }
         Err(anyhow!("routing/get {name}: no Value record"))
+    }
+
+    /// `key/gen?arg=<name>` — create (or fetch) a named key in the sidecar keystore and
+    /// return its PeerId — the IPNS name a `playlist/<uuid>` key publishes under.
+    pub async fn key_gen(&self, name: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(rename = "Id", default)]
+            id: String,
+        }
+        let resp: Resp = self
+            .http
+            .post(self.url(&format!("key/gen?arg={name}")))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("key/gen {name}"))?
+            .json()
+            .await?;
+        Ok(resp.id)
+    }
+
+    /// `playlist/publish?key&seq&lifetime` with the raw doc as body — the node computes the
+    /// doc's CID, signs the record, DHT-puts it, and gossips {name, record, doc} inline.
+    /// Returns (name, signed record base64) — the record feeds the re-announce cycle.
+    pub async fn playlist_publish(
+        &self,
+        key: &str,
+        seq: u64,
+        lifetime: &str,
+        doc: Vec<u8>,
+    ) -> Result<(String, String)> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(rename = "Name", default)]
+            name: String,
+            #[serde(rename = "Record", default)]
+            record: String,
+        }
+        let resp: Resp = self
+            .http
+            .post(self.url(&format!(
+                "playlist/publish?key={key}&seq={seq}&lifetime={lifetime}"
+            )))
+            .timeout(Duration::from_secs(20))
+            .body(doc)
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("playlist/publish {key} seq={seq}"))?
+            .json()
+            .await?;
+        Ok((resp.name, resp.record))
+    }
+
+    /// `playlist/records?since=<v>` — drain the sidecar's bounded playlist relay buffer.
+    /// Record/Doc are base64; the caller RE-VERIFIES both (untrusted cache doctrine).
+    pub async fn playlist_records(&self, since: u64) -> Result<(u64, Vec<PlaylistWire>)> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(rename = "Version", default)]
+            version: u64,
+            #[serde(rename = "Records", default)]
+            records: Vec<PlaylistWire>,
+        }
+        let resp: Resp = self
+            .http
+            .post(self.url(&format!("playlist/records?since={since}")))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok((resp.version, resp.records))
+    }
+
+    /// `playlist/announce` — re-gossip held {record, doc} pairs verbatim; the node applies
+    /// last-seen suppression, so calling this liberally is cheap.
+    pub async fn playlist_announce(&self, entries: &[PlaylistWire]) -> Result<()> {
+        self.http
+            .post(self.url("playlist/announce"))
+            .timeout(Duration::from_secs(20))
+            .json(entries)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     /// `node/status` — reachability verdict + relay-hop breakdown + peer/byte counts.

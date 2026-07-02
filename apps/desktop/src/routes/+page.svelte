@@ -6,6 +6,8 @@
   import NowPlaying from "$lib/components/NowPlaying.svelte";
   import QueuePanel from "$lib/components/QueuePanel.svelte";
   import PeersPanel from "$lib/components/PeersPanel.svelte";
+  import PlaylistsView from "$lib/components/PlaylistsView.svelte";
+  import PlaylistDetailPanel from "$lib/components/PlaylistDetailPanel.svelte";
   import {
     search,
     listModules,
@@ -20,6 +22,11 @@
   import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
 
   let rightView = $state<"detail" | "queue" | "peers">("detail");
+  // Center-region switch (PLAYLISTS.md): the bottom-bar button flips between the track
+  // search/view and the local playlist search/view; the header search input dispatches
+  // to whichever is active.
+  let mainView = $state<"tracks" | "playlists">("tracks");
+  let selectedPlaylist = $state<string | null>(null);
 
   function play(h: ModuleHit) {
     playList(
@@ -89,6 +96,7 @@
   let timer: ReturnType<typeof setTimeout>;
   let reqSeq = 0;
   $effect(() => {
+    if (mainView !== "tracks") return; // playlists mode: PlaylistsView owns the query
     const q = query.trim();
     const fmt = format;
     const s = sort;
@@ -126,11 +134,14 @@
       bind:this={searchEl}
       bind:value={query}
       class="search"
-      placeholder="search title / file / instruments / comments    (press /)"
+      placeholder={mainView === "playlists"
+        ? "search playlists    (press /)"
+        : "search title / file / instruments / comments    (press /)"}
       spellcheck="false"
     />
     <span class="status">
-      {#if apiError}<span class="err">catalog offline</span>
+      {#if mainView === "playlists"}playlists
+      {:else if apiError}<span class="err">catalog offline</span>
       {:else if loading}loading…
       {:else}{rows.length} result{rows.length === 1 ? "" : "s"}{/if}
     </span>
@@ -145,16 +156,24 @@
     <span class="engine">{player.ready ? "engine ●" : "engine ○"}</span>
   </header>
 
-  <main>
-    <Sidebar {formats} {total} bind:format bind:sort />
-    <section class="results">
-      <ResultsTable {rows} bind:selectedId onplay={play} />
-    </section>
+  <main class:noside={mainView === "playlists"}>
+    {#if mainView === "tracks"}
+      <Sidebar {formats} {total} bind:format bind:sort />
+      <section class="results">
+        <ResultsTable {rows} bind:selectedId onplay={play} />
+      </section>
+    {:else}
+      <section class="results">
+        <PlaylistsView {query} bind:selectedName={selectedPlaylist} />
+      </section>
+    {/if}
     <aside class="detail">
       {#if rightView === "queue"}
         <QueuePanel />
       {:else if rightView === "peers"}
         <PeersPanel />
+      {:else if mainView === "playlists"}
+        <PlaylistDetailPanel name={selectedPlaylist} />
       {:else}
         <DetailPanel id={selectedId} onplay={play} />
       {/if}
@@ -162,7 +181,12 @@
   </main>
 
   {#if nowPlaying.error}<div class="toast">{nowPlaying.error}</div>{/if}
-  <NowPlaying onnext={playNext} onprev={playPrev} />
+  <NowPlaying
+    onnext={playNext}
+    onprev={playPrev}
+    playlistsOn={mainView === "playlists"}
+    onplaylists={() => (mainView = mainView === "playlists" ? "tracks" : "playlists")}
+  />
 
   {#if showHelp}
     <div class="help-bg" onclick={() => (showHelp = false)} role="presentation">
@@ -232,6 +256,10 @@
     grid-template-columns: 180px 1fr 320px;
     min-height: 0;
     overflow: hidden;
+  }
+  /* Playlists mode has no format sidebar. */
+  main.noside {
+    grid-template-columns: 1fr 320px;
   }
   .results {
     display: flex;
