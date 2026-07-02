@@ -326,7 +326,15 @@ Deep links: moved to §10 future work — web redirect + fragment payload design
     initial best-effort record put). No record puts, no provider records, no holder
     re-puts. `routing/get` on playlist names answers from the gossip buffer; a
     never-published playlist publishes seq 1 without any lookup.
-13. **Holder tier ("add to library", user call 2026-07-02).** Three tiers in
+13. **Play-time pin (user call 2026-07-03).** The playlist the queue is currently
+    sourced from is pinned in Rust (in-memory, single slot): exempt from budget
+    eviction and seen-tier decay, and a mid-play tombstone keeps the row dormant
+    (library-style) instead of deleting it. NOT the held tier — nothing is backed or
+    re-announced (playing must not silently become a public backing act). The pin
+    releases when the queue's source changes or clears; normal lifecycle resumes on
+    the next decay/eviction pass. Dormant rows otherwise linger in discover only until
+    the next decay tick (≤ one announce cycle) — accepted, badged.
+14. **Holder tier ("add to library", user call 2026-07-02).** Three tiers in
     `playlists.db`: *mine* (signing key, editable, never evicted), *held* (foreign,
     deliberately added — never evicted, follows the author's updates, read-only), and
     *seen* (gossip brought it in — the discover pool, budget-evicted). **Re-announce is

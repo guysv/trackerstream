@@ -91,7 +91,16 @@ function saveQueue(): void {
 // Gapless auto-advance: when a track ends, play the next queued one.
 player.onEnded = () => playNext();
 
+// Fires when the queue's backing list is replaced or cleared — a change of play
+// source. next/prev pass queue.items back in, so they don't fire. playlists.svelte.ts
+// uses this to release its play-time pin.
+let onQueueSourceChange: (() => void) | undefined;
+export function setOnQueueSourceChange(cb: () => void): void {
+  onQueueSourceChange = cb;
+}
+
 export function playList(items: ModuleHit[], index: number): void {
+  if (items !== queue.items) onQueueSourceChange?.();
   queue.items = items;
   queue.index = index;
   saveQueue();
@@ -103,6 +112,7 @@ export function playList(items: ModuleHit[], index: number): void {
 }
 
 export function clearQueue(): void {
+  onQueueSourceChange?.();
   queue.items = [];
   queue.index = -1;
   saveQueue();

@@ -542,6 +542,13 @@ fn playlist_played(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Re
     pl.mark_played(&name).map_err(|e| e.to_string())
 }
 
+/// Pin the playlist the player is sourced from (None when playback moves elsewhere):
+/// pinned rows can't be evicted, decayed, or tombstone-deleted out from under playback.
+#[tauri::command]
+fn playlist_pin(name: Option<String>, pl: State<'_, Arc<playlists::Playlists>>) {
+    pl.pin_playing(name);
+}
+
 #[tauri::command]
 fn playlist_sync_status(pl: State<'_, Arc<playlists::Playlists>>) -> Result<playlists::SyncStatus, String> {
     pl.status().map_err(|e| e.to_string())
@@ -643,6 +650,7 @@ pub fn run() {
             playlist_delete,
             playlist_publish,
             playlist_played,
+            playlist_pin,
             playlist_sync_status
         ])
         .run(tauri::generate_context!())
