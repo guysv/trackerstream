@@ -352,8 +352,9 @@ itself, and the social one: "what is this person into?"
 
 - **Disclosure model is pull, 1:1** — you reveal your library to the specific peer who
   asked, not to the whole network (contrast with hold beacons below, which broadcast).
-  The responder answers with held+mine only — backing is a public act; the seen tier is
-  never disclosed. A "back silently" per-playlist toggle can exempt entries.
+  The responder answers with **held + published-mine only** — both are explicit public
+  acts (backing / sharing). PRIVATE (unpublished) playlists and the seen tier are never
+  disclosed. A "back silently" per-playlist toggle can exempt held entries too.
 - Response is names+titles only (no docs — the normal gossip path distributes those);
   rate-limit requests per peer like everything else. An entry the asker doesn't hold
   yet can be requested via the ordinary announce machinery (the responder just
@@ -365,7 +366,8 @@ Announce suppression deliberately hides holders (~one voice per playlist per cyc
 popularity is invisible today. Restore the signal on a cheap side channel:
 
 - Each node broadcasts a small jittered **hold manifest** (~hourly): truncated 8-byte
-  name-hashes of its held+mine playlists — a 200-playlist library ≈ 1.6 KB message.
+  name-hashes of its held + published-mine playlists (never private/unpublished ones,
+  never the seen tier) — a 200-playlist library ≈ 1.6 KB message.
   Gossipsub already signs messages, so origin authenticity is free.
 - Every node counts locally: name → distinct origins over a 24h sliding window (bounded
   LRU). Frequency = holder-set liveness; variety = breadth. No consensus, none needed.
