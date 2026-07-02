@@ -37,9 +37,12 @@ so rendering a playlist needs **zero catalog lookups**; the catalog id resolves 
 via the normal catalog `get` path **only at play time**. A 100-track playlist ≈ 5 KB;
 1 MiB ≈ ~20k tracks.
 
-**Tombstone:** `{"v":1,"del":true}` published at `seq+1`. IPNS has no delete; syncers
-seeing a tombstone drop the local row, and the record dies at EOL. Tombstones re-announce
-like any record until expiry so late syncers hear about the deletion.
+**Tombstone:** `{"v":1,"del":true}` published at `seq+1`. IPNS has no delete; the
+record dies at EOL. On receipt, SEEN-tier copies drop; LIBRARY copies (held/mine) are
+preserved **dormant** — we don't delete playlists the user chose to keep. The kept row's
+record is cleared (it can never be re-announced, honoring the deletion) and its seq pins
+at the tombstone's (replayed older records can't resurrect it); a genuine author
+republish at `seq+1` revives it in place.
 
 **Hard cap: 1 MiB of document bytes.** Anything larger is adversarial by definition —
 dropped in the topic validator, never stored, never forwarded.

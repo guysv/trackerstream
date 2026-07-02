@@ -105,8 +105,14 @@
 
     {#if detail.dormant}
       <div class="dnote">
-        this playlist's record has expired — its author hasn't re-signed it in over a
-        week, so nobody (including you) can share it onward. your copy stays playable.
+        {#if detail.tombstoned}
+          the author deleted this playlist (tombstone received). your kept copy stays
+          playable but can't be shared onward — unless the author republishes, in which
+          case it revives here automatically.
+        {:else}
+          this playlist's record has expired — its author hasn't re-signed it in over a
+          week, so nobody (including you) can share it onward. your copy stays playable.
+        {/if}
         <b>duplicate to mine</b> forks it under your key to make it shareable again.
       </div>
     {/if}
