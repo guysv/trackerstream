@@ -7,6 +7,7 @@
 pub mod catalog;
 pub mod ipfs;
 pub mod ipns;
+pub mod playlists;
 pub mod rpc;
 pub mod sidecar;
 
@@ -469,6 +470,69 @@ fn set_playhead(root: String, order: u32, streams: State<'_, Streams>) -> Result
     Ok(())
 }
 
+// ---- playlists (PLAYLISTS.md) — thin wrappers over playlists::Playlists ----
+
+#[tauri::command]
+fn playlist_search(
+    q: String,
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<Vec<playlists::PlaylistMeta>, String> {
+    pl.search(&q).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn playlist_list(pl: State<'_, Arc<playlists::Playlists>>) -> Result<Vec<playlists::PlaylistMeta>, String> {
+    pl.list().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn playlist_get(
+    name: String,
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<Option<playlists::PlaylistDetail>, String> {
+    pl.get(&name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn playlist_create(
+    title: String,
+    tracks: Vec<(i64, String, String)>,
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<playlists::PlaylistMeta, String> {
+    pl.create(title, tracks).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn playlist_update(
+    name: String,
+    title: String,
+    tracks: Vec<(i64, String, String)>,
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<(), String> {
+    pl.update(&name, title, tracks).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn playlist_delete(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Result<(), String> {
+    pl.delete(&name).await.map_err(|e| e.to_string())
+}
+
+/// The explicit "Share" action — the ONLY path that makes a playlist public.
+#[tauri::command]
+async fn playlist_publish(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Result<(), String> {
+    pl.publish(&name).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn playlist_played(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Result<(), String> {
+    pl.mark_played(&name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn playlist_sync_status(pl: State<'_, Arc<playlists::Playlists>>) -> Result<playlists::SyncStatus, String> {
+    pl.status().map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // The client log hub: everything routed through the `log` facade (backend, frontend via
@@ -527,11 +591,19 @@ pub fn run() {
                 .id;
             log::info!("sidecar up, peer={peer_id}, rpc={}", sc.rpc_addr());
 
+            // Playlists: the durable local store + sync/announce engine (PLAYLISTS.md).
+            let pl = Arc::new(
+                playlists::Playlists::open(dir.as_deref(), rpc.clone())
+                    .map_err(|e| format!("playlists store: {e}"))?,
+            );
+            tauri::async_runtime::spawn(playlists::run_loops(pl.clone()));
+
             app.manage(NodeState { rpc, peer_id });
             app.manage(sc); // keep the child alive for the app's lifetime
             app.manage(Streams::default());
             app.manage(held);
             app.manage(ipns_cache);
+            app.manage(pl);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -547,7 +619,16 @@ pub fn run() {
             get_skeleton,
             get_sample,
             set_playhead,
-            open_logs_dir
+            open_logs_dir,
+            playlist_search,
+            playlist_list,
+            playlist_get,
+            playlist_create,
+            playlist_update,
+            playlist_delete,
+            playlist_publish,
+            playlist_played,
+            playlist_sync_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

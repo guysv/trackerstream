@@ -2,14 +2,18 @@
   import { getModule, type ModuleDetail, type ModuleHit } from "$lib/catalog";
   import { fmtTime, fmtBytes } from "$lib/format";
   import { enqueue } from "$lib/player.svelte";
+  import { plList, plCreate, addTrackTo, hitTuple, plBump, type PlaylistMeta } from "$lib/playlists.svelte";
 
   let { id, onplay }: { id: number | null; onplay: (h: ModuleHit) => void } = $props();
 
   let detail = $state<ModuleDetail | null>(null);
+  let plMenu = $state(false);
+  let myLists = $state<PlaylistMeta[]>([]);
 
   $effect(() => {
     const cur = id;
     detail = null;
+    plMenu = false;
     if (cur == null) return;
     getModule(cur)
       .then((d) => {
@@ -17,6 +21,23 @@
       })
       .catch(() => {});
   });
+
+  async function openPlMenu() {
+    if (!plMenu) myLists = (await plList().catch(() => [])).filter((p) => p.isMine);
+    plMenu = !plMenu;
+  }
+
+  async function addTo(name: string) {
+    if (detail) await addTrackTo(name, detail);
+    plMenu = false;
+  }
+
+  async function addToNew() {
+    if (!detail) return;
+    await plCreate(detail.title || detail.filename, [hitTuple(detail)]);
+    plBump();
+    plMenu = false;
+  }
 
   const instruments = $derived(
     (detail?.instruments ?? "").split(/\s+/).filter(Boolean).slice(0, 200),
@@ -33,6 +54,17 @@
       <button class="play" onclick={() => onplay(detail!)}>▶ play</button>
       <button onclick={() => enqueue(detail!)}>+ queue</button>
       <button onclick={() => enqueue(detail!, true)}>play next</button>
+      <span class="plwrap">
+        <button onclick={openPlMenu}>+ list</button>
+        {#if plMenu}
+          <div class="plmenu">
+            {#each myLists as p (p.name)}
+              <button class="plitem" onclick={() => addTo(p.name)}>{p.title || "(untitled)"}</button>
+            {/each}
+            <button class="plitem new" onclick={addToNew}>＋ new playlist</button>
+          </div>
+        {/if}
+      </span>
     </div>
 
     <dl class="meta">
@@ -90,6 +122,40 @@
   .play {
     color: var(--accent);
     border-color: var(--accent);
+  }
+  .plwrap {
+    position: relative;
+  }
+  .plmenu {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    z-index: 6;
+    display: flex;
+    flex-direction: column;
+    min-width: 160px;
+    max-height: 220px;
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--border-hi);
+    border-radius: 4px;
+    padding: 0.2rem;
+  }
+  .plitem {
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0.25rem 0.5rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .plitem:hover {
+    background: var(--row-hover);
+  }
+  .plitem.new {
+    color: var(--violet);
+    border-top: 1px solid var(--border);
   }
   dl.meta {
     display: grid;

@@ -2,7 +2,17 @@
   import { player, nowPlaying } from "$lib/player.svelte";
   import { fmtTime } from "$lib/format";
 
-  let { onnext, onprev }: { onnext?: () => void; onprev?: () => void } = $props();
+  let {
+    onnext,
+    onprev,
+    playlistsOn = false,
+    onplaylists,
+  }: {
+    onnext?: () => void;
+    onprev?: () => void;
+    playlistsOn?: boolean;
+    onplaylists?: () => void;
+  } = $props();
 
   const info = $derived(player.info);
   const pos = $derived(player.pos);
@@ -23,6 +33,13 @@
 </script>
 
 <div class="bar">
+  <!-- The bottom-bar Playlists toggle (PLAYLISTS.md): flips the main area between the
+       track search/view and the local playlist search/view. -->
+  {#if onplaylists}
+    <button class="plists" class:on={playlistsOn} onclick={() => onplaylists?.()} title="playlists">
+      ≡ playlists
+    </button>
+  {/if}
   <div class="transport">
     <button onclick={() => onprev?.()} disabled={!onprev} title="previous">⏮</button>
     <button class="pp" onclick={() => player.toggle()} disabled={!info}>
@@ -95,7 +112,7 @@
     position: relative;
     z-index: 5;
     display: grid;
-    grid-template-columns: auto 1fr auto 140px;
+    grid-template-columns: auto auto 1fr auto 140px;
     gap: 1rem;
     align-items: center;
     height: 64px;
@@ -116,6 +133,14 @@
   .transport {
     display: flex;
     gap: 0.3rem;
+  }
+  .plists {
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .plists.on {
+    border-color: var(--violet);
+    color: var(--violet);
   }
   .transport button {
     width: 36px;

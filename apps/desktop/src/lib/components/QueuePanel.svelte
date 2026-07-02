@@ -1,12 +1,26 @@
 <script lang="ts">
   import { queue, playList, removeFromQueue, moveInQueue, clearQueue } from "$lib/player.svelte";
+  import { saveQueueAsPlaylist } from "$lib/playlists.svelte";
   import { fmtTime } from "$lib/format";
+
+  let saved = $state(false);
+  async function saveAsPlaylist() {
+    const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+    await saveQueueAsPlaylist(`queue ${stamp}`);
+    saved = true;
+    setTimeout(() => (saved = false), 1500);
+  }
 </script>
 
 <div class="queue">
   <div class="qhead">
     <span>queue · {queue.items.length}</span>
-    <button onclick={clearQueue} disabled={!queue.items.length}>clear</button>
+    <span class="qbtns">
+      <button onclick={saveAsPlaylist} disabled={!queue.items.length || saved}>
+        {saved ? "saved ✓" : "save as playlist"}
+      </button>
+      <button onclick={clearQueue} disabled={!queue.items.length}>clear</button>
+    </span>
   </div>
 
   <div class="qlist">
@@ -43,6 +57,10 @@
     border-bottom: 1px solid var(--border);
     text-transform: uppercase;
     font-size: 11px;
+  }
+  .qbtns {
+    display: flex;
+    gap: 0.4rem;
   }
   .qlist {
     flex: 1;
