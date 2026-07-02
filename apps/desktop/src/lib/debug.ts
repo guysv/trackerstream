@@ -1,9 +1,7 @@
-// Streaming-state tracer. The webview console isn't visible in the dev terminal,
-// so we mirror each transition to the Rust backend (debug_log -> stderr) AND to
-// the webview console. Flip DEBUG off to make every call a no-op.
-import { invoke } from "@tauri-apps/api/core";
-
-export const DEBUG = false;
+// Streaming-state tracer. Each transition goes to the webview console AND into the
+// app's log file via tauri-plugin-log at debug level — so whether a trace is recorded
+// is a runtime decision (TS_LOG=debug, or any dev build), not a rebuild.
+import { debug } from "@tauri-apps/plugin-log";
 
 let t0 = 0;
 function clock(): string {
@@ -15,14 +13,13 @@ function clock(): string {
 /** Trace a streaming/UI state transition. `tag` groups the source, `data` is any
  *  small JSON-able payload. Fire-and-forget; never throws into the caller. */
 export function dbg(tag: string, data?: Record<string, unknown>): void {
-  if (!DEBUG) return;
   const payload = data ? " " + JSON.stringify(data) : "";
   const line = `${clock()} ${tag}${payload}`;
   // eslint-disable-next-line no-console
   console.debug("[UIDBG]", line);
-  // Mirror to the dev terminal via the backend (best-effort; absent in a browser).
+  // Into the shared log file (best-effort; absent in a plain browser).
   try {
-    void invoke("debug_log", { line }).catch(() => {});
+    void debug(line).catch(() => {});
   } catch {
     /* not running under Tauri */
   }

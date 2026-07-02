@@ -424,7 +424,7 @@ pub async fn stream_v2(
     let manifest: ManifestV2 = serde_ipld_dagcbor::from_slice(&fetch_bytes(rpc, root).await?)?;
 
     if manifest.v != 2 {
-        eprintln!("[stream] {root}: v1 root -> full reassemble (no streaming)");
+        log::info!(target: "stream", "{root}: v1 root -> full reassemble (no streaming)");
         let bytes = reassemble(rpc, root).await?;
         *state.skeleton.lock().unwrap() = bytes;
         let _ = events.send(StreamEvent::Skeleton { plan: PlanV2::default(), samples: 0 });
@@ -460,8 +460,9 @@ pub async fn stream_v2(
     });
     let dropped = dropped - plan.checkpoints.len();
 
-    eprintln!(
-        "[stream] {root}: v2 — {} streamed samples, {} checkpoints{}",
+    log::info!(
+        target: "stream",
+        "{root}: v2 — {} streamed samples, {} checkpoints{}",
         samples.len(),
         plan.checkpoints.len(),
         if dropped > 0 { format!(" ({dropped} checkpoint(s) pruned — referenced un-streamed slots)") } else { String::new() }

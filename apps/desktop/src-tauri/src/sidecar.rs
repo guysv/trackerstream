@@ -55,14 +55,23 @@ impl Sidecar {
             .arg("0")
             .arg("--rpc")
             .arg(&rpc_addr)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
+            // Both streams are piped into the app's log hub (tauri-plugin-log) under the
+            // `tsnode` target, so the child's output lands in the rotating log file — the old
+            // null/inherit setup dropped stdout entirely and left stderr terminal-only.
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         if !bootstrap.is_empty() {
             cmd.arg("--bootstrap").arg(bootstrap);
         }
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn tsnode at {}", bin.display()))?;
+        if let Some(out) = child.stdout.take() {
+            forward_output(out);
+        }
+        if let Some(err) = child.stderr.take() {
+            forward_output(err);
+        }
 
         let rpc = NodeRpc::new(&rpc_addr);
         let mut sc = Sidecar {
@@ -103,6 +112,31 @@ impl Drop for Sidecar {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Forward one of the child's output streams into the log hub, line by line, on a detached
+/// reader thread (exits when the pipe closes, i.e. when the child dies). The Go side prefixes
+/// its own lines with "[tsnode] " — stripped here since the log target already says tsnode.
+/// go-log (libp2p internals, enabled via GOLOG_LOG_LEVEL, which the child inherits) tags lines
+/// with a tab-separated level — mapped so real errors keep their severity in the file.
+fn forward_output(stream: impl std::io::Read + Send + 'static) {
+    use std::io::{BufRead, BufReader};
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { break };
+            let msg = line.strip_prefix("[tsnode] ").unwrap_or(&line);
+            let level = if line.contains("\tERROR\t") {
+                log::Level::Error
+            } else if line.contains("\tWARN\t") {
+                log::Level::Warn
+            } else if line.contains("\tDEBUG\t") {
+                log::Level::Debug
+            } else {
+                log::Level::Info
+            };
+            log::log!(target: "tsnode", level, "{msg}");
+        }
+    });
 }
 
 /// Best-effort: terminate any leftover tsnode process still bound to `repo` (an orphan from a
