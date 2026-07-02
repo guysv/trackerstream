@@ -360,6 +360,28 @@ itself, and the social one: "what is this person into?"
   yet can be requested via the ordinary announce machinery (the responder just
   re-announces it, suppression permitting).
 
+### Deep links via web redirect + fragment payload (near-term, Phase 4 shape)
+
+`https://trackerstream.xyz/p/<name>#<b64(record ++ doc)>` — an HTTPS link (clickable in
+any chat app, unlike custom schemes) served by the existing apps/server as a dumb
+landing page: app installed → fires `trackerstream://playlist/<name>` with the fragment
+passed through; not installed → download page. The onboarding funnel in one URL.
+
+- **The fragment IS the content channel.** Fragments never reach the server, and the
+  payload is the same self-certifying `{record, doc}` envelope as gossip — the app
+  verifies it identically (signature → doc hash → CID). A fresh install resolves
+  INSTANTLY, no gossip warmup, and then follows updates via the normal tiers. The link
+  is a third transport (gossip = push, playlist-list = pull, link = out-of-band), all
+  with identical trust.
+- Server stores and sees nothing — the seed-holds-no-docs principle extends to the web
+  tier. No DHT needed; a DHT wouldn't have helped anyway (records ≠ docs).
+- A compact 20-track playlist ≈ ~3 KB URL. Oversized playlists fall back to a name-only
+  link resolved by gossip (pending "syncing…" state, ≤ one announce cycle). Rich chat
+  previews (og: tags) need server-side knowledge — off by default; optionally an
+  explicit `?t=<title>` the author consciously includes at share time.
+- If name-only links ever feel slow, the fix is a targeted re-announce request over the
+  playlist-list protocol (below) — pull-triggered push, still pure pubsub+seq.
+
 ### Hold beacons — popularity measurement (mid-term)
 
 Announce suppression deliberately hides holders (~one voice per playlist per cycle), so
