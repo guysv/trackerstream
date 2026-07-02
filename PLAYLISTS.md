@@ -337,3 +337,58 @@ anticipates exactly this).
     lifetime. Held rows survive local decay even with an expired record (the user chose
     to keep the data; it just can't propagate until the author returns). UI: library
     default + discover tab; "add to library" ≠ "duplicate to mine" (fork) ≠ delete.
+
+## 10. Future (documented, deliberately not built)
+
+Captured while fresh — none of this is v1 scope. Ordered roughly nearest-first.
+
+### Playlist-list peer protocol (near-term)
+
+A direct request/response stream protocol (`/trackerstream/playlist-list/1.0.0`,
+sibling of `PeerProtocol`): ask a connected peer "what playlists do you hold?", get back
+its library as `{name, seq, title}` entries — surfaced as a section in the peer card
+(PeersPanel/PeerDetail). Browsing a peer's library becomes a discovery channel in
+itself, and the social one: "what is this person into?"
+
+- **Disclosure model is pull, 1:1** — you reveal your library to the specific peer who
+  asked, not to the whole network (contrast with hold beacons below, which broadcast).
+  The responder answers with held+mine only — backing is a public act; the seen tier is
+  never disclosed. A "back silently" per-playlist toggle can exempt entries.
+- Response is names+titles only (no docs — the normal gossip path distributes those);
+  rate-limit requests per peer like everything else. An entry the asker doesn't hold
+  yet can be requested via the ordinary announce machinery (the responder just
+  re-announces it, suppression permitting).
+
+### Hold beacons — popularity measurement (mid-term)
+
+Announce suppression deliberately hides holders (~one voice per playlist per cycle), so
+popularity is invisible today. Restore the signal on a cheap side channel:
+
+- Each node broadcasts a small jittered **hold manifest** (~hourly): truncated 8-byte
+  name-hashes of its held+mine playlists — a 200-playlist library ≈ 1.6 KB message.
+  Gossipsub already signs messages, so origin authenticity is free.
+- Every node counts locally: name → distinct origins over a 24h sliding window (bounded
+  LRU). Frequency = holder-set liveness; variety = breadth. No consensus, none needed.
+- Uses: discover-tab ranking by backing, "backed by ~N holders" in the detail pane, and
+  a "rare — you're one of few holders" nudge (seeder culture, motivates the hold button).
+- **Privacy tension, decide when building:** beacons broadcast (hashed) library
+  contents under a peer id. Coherent stance: backing is public like seeding; only
+  held/mine beacon, never seen; still deserves a visible "back silently" opt-out, since
+  publish-is-explicit exists precisely to protect listening habits.
+- Sybil-gameable until the identity layer lands — accepted. The beacon FEED never
+  changes; only the weighting function does (see below).
+
+### Identity + friends tiers — Sybil resistance (long-term)
+
+A cross-device **identity layer** (one identity, many device keys) with a **friends
+layer** on top, giving three peer trust tiers — me / friends / everyone — mirroring the
+playlist tiers (mine / held / seen), one level up.
+
+- Identity fixes the deliberately-scoped-out v1 seams: multi-device edits of one
+  playlist key (today: newest-seq-wins race, single-keystore), and keystore portability.
+- Friends become a *trusted discovery channel*: friend attestations (hold beacons,
+  playlist-list answers) get a trust multiplier; stranger counts get discounted or
+  capped. Per-identity rate limits replace per-connection nuisance-bounds — actual
+  Sybil resistance for the discovery channel, in the same feeds built earlier.
+- Until then, per-peer rate limiting (§ validator) is explicitly a nuisance bound, and
+  that is fine (user decision, 2026-07-03).
