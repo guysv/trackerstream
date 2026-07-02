@@ -4,6 +4,7 @@
     plUpdate,
     plDelete,
     plPublish,
+    plHold,
     plState,
     plBump,
     playPlaylist,
@@ -97,6 +98,7 @@
     <div class="sub">
       {detail.items.length} tracks
       {#if detail.isMine}· mine{/if}
+      {#if detail.held}· <span class="heldtxt">in library</span>{/if}
       {#if detail.published}· <span class="pub">shared</span>{/if}
     </div>
 
@@ -118,8 +120,22 @@
           <button onclick={() => (confirmDelete = true)} disabled={busy}>delete</button>
         {/if}
       {:else}
+        <!-- Holder tier: "in library" = backed (re-announced, never evicted), still
+             following the author's updates. Duplicate = fork under your own key. -->
+        <button
+          class:held={detail.held}
+          onclick={async () => {
+            if (!detail) return;
+            await plHold(detail.name, !detail.held).catch((e) => (error = String(e)));
+            plBump();
+          }}
+        >
+          {detail.held ? "✓ in library" : "＋ add to library"}
+        </button>
         <button onclick={() => detail && duplicatePlaylist(detail)}>duplicate to mine</button>
-        <button onclick={del} disabled={busy}>remove</button>
+        {#if !detail.held}
+          <button onclick={del} disabled={busy}>remove</button>
+        {/if}
       {/if}
     </div>
 
@@ -189,6 +205,13 @@
   }
   .pub {
     color: var(--cyan);
+  }
+  .heldtxt {
+    color: var(--violet);
+  }
+  button.held {
+    border-color: var(--violet);
+    color: var(--violet);
   }
   .actions {
     display: flex;

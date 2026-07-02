@@ -324,3 +324,13 @@ anticipates exactly this).
     initial best-effort record put). No record puts, no provider records, no holder
     re-puts. `routing/get` on playlist names answers from the gossip buffer; a
     never-published playlist publishes seq 1 without any lookup.
+13. **Holder tier ("add to library", user call 2026-07-02).** Three tiers in
+    `playlists.db`: *mine* (signing key, editable, never evicted), *held* (foreign,
+    deliberately added — never evicted, follows the author's updates, read-only), and
+    *seen* (gossip brought it in — the discover pool, budget-evicted). **Re-announce is
+    library-only** (mine + held): backing is deliberate. **Decay:** only the author can
+    re-sign a record, so once no library re-announces a playlist its record ages to EOL
+    (≤168h) and every unbacked copy purges itself — network-wide decay within one record
+    lifetime. Held rows survive local decay even with an expired record (the user chose
+    to keep the data; it just can't propagate until the author returns). UI: library
+    default + discover tab; "add to library" ≠ "duplicate to mine" (fork) ≠ delete.

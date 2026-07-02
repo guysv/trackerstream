@@ -17,11 +17,15 @@
 
   let rows = $state<PlaylistMeta[]>([]);
   let error = $state<string | null>(null);
+  // Library = mine + held (what you back); discover = the seen tier gossip brought in.
+  // A non-empty search spans everything regardless of the toggle.
+  let tab = $state<"library" | "discover">("library");
 
   $effect(() => {
     const q = query.trim();
-    void plState.version; // re-query after any mutation
-    (q ? plSearch(q) : plList())
+    const t = tab;
+    void plState.version; // re-query after any mutation + the sync tick
+    (q ? plSearch(q) : plList(t === "library" ? "library" : "seen"))
       .then((r) => {
         rows = r;
         error = null;
@@ -53,7 +57,11 @@
 
 <div class="plists">
   <div class="phead">
-    <span>playlists · {rows.length}</span>
+    <span class="tabs">
+      <button class="tab" class:on={tab === "library"} onclick={() => (tab = "library")}>library</button>
+      <button class="tab" class:on={tab === "discover"} onclick={() => (tab = "discover")}>discover</button>
+      <span class="count">· {rows.length}</span>
+    </span>
     <button onclick={createNew}>＋ new</button>
   </div>
   <div class="plist">
@@ -69,6 +77,7 @@
         <span class="title">{p.title || "(untitled)"}</span>
         <span class="badges">
           {#if p.isMine}<span class="badge mine">mine</span>{/if}
+          {#if p.held}<span class="badge held">held</span>{/if}
           {#if p.published}<span class="badge pub">shared</span>{/if}
         </span>
         <span class="count">{p.tracks} trk</span>
@@ -79,8 +88,9 @@
       <div class="empty err">{error}</div>
     {:else if !rows.length}
       <div class="empty">
-        {#if query.trim()}no playlists match{:else}
-          no playlists yet — ＋ new, or save the queue as one{/if}
+        {#if query.trim()}no playlists match{:else if tab === "discover"}
+          nothing seen from the network yet{:else}
+          library empty — ＋ new, save the queue as one, or add from discover{/if}
       </div>
     {/if}
   </div>
@@ -144,6 +154,28 @@
   .badge.mine {
     color: var(--amber);
     border-color: var(--amber);
+  }
+  .badge.held {
+    color: var(--violet);
+    border-color: var(--violet);
+  }
+  .tabs {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  .tab {
+    font-size: 11px;
+    text-transform: uppercase;
+    padding: 0.15rem 0.5rem;
+  }
+  .tab.on {
+    border-color: var(--violet);
+    color: var(--violet);
+  }
+  .count {
+    color: var(--dim);
+    text-transform: none;
   }
   .badge.pub {
     color: var(--cyan);

@@ -100,6 +100,7 @@ pub struct PlaylistMeta {
     pub title: String,
     pub tracks: i64,
     pub is_mine: bool,
+    pub held: bool,
     pub published: bool,
     pub size_bytes: i64,
     pub last_update_at: i64,
@@ -160,6 +161,7 @@ impl Playlists {
                seq INTEGER NOT NULL DEFAULT 0,
                size_bytes INTEGER NOT NULL DEFAULT 0,
                is_mine INTEGER NOT NULL DEFAULT 0,
+               held INTEGER NOT NULL DEFAULT 0,
                published INTEGER NOT NULL DEFAULT 0,
                last_update_at INTEGER NOT NULL DEFAULT 0,
                last_played_at INTEGER
@@ -170,6 +172,8 @@ impl Playlists {
                name TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (name, seq)
              );",
         )?;
+        // Migration for pre-holder DBs: add `held` if missing (duplicate-column = fine).
+        let _ = conn.execute("ALTER TABLE playlists ADD COLUMN held INTEGER NOT NULL DEFAULT 0", []);
         let budget = std::env::var("TS_PLAYLIST_BUDGET_MB")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
@@ -248,14 +252,18 @@ impl Playlists {
         let db = self.db.lock().unwrap();
         loop {
             let used: i64 = db
-                .query_row("SELECT COALESCE(SUM(size_bytes),0) FROM playlists WHERE is_mine=0", [], |r| r.get(0))
+                .query_row(
+                    "SELECT COALESCE(SUM(size_bytes),0) FROM playlists WHERE is_mine=0 AND held=0",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap_or(0);
             if used <= self.budget {
                 return;
             }
             let victim: Option<String> = db
                 .query_row(
-                    "SELECT name FROM playlists WHERE is_mine=0 ORDER BY last_update_at ASC LIMIT 1",
+                    "SELECT name FROM playlists WHERE is_mine=0 AND held=0 ORDER BY last_update_at ASC LIMIT 1",
                     [],
                     |r| r.get(0),
                 )
@@ -417,7 +425,7 @@ impl Playlists {
     pub fn search(&self, q: &str) -> Result<Vec<PlaylistMeta>> {
         let q = q.trim();
         if q.is_empty() {
-            return self.list();
+            return self.list("all");
         }
         // Quote each token (FTS5 phrase), prefix-expand the last — same spirit as the
         // catalog search's term building.
@@ -429,7 +437,7 @@ impl Playlists {
         fts.push('*');
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(
-            "SELECT p.name, p.title, p.doc_json, p.is_mine, p.published, p.size_bytes,
+            "SELECT p.name, p.title, p.doc_json, p.is_mine, p.held, p.published, p.size_bytes,
                     p.last_update_at, p.last_played_at
              FROM playlists_fts f JOIN playlists p ON p.name = f.name
              WHERE playlists_fts MATCH ?1
@@ -439,22 +447,40 @@ impl Playlists {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    pub fn list(&self) -> Result<Vec<PlaylistMeta>> {
+    /// scope: "library" = mine + held; "seen" = unheld foreign (the discover pool);
+    /// anything else = all.
+    pub fn list(&self, scope: &str) -> Result<Vec<PlaylistMeta>> {
+        let filter = match scope {
+            "library" => "WHERE is_mine=1 OR held=1",
+            "seen" => "WHERE is_mine=0 AND held=0",
+            _ => "",
+        };
         let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare(
-            "SELECT name, title, doc_json, is_mine, published, size_bytes,
+        let mut stmt = db.prepare(&format!(
+            "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
                     last_update_at, last_played_at
-             FROM playlists ORDER BY is_mine DESC, last_update_at DESC LIMIT 500",
-        )?;
+             FROM playlists {filter} ORDER BY is_mine DESC, held DESC, last_update_at DESC LIMIT 500",
+        ))?;
         let rows = stmt.query_map([], row_meta)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Add/remove a FOREIGN playlist to/from the library ("holder" tier): held rows are
+    /// never evicted and are the ones this client re-announces (backs). No-op for mine.
+    pub fn set_held(&self, name: &str, held: bool) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE playlists SET held=?2 WHERE name=?1 AND is_mine=0",
+            params![name, held as i64],
+        )?;
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Result<Option<PlaylistDetail>> {
         let db = self.db.lock().unwrap();
         let row = db
             .query_row(
-                "SELECT name, title, doc_json, is_mine, published, size_bytes,
+                "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
                         last_update_at, last_played_at
                  FROM playlists WHERE name=?1",
                 params![name],
@@ -512,14 +538,49 @@ impl Playlists {
         ver
     }
 
-    /// One announce tick: re-gossip everything we hold a record for (the node applies
+    /// Decay (PLAYLISTS.md holder tier): purge SEEN-tier rows whose record has expired.
+    /// Only the author can re-sign, so once nobody in any library re-announces a
+    /// playlist its record ages to EOL (≤168h) and every unbacked copy evaporates —
+    /// network-wide decay within one record lifetime. Held and mine rows are exempt:
+    /// the user chose to keep those, expired record or not.
+    pub fn decay_expired(&self) {
+        let seen: Vec<(String, Option<String>)> = {
+            let db = self.db.lock().unwrap();
+            let Ok(mut stmt) =
+                db.prepare("SELECT name, record_b64 FROM playlists WHERE is_mine=0 AND held=0")
+            else {
+                return;
+            };
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        };
+        for (name, rec) in seen {
+            let alive = rec
+                .as_deref()
+                .map(|r| ipns::verify_b64_seq(&name, r).is_ok())
+                .unwrap_or(false);
+            if !alive {
+                let db = self.db.lock().unwrap();
+                let _ = db.execute("DELETE FROM playlists WHERE name=?1", params![name]);
+                let _ = db.execute("DELETE FROM playlists_fts WHERE name=?1", params![name]);
+            }
+        }
+    }
+
+    /// One announce tick: re-gossip the LIBRARY (mine + held — the node applies
     /// last-seen suppression, so this is cheap), dropping locally-expired records; own
-    /// records within the renewal margin of EOL are re-signed at seq+1 first.
+    /// records within the renewal margin of EOL are re-signed at seq+1 first. Also runs
+    /// the seen-tier decay pass, since both share the cycle cadence.
     pub async fn announce_once(&self) {
+        self.decay_expired();
+        // Library-only: mine + held re-announce; the seen tier is relayed live by
+        // gossipsub but NOT kept alive — unbacked playlists decay at record EOL.
         let held: Vec<(String, i64, String, String, bool)> = {
             let db = self.db.lock().unwrap();
             let Ok(mut stmt) = db.prepare(
-                "SELECT name, seq, record_b64, doc_json, is_mine FROM playlists WHERE record_b64 IS NOT NULL",
+                "SELECT name, seq, record_b64, doc_json, is_mine FROM playlists
+                 WHERE record_b64 IS NOT NULL AND (is_mine=1 OR held=1)",
             ) else {
                 return;
             };
@@ -626,10 +687,11 @@ fn row_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistMeta> {
         title: r.get(1)?,
         tracks,
         is_mine: r.get::<_, i64>(3)? != 0,
-        published: r.get::<_, i64>(4)? != 0,
-        size_bytes: r.get(5)?,
-        last_update_at: r.get(6)?,
-        last_played_at: r.get(7)?,
+        held: r.get::<_, i64>(4)? != 0,
+        published: r.get::<_, i64>(5)? != 0,
+        size_bytes: r.get(6)?,
+        last_update_at: r.get(7)?,
+        last_played_at: r.get(8)?,
     })
 }
 
@@ -820,11 +882,60 @@ mod tests {
             .await
             .expect("create");
         println!("create -> {}", serde_json::to_string(&meta).unwrap());
-        let list = pl.list().unwrap();
+        let list = pl.list("all").unwrap();
         println!("list -> {}", serde_json::to_string(&list).unwrap());
         let detail = pl.get(&meta.name).expect("get").expect("row");
         println!("get -> {}", serde_json::to_string(&detail).unwrap());
         assert_eq!(detail.items.len(), 1);
+    }
+
+    // Holder tier: held rows are exempt from budget eviction and decay; scoped lists
+    // split library (mine+held) from the seen/discover pool; un-held rows decay once
+    // their record expires.
+    #[test]
+    fn holder_tier_exempts_and_decays() {
+        let mut pl = mem();
+        pl.budget = 0; // any seen-tier bytes are over budget
+        let k1 = Keypair::generate_ed25519();
+        let k2 = Keypair::generate_ed25519();
+        let w1 = wire_for(&k1, &doc_bytes("kept"), 1);
+        let w2 = wire_for(&k2, &doc_bytes("transient"), 1);
+        pl.ingest_wire(&w1).unwrap();
+        pl.set_held(&w1.name, true).unwrap();
+        pl.ingest_wire(&w2).unwrap();
+
+        pl.enforce_budget();
+        assert!(pl.get(&w1.name).unwrap().is_some(), "held row must survive eviction");
+        assert!(pl.get(&w2.name).unwrap().is_none(), "seen row over budget must evict");
+
+        pl.ingest_wire(&w2).unwrap();
+        let lib = pl.list("library").unwrap();
+        assert!(lib.iter().any(|p| p.name == w1.name) && !lib.iter().any(|p| p.name == w2.name));
+        let seen = pl.list("seen").unwrap();
+        assert!(seen.iter().any(|p| p.name == w2.name) && !seen.iter().any(|p| p.name == w1.name));
+
+        // Expire both records in place; decay drops the seen row, keeps the held one.
+        for (kp, w) in [(&k1, &w1), (&k2, &w2)] {
+            let dead = rust_ipns::Record::new(
+                kp,
+                format!("/ipfs/{}", cid_for(&doc_bytes("x"))).as_bytes(),
+                ChronoDuration::seconds(-10),
+                9,
+                0,
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+            let db = pl.db.lock().unwrap();
+            db.execute(
+                "UPDATE playlists SET record_b64=?2 WHERE name=?1",
+                params![w.name, B64.encode(dead)],
+            )
+            .unwrap();
+        }
+        pl.decay_expired();
+        assert!(pl.get(&w1.name).unwrap().is_some(), "held row must survive decay");
+        assert!(pl.get(&w2.name).unwrap().is_none(), "unbacked row must decay at record EOL");
     }
 
     #[test]
