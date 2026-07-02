@@ -11,6 +11,7 @@ export interface PlaylistMeta {
   title: string;
   tracks: number;
   isMine: boolean;
+  held: boolean;
   published: boolean;
   sizeBytes: number;
   lastUpdateAt: number;
@@ -37,8 +38,15 @@ export interface PlaylistSyncStatus {
 /** The compact doc's track tuple: [catalog id, module name, song title]. */
 export type TrackTuple = [number, string, string];
 
+export type PlaylistScope = "library" | "seen" | "all";
+
 export const plSearch = (q: string) => invoke<PlaylistMeta[]>("playlist_search", { q });
-export const plList = () => invoke<PlaylistMeta[]>("playlist_list");
+export const plList = (scope: PlaylistScope = "all") =>
+  invoke<PlaylistMeta[]>("playlist_list", { scope });
+/** Add/remove a foreign playlist to/from the library — the "holder" tier: backed
+ * (re-announced), never evicted. Distinct from duplicate (fork) and delete. */
+export const plHold = (name: string, held: boolean) =>
+  invoke<void>("playlist_hold", { name, held });
 export const plGet = (name: string) => invoke<PlaylistDetail | null>("playlist_get", { name });
 export const plCreate = (title: string, tracks: TrackTuple[]) =>
   invoke<PlaylistMeta>("playlist_create", { title, tracks });

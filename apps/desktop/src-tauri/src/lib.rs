@@ -481,8 +481,22 @@ fn playlist_search(
 }
 
 #[tauri::command]
-fn playlist_list(pl: State<'_, Arc<playlists::Playlists>>) -> Result<Vec<playlists::PlaylistMeta>, String> {
-    pl.list().map_err(|e| e.to_string())
+fn playlist_list(
+    scope: Option<String>,
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<Vec<playlists::PlaylistMeta>, String> {
+    pl.list(scope.as_deref().unwrap_or("all")).map_err(|e| e.to_string())
+}
+
+/// Add/remove a foreign playlist to/from the library (the "holder" tier — backed,
+/// never evicted, re-announced).
+#[tauri::command]
+fn playlist_hold(
+    name: String,
+    held: bool,
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<(), String> {
+    pl.set_held(&name, held).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -623,6 +637,7 @@ pub fn run() {
             playlist_search,
             playlist_list,
             playlist_get,
+            playlist_hold,
             playlist_create,
             playlist_update,
             playlist_delete,
