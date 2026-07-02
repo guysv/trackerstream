@@ -78,6 +78,7 @@
         <span class="badges">
           {#if p.isMine}<span class="badge mine">mine</span>{/if}
           {#if p.held}<span class="badge held">held</span>{/if}
+          {#if p.dormant}<span class="badge dormant" title="record expired — author absent; fork to keep it shareable">dormant</span>{/if}
           {#if p.published}<span class="badge pub">shared</span>{/if}
         </span>
         <span class="count">{p.tracks} trk</span>
@@ -158,6 +159,10 @@
   .badge.held {
     color: var(--violet);
     border-color: var(--violet);
+  }
+  .badge.dormant {
+    color: var(--hot);
+    border-color: var(--hot);
   }
   .tabs {
     display: flex;

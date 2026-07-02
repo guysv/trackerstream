@@ -99,8 +99,17 @@
       {detail.items.length} tracks
       {#if detail.isMine}· mine{/if}
       {#if detail.held}· <span class="heldtxt">in library</span>{/if}
+      {#if detail.dormant}· <span class="dormant">dormant</span>{/if}
       {#if detail.published}· <span class="pub">shared</span>{/if}
     </div>
+
+    {#if detail.dormant}
+      <div class="dnote">
+        this playlist's record has expired — its author hasn't re-signed it in over a
+        week, so nobody (including you) can share it onward. your copy stays playable.
+        <b>duplicate to mine</b> forks it under your key to make it shareable again.
+      </div>
+    {/if}
 
     <div class="actions">
       <button
@@ -208,6 +217,17 @@
   }
   .heldtxt {
     color: var(--violet);
+  }
+  .dormant {
+    color: var(--hot);
+  }
+  .dnote {
+    border: 1px solid var(--hot);
+    border-radius: 4px;
+    padding: 0.6rem;
+    font-size: 11px;
+    color: var(--dim);
+    margin-bottom: 0.8rem;
   }
   button.held {
     border-color: var(--violet);
