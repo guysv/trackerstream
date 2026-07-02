@@ -13,9 +13,11 @@ export interface PlaylistMeta {
   isMine: boolean;
   held: boolean;
   published: boolean;
-  /** Record passed its EOL and only the author can re-sign: still playable, no longer
-   * propagating. The UI nudges toward "duplicate to mine". */
+  /** No longer propagating (record expired or author tombstoned it): still playable,
+   * the UI nudges toward "duplicate to mine". */
   dormant: boolean;
+  /** The author published a deletion; library copies are preserved dormant. */
+  tombstoned: boolean;
   sizeBytes: number;
   lastUpdateAt: number;
   lastPlayedAt: number | null;

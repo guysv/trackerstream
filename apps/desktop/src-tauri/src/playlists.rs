@@ -102,10 +102,13 @@ pub struct PlaylistMeta {
     pub is_mine: bool,
     pub held: bool,
     pub published: bool,
-    /// Foreign playlist whose record has passed EOL: still playable and held, but no
-    /// longer propagating (nobody can re-announce it) until its author re-signs. The
-    /// UI nudges toward "duplicate to mine" (fork under a living key).
+    /// No longer propagating: the record expired (author absent) or the author
+    /// tombstoned it. Still playable if kept; the UI nudges toward "duplicate to
+    /// mine" (fork under a living key).
     pub dormant: bool,
+    /// The author published a deletion. Library copies are preserved dormant — we
+    /// don't delete playlists the user chose to keep.
+    pub tombstoned: bool,
     pub size_bytes: i64,
     pub last_update_at: i64,
     pub last_played_at: Option<i64>,
@@ -179,6 +182,7 @@ impl Playlists {
         // Migrations for older DBs (duplicate-column errors = already applied, fine).
         let _ = conn.execute("ALTER TABLE playlists ADD COLUMN held INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE playlists ADD COLUMN eol INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE playlists ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0", []);
         backfill_eol(&conn);
         let budget = std::env::var("TS_PLAYLIST_BUDGET_MB")
             .ok()
@@ -234,10 +238,31 @@ impl Playlists {
 
         let db = self.db.lock().unwrap();
         if doc.del {
-            // Tombstone: drop the local copy (also for our own name — a delete from
-            // another install of the same identity wins by seq, exactly like any edit).
-            db.execute("DELETE FROM playlists WHERE name=?1", params![w.name])?;
-            db.execute("DELETE FROM playlists_fts WHERE name=?1", params![w.name])?;
+            // Tombstone. SEEN-tier copies drop; LIBRARY copies (held/mine) are
+            // preserved DORMANT — we don't delete playlists the user chose to keep.
+            // Clearing record_b64 makes the row un-announceable (the deletion is
+            // honored on the network) and advancing seq to the tombstone's blocks
+            // replayed older records; a genuine author republish (seq+1) revives the
+            // row through the normal upsert path.
+            let in_library: bool = db
+                .query_row(
+                    "SELECT is_mine OR held FROM playlists WHERE name=?1",
+                    params![w.name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0)
+                != 0;
+            if in_library {
+                db.execute(
+                    "UPDATE playlists SET seq=?2, record_b64=NULL, tombstoned=1, published=0,
+                       last_update_at=?3 WHERE name=?1",
+                    params![w.name, seq as i64, now_secs()],
+                )?;
+            } else {
+                db.execute("DELETE FROM playlists WHERE name=?1", params![w.name])?;
+                db.execute("DELETE FROM playlists_fts WHERE name=?1", params![w.name])?;
+            }
             return Ok(true);
         }
         upsert_row(&db, &w.name, &doc, &doc_bytes, Some(&w.record), seq as i64, record_eol_secs(&w.record))?;
@@ -444,7 +469,7 @@ impl Playlists {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(
             "SELECT p.name, p.title, p.doc_json, p.is_mine, p.held, p.published, p.size_bytes,
-                    p.last_update_at, p.last_played_at, p.eol
+                    p.last_update_at, p.last_played_at, p.eol, p.tombstoned
              FROM playlists_fts f JOIN playlists p ON p.name = f.name
              WHERE playlists_fts MATCH ?1
              ORDER BY bm25(playlists_fts) LIMIT 200",
@@ -464,7 +489,7 @@ impl Playlists {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(&format!(
             "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
-                    last_update_at, last_played_at, eol
+                    last_update_at, last_played_at, eol, tombstoned
              FROM playlists {filter} ORDER BY is_mine DESC, held DESC, last_update_at DESC LIMIT 500",
         ))?;
         let rows = stmt.query_map([], row_meta)?;
@@ -487,7 +512,7 @@ impl Playlists {
         let row = db
             .query_row(
                 "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
-                        last_update_at, last_played_at, eol
+                        last_update_at, last_played_at, eol, tombstoned
                  FROM playlists WHERE name=?1",
                 params![name],
                 row_meta,
@@ -692,6 +717,7 @@ fn upsert_row(
            record_b64=COALESCE(excluded.record_b64, playlists.record_b64),
            seq=CASE WHEN ?5 < 0 THEN playlists.seq ELSE ?5 END,
            eol=CASE WHEN ?8 < 0 THEN playlists.eol ELSE ?8 END,
+           tombstoned=0,
            size_bytes=excluded.size_bytes,
            last_update_at=excluded.last_update_at",
         params![
@@ -720,6 +746,7 @@ fn row_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistMeta> {
         .unwrap_or(0);
     let is_mine = r.get::<_, i64>(3)? != 0;
     let eol: i64 = r.get(9)?;
+    let tombstoned = r.get::<_, i64>(10)? != 0;
     Ok(PlaylistMeta {
         name: r.get(0)?,
         title: r.get(1)?,
@@ -727,9 +754,10 @@ fn row_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistMeta> {
         is_mine,
         held: r.get::<_, i64>(4)? != 0,
         published: r.get::<_, i64>(5)? != 0,
-        // Mine rows auto-renew on the announce cycle, so dormancy is a foreign-row
-        // concept: record present, EOL known, and passed.
-        dormant: !is_mine && eol > 0 && eol < now_secs(),
+        // Dormant = can't propagate: tombstoned by the author, or (foreign rows only —
+        // mine auto-renew on the announce cycle) the record aged past its EOL.
+        dormant: tombstoned || (!is_mine && eol > 0 && eol < now_secs()),
+        tombstoned,
         size_bytes: r.get(6)?,
         last_update_at: r.get(7)?,
         last_played_at: r.get(8)?,
@@ -831,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_deletes_row() {
+    fn tombstone_deletes_seen_rows() {
         let pl = mem();
         let kp = Keypair::generate_ed25519();
         let w = wire_for(&kp, &doc_bytes("alive"), 1);
@@ -840,6 +868,42 @@ mod tests {
         let wt = wire_for(&kp, &tomb, 2);
         pl.ingest_wire(&wt).unwrap();
         assert!(pl.get(&w.name).unwrap().is_none());
+    }
+
+    // Library copies survive a tombstone as dormant (we don't delete playlists the user
+    // chose to keep): record cleared (never re-announced), seq pinned at the tombstone's
+    // (replays can't resurrect), doc still playable — and a genuine author republish at
+    // seq+1 revives the row.
+    #[test]
+    fn tombstone_preserves_held_rows_dormant_and_republish_revives() {
+        let pl = mem();
+        let kp = Keypair::generate_ed25519();
+        let w = wire_for(&kp, &doc_bytes("keeper"), 1);
+        pl.ingest_wire(&w).unwrap();
+        pl.set_held(&w.name, true).unwrap();
+
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        pl.ingest_wire(&wire_for(&kp, &tomb, 2)).unwrap();
+
+        let got = pl.get(&w.name).unwrap().expect("held row must survive the tombstone");
+        assert!(got.meta.dormant && got.meta.tombstoned);
+        assert_eq!(got.meta.title, "keeper", "kept doc stays playable");
+        let rec: Option<String> = {
+            let db = pl.db.lock().unwrap();
+            db.query_row("SELECT record_b64 FROM playlists WHERE name=?1", params![w.name], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(rec.is_none(), "tombstoned row must never be re-announced");
+
+        // Replayed pre-delete record (seq 1) must NOT resurrect it.
+        assert!(!pl.ingest_wire(&w).unwrap());
+        assert!(pl.get(&w.name).unwrap().unwrap().meta.tombstoned);
+
+        // Author republishes (seq 3): the held row revives in place.
+        pl.ingest_wire(&wire_for(&kp, &doc_bytes("reborn"), 3)).unwrap();
+        let back = pl.get(&w.name).unwrap().unwrap();
+        assert!(!back.meta.tombstoned && !back.meta.dormant && back.meta.held);
+        assert_eq!(back.meta.title, "reborn");
     }
 
     #[test]
