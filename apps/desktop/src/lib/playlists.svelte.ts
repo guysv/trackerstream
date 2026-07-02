@@ -57,6 +57,15 @@ export const itemTuples = (items: PlaylistItem[]): TrackTuple[] =>
 export const plState = $state({ version: 0 });
 export const plBump = () => plState.version++;
 
+// The Rust sync loop writes into playlists.db behind the UI's back (20s poll of the
+// sidecar), so bump the counter on a timer too — otherwise a playlist synced from the
+// network stays invisible until some local mutation happens to refresh the views.
+// Queries only actually run while playlist components are mounted, and they're local
+// SQLite reads. (window guard: this module also loads during SSR prerender.)
+if (typeof window !== "undefined") {
+  setInterval(plBump, 10_000);
+}
+
 // Playlist docs carry no root CIDs (by design — tracks resolve via the catalog only at
 // play time), so playing a playlist resolves entries through `getModule` first. Bounded
 // like the results table: a >200-track playlist plays its first 200.
