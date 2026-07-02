@@ -215,6 +215,7 @@
     align-items: center;
     padding: 0.2rem 0;
     height: 24px;
+    cursor: default; /* rows are dblclick targets, not links (matches QueuePanel) */
   }
   .trow:hover {
     background: var(--row-hover);
