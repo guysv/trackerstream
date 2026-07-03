@@ -180,6 +180,9 @@ export async function addTrackTo(name: string, h: ModuleHit): Promise<void> {
   const tuples = itemTuples(d.items);
   if (!tuples.some((t) => t[0] === h.id)) tuples.push(hitTuple(h));
   await plUpdate(name, d.title, tuples);
+  // If this is the private Liked Tracks playlist, flip the ♥ optimistically (reassign
+  // the reactive set) instead of waiting on the 10s refreshLiked() poll — mirrors toggleLike().
+  if (d.liked && !liked.ids.has(h.id)) liked.ids = new Set(liked.ids).add(h.id);
   plBump();
 }
 
