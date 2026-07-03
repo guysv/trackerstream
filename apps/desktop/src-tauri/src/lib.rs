@@ -691,16 +691,14 @@ pub fn run() {
     // The client log hub: everything routed through the `log` facade (backend, frontend via
     // the plugin's JS API, tsnode sidecar output via sidecar.rs) lands in one rotating file
     // in the OS app-log dir (macOS: ~/Library/Logs/xyz.trackerstream/) plus stdout for dev.
-    // TS_LOG=error|warn|info|debug|trace overrides the level (default: debug in dev builds,
-    // info in release) — a runtime knob, no rebuild needed.
+    // TS_LOG=error|warn|info|debug|trace overrides the level (default: info in both dev and
+    // release) — a runtime knob, no rebuild needed. Set TS_LOG=debug to bring back the
+    // frontend trace (debug.ts `pos.order`/`ev.*` events) and the sidecar's per-address
+    // dial chatter (see `sidecar::forward_output`).
     let level = std::env::var("TS_LOG")
         .ok()
         .and_then(|v| v.parse::<log::LevelFilter>().ok())
-        .unwrap_or(if cfg!(debug_assertions) {
-            log::LevelFilter::Debug
-        } else {
-            log::LevelFilter::Info
-        });
+        .unwrap_or(log::LevelFilter::Info);
     tauri::Builder::default()
         // Single-instance MUST be the first plugin registered (Tauri docs): on
         // Win/Linux a deep-link click launches a second process, whose argv URL the
