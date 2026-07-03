@@ -2,7 +2,16 @@
   import { getModule, type ModuleDetail, type ModuleHit } from "$lib/catalog";
   import { fmtTime, fmtBytes } from "$lib/format";
   import { enqueue } from "$lib/player.svelte";
-  import { plList, plCreate, addTrackTo, hitTuple, plBump, type PlaylistMeta } from "$lib/playlists.svelte";
+  import {
+    plList,
+    plCreate,
+    addTrackTo,
+    hitTuple,
+    plBump,
+    toggleLike,
+    isLiked,
+    type PlaylistMeta,
+  } from "$lib/playlists.svelte";
 
   let { id, onplay }: { id: number | null; onplay: (h: ModuleHit) => void } = $props();
 
@@ -23,7 +32,8 @@
   });
 
   async function openPlMenu() {
-    if (!plMenu) myLists = (await plList().catch(() => [])).filter((p) => p.isMine);
+    // Own playlists, minus "Liked Tracks" — the ♥ button is its canonical path.
+    if (!plMenu) myLists = (await plList().catch(() => [])).filter((p) => p.isMine && !p.liked);
     plMenu = !plMenu;
   }
 
@@ -52,6 +62,14 @@
     <div class="file">{detail.filename}</div>
     <div class="actions">
       <button class="play" onclick={() => onplay(detail!)}>▶ play</button>
+      <button
+        class="like"
+        class:on={isLiked(detail.id)}
+        title={isLiked(detail.id) ? "remove from Liked Tracks" : "add to Liked Tracks"}
+        onclick={() => detail && toggleLike(detail)}
+      >
+        {isLiked(detail.id) ? "♥" : "♡"}
+      </button>
       <button onclick={() => enqueue(detail!)}>+ queue</button>
       <button onclick={() => enqueue(detail!, true)}>play next</button>
       <span class="plwrap">
@@ -122,6 +140,10 @@
   .play {
     color: var(--accent);
     border-color: var(--accent);
+  }
+  .like.on {
+    color: var(--hot);
+    border-color: var(--hot);
   }
   .plwrap {
     position: relative;

@@ -27,6 +27,9 @@ const TRACKS_MAX: usize = 20_000;
 const TITLE_MAX: usize = 300;
 const FIELD_MAX: usize = 512;
 const LIFETIME: &str = "168h";
+/// Title of the private, per-client "Liked Tracks" playlist (Spotify-style). Its
+/// stable identity is the `liked` column, not this string (a user could rename it).
+const LIKED_TITLE: &str = "Liked Tracks";
 /// Republish an own record when it has less than this long to live.
 const RENEW_MARGIN_SECS: i64 = 24 * 3600;
 /// A name-only deep link stops waiting for gossip after this (≈ one announce cycle).
@@ -113,6 +116,9 @@ pub struct PlaylistMeta {
     /// The author published a deletion. Library copies are preserved dormant — we
     /// don't delete playlists the user chose to keep.
     pub tombstoned: bool,
+    /// The private per-client "Liked Tracks" playlist (Spotify-style). Always own +
+    /// unpublished; the UI pins it and hides share/delete.
+    pub liked: bool,
     pub size_bytes: i64,
     pub last_update_at: i64,
     pub last_played_at: Option<i64>,
@@ -178,6 +184,9 @@ pub struct Playlists {
     /// In-memory only: a link click is interactive; a rare transient doesn't merit
     /// surviving restarts. Entries resolve when the row lands, or expire (~15 min).
     pending: Mutex<HashMap<String, i64>>,
+    /// Serializes lazy creation of the singleton "Liked Tracks" playlist so two
+    /// concurrent first-likes can't mint two of it (held across the key_gen await).
+    liked_guard: tokio::sync::Mutex<()>,
 }
 
 impl Playlists {
@@ -213,6 +222,7 @@ impl Playlists {
         let _ = conn.execute("ALTER TABLE playlists ADD COLUMN held INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE playlists ADD COLUMN eol INTEGER NOT NULL DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE playlists ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute("ALTER TABLE playlists ADD COLUMN liked INTEGER NOT NULL DEFAULT 0", []);
         backfill_eol(&conn);
         let budget = std::env::var("TS_PLAYLIST_BUDGET_MB")
             .ok()
@@ -227,6 +237,7 @@ impl Playlists {
             pinned: Mutex::new(None),
             manifest_hash: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            liked_guard: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -491,6 +502,75 @@ impl Playlists {
         Ok(())
     }
 
+    // -- liked tracks (the private, per-client "Liked Tracks" playlist) --
+
+    /// The name of the singleton "Liked Tracks" playlist, creating it on first use.
+    /// It's a normal own playlist (is_mine=1) flagged `liked=1`, never published —
+    /// private by construction. Serialized so two concurrent first-likes can't mint two.
+    pub async fn ensure_liked(&self) -> Result<String> {
+        let _guard = self.liked_guard.lock().await;
+        if let Some(name) = self.liked_name()? {
+            return Ok(name);
+        }
+        let meta = self.create(LIKED_TITLE.to_string(), vec![]).await?;
+        let db = self.db.lock().unwrap();
+        db.execute("UPDATE playlists SET liked=1 WHERE name=?1", params![meta.name])?;
+        Ok(meta.name)
+    }
+
+    /// The liked playlist's name if it exists — a pure read (never creates the row).
+    pub fn liked_name(&self) -> Result<Option<String>> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .query_row("SELECT name FROM playlists WHERE liked=1 LIMIT 1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Toggle a track's membership in "Liked Tracks" (Spotify-style ♥), creating the
+    /// liked playlist on first use. Returns the new state: `true` = now liked. Private by
+    /// default (nothing hits the network), but if the user has *shared* their liked
+    /// playlist this republishes it (seq+1) so the public copy stays current — the toggle
+    /// routes through `update()`, which owns that republish-if-published logic.
+    pub async fn like_toggle(&self, track: (i64, String, String)) -> Result<bool> {
+        let name = self.ensure_liked().await?;
+        let (title, tracks, liked_now) = {
+            let db = self.db.lock().unwrap();
+            let (title, doc_json): (String, String) = db.query_row(
+                "SELECT title, doc_json FROM playlists WHERE name=?1",
+                params![name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let doc: PlaylistDoc = serde_json::from_str(&doc_json)?;
+            let mut tracks: Vec<(i64, String, String)> =
+                doc.ts.iter().map(|t| (t.0, t.1.clone(), t.2.clone())).collect();
+            let liked_now = match tracks.iter().position(|t| t.0 == track.0) {
+                Some(pos) => {
+                    tracks.remove(pos);
+                    false
+                }
+                None => {
+                    tracks.push(track);
+                    true
+                }
+            };
+            (title, tracks, liked_now)
+        };
+        self.update(&name, title, tracks).await?;
+        Ok(liked_now)
+    }
+
+    /// The catalog ids currently in the liked playlist (empty if none yet) — the "is
+    /// this liked" set the UI's heart buttons read. Pure read, never creates the row.
+    pub fn liked_ids(&self) -> Result<Vec<i64>> {
+        let db = self.db.lock().unwrap();
+        let doc_json: Option<String> = db
+            .query_row("SELECT doc_json FROM playlists WHERE liked=1 LIMIT 1", [], |r| r.get(0))
+            .optional()?;
+        let Some(doc_json) = doc_json else { return Ok(vec![]) };
+        let doc: PlaylistDoc = serde_json::from_str(&doc_json)?;
+        Ok(doc.ts.iter().map(|t| t.0).collect())
+    }
+
     // -- queries --
 
     pub fn search(&self, q: &str) -> Result<Vec<PlaylistMeta>> {
@@ -509,7 +589,7 @@ impl Playlists {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(
             "SELECT p.name, p.title, p.doc_json, p.is_mine, p.held, p.published, p.size_bytes,
-                    p.last_update_at, p.last_played_at, p.eol, p.tombstoned
+                    p.last_update_at, p.last_played_at, p.eol, p.tombstoned, p.liked
              FROM playlists_fts f JOIN playlists p ON p.name = f.name
              WHERE playlists_fts MATCH ?1
              ORDER BY bm25(playlists_fts) LIMIT 200",
@@ -529,7 +609,7 @@ impl Playlists {
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare(&format!(
             "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
-                    last_update_at, last_played_at, eol, tombstoned
+                    last_update_at, last_played_at, eol, tombstoned, liked
              FROM playlists {filter} ORDER BY is_mine DESC, held DESC, last_update_at DESC LIMIT 500",
         ))?;
         let rows = stmt.query_map([], row_meta)?;
@@ -567,7 +647,7 @@ impl Playlists {
         let row = db
             .query_row(
                 "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
-                        last_update_at, last_played_at, eol, tombstoned
+                        last_update_at, last_played_at, eol, tombstoned, liked
                  FROM playlists WHERE name=?1",
                 params![name],
                 row_meta,
@@ -993,6 +1073,7 @@ fn row_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistMeta> {
         // mine auto-renew on the announce cycle) the record aged past its EOL.
         dormant: tombstoned || (!is_mine && eol > 0 && eol < now_secs()),
         tombstoned,
+        liked: r.get::<_, i64>(11)? != 0,
         size_bytes: r.get(6)?,
         last_update_at: r.get(7)?,
         last_played_at: r.get(8)?,
@@ -1003,6 +1084,18 @@ fn row_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistMeta> {
 /// (the suppression that makes this polite lives node-side; expired-own renewal lives
 /// in `announce_once`).
 pub async fn run_loops(pl: Arc<Playlists>) {
+    // Every client always has a private "Liked Tracks" playlist (Spotify-style): create
+    // it eagerly so it's in the library from first launch. Detached so a slow/absent
+    // node's key_gen can't gate the sync loop; a failure is harmless — the first ♥
+    // recreates it lazily via like_toggle.
+    tokio::spawn({
+        let pl = pl.clone();
+        async move {
+            if let Err(e) = pl.ensure_liked().await {
+                log::debug!("liked playlist ensure at startup failed (retries on first like): {e}");
+            }
+        }
+    });
     let mut cursor = 0u64;
     let mut ticks: u64 = 0;
     // First announce soon after startup (make our playlists discoverable), then ~15min.
@@ -1185,6 +1278,39 @@ mod tests {
         let m = pl.manifest().unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, seen.name);
+    }
+
+    // The "Liked Tracks" playlist is private by construction: own + unpublished, so it
+    // never appears in the disclosure set (no leaked listening habits). `create()` needs
+    // a live node for key_gen, so the row is injected directly here — the same shortcut
+    // the budget/manifest tests use.
+    #[test]
+    fn liked_playlist_is_private_and_identified() {
+        let pl = mem();
+        let doc = PlaylistDoc {
+            v: 1,
+            t: LIKED_TITLE.into(),
+            del: false,
+            ts: vec![TrackRef(1, "a.it".into(), "A".into()), TrackRef(2, "b.it".into(), "B".into())],
+        };
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        {
+            let db = pl.db.lock().unwrap();
+            upsert_row(&db, "likedname", &doc, &bytes, None, 0, 0).unwrap();
+            db.execute(
+                "UPDATE playlists SET is_mine=1, liked=1, key_name='playlist-liked' WHERE name=?1",
+                params!["likedname"],
+            )
+            .unwrap();
+        }
+        assert_eq!(pl.liked_name().unwrap().as_deref(), Some("likedname"));
+        assert_eq!(pl.liked_ids().unwrap(), vec![1, 2]);
+        // Private by default — an unpublished liked playlist is never disclosed (until
+        // the user explicitly shares it, at which point it's a normal published own row).
+        assert!(pl.manifest().unwrap().is_empty());
+        // Surfaced in the library list with the liked flag set for the UI.
+        let lib = pl.list("library").unwrap();
+        assert!(lib.iter().any(|p| p.name == "likedname" && p.liked && p.is_mine));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { player, nowPlaying } from "$lib/player.svelte";
   import { fmtTime } from "$lib/format";
+  import { toggleLike, isLiked } from "$lib/playlists.svelte";
 
   let {
     onnext,
@@ -50,6 +51,17 @@
 
   <div class="center">
     <div class="track">
+      {#if nowPlaying.hit}
+        {@const h = nowPlaying.hit}
+        <button
+          class="like"
+          class:on={isLiked(h.id)}
+          title={isLiked(h.id) ? "remove from Liked Tracks" : "add to Liked Tracks"}
+          onclick={() => toggleLike(h)}
+        >
+          {isLiked(h.id) ? "♥" : "♡"}
+        </button>
+      {/if}
       <span class="name">{nowPlaying.hit?.title || nowPlaying.hit?.filename || "—"}</span>
       {#if nowPlaying.buffering}<span class="buffering">buffering… {nowPlaying.pct}%</span>
       {:else if nowPlaying.streaming}<span class="streaming">streaming {nowPlaying.pct}%</span>{/if}
@@ -163,6 +175,20 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .like {
+    padding: 0 0.35rem;
+    line-height: 1;
+    background: none;
+    border: none;
+    color: var(--dim);
+    align-self: center;
+  }
+  .like:hover {
+    color: var(--hot);
+  }
+  .like.on {
+    color: var(--hot);
   }
   .streaming {
     color: var(--cyan);

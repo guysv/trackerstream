@@ -210,7 +210,9 @@ Delete of a published playlist publishes the tombstone first, then removes local
 **Tauri commands** (register in `src-tauri/src/lib.rs:537-551`):
 `playlist_search(q)` / `playlist_list(sort)` / `playlist_get(name)` — local SQLite;
 `playlist_create(title, tracks)` / `playlist_update(name, doc)` / `playlist_delete(name)`
-/ `playlist_publish(name)`; `playlist_sync_status()` — counts, bytes, budget.
+/ `playlist_publish(name)`; `playlist_sync_status()` — counts, bytes, budget;
+`playlist_like_toggle(track)` / `playlist_liked_ids()` / `playlist_liked_name()` — the
+private "Liked Tracks" playlist (§9 №19).
 
 ## 6. UI
 
@@ -408,6 +410,20 @@ saturation; malformed dies at the local validator.
 18. **`want` re-announce bypasses suppression** (30s per-name cooldown): the asker
     demonstrably missed the last announce — the pull-triggered push for late joiners and
     name-only links, still pure pubsub+seq (zero-DHT unchanged).
+19. **"Liked Tracks" playlist (Spotify-style ♥, user call 2026-07-03).** Every client
+    auto-provisions one own playlist flagged `liked=1` — its *stable identity* (a user
+    could rename the title, so the flag, not the string, is canonical). It is an ordinary
+    mine playlist in every other respect: **private by default** (unpublished → excluded
+    from the disclosure set §9 №15, so listening habits stay private), but **explicitly
+    shareable** — the same "Share" opt-in as any playlist makes it public. Not a locked
+    fixture: it is deletable (the tombstone/retract path — otherwise sharing would be
+    irreversible, since there is no unpublish), and a fresh empty one is re-provisioned
+    eagerly at startup and lazily on the next like. The ♥ button (module detail + now-
+    playing bar) toggles membership by catalog id; **the toggle routes through `update()`**
+    so that while the liked playlist is shared, each like/unlike republishes (seq+1) and
+    the public copy stays current. New column `liked`; new RPCs `playlist_like_toggle`,
+    `playlist_liked_ids`, `playlist_liked_name`. The UI pins it to the top of the library,
+    marks it ♥, and drops it from the "add to playlist" menu (the heart is its one path).
 
 ## 10. Future (documented, deliberately not built)
 

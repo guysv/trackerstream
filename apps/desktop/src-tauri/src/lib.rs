@@ -562,6 +562,31 @@ fn playlist_sync_status(pl: State<'_, Arc<playlists::Playlists>>) -> Result<play
     pl.status().map_err(|e| e.to_string())
 }
 
+// ---- liked tracks (the private, per-client "Liked Tracks" playlist — Spotify-style) ----
+
+/// Toggle a track's membership in "Liked Tracks" (the ♥ button). Creates the private
+/// liked playlist on first use; returns `true` if the track is now liked. Never
+/// published — private by construction.
+#[tauri::command]
+async fn playlist_like_toggle(
+    track: (i64, String, String),
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<bool, String> {
+    pl.like_toggle(track).await.map_err(|e| e.to_string())
+}
+
+/// The catalog ids currently liked — the set the heart buttons read (empty if none yet).
+#[tauri::command]
+fn playlist_liked_ids(pl: State<'_, Arc<playlists::Playlists>>) -> Result<Vec<i64>, String> {
+    pl.liked_ids().map_err(|e| e.to_string())
+}
+
+/// The liked playlist's name (creating it if needed) — for the UI to open it.
+#[tauri::command]
+async fn playlist_liked_name(pl: State<'_, Arc<playlists::Playlists>>) -> Result<String, String> {
+    pl.ensure_liked().await.map_err(|e| e.to_string())
+}
+
 // ---- playlist-list peer protocol (PLAYLISTS.md §10, shipped) ----
 
 /// One disclosed playlist of a peer, joined against the local DB for the
@@ -760,6 +785,9 @@ pub fn run() {
             playlist_played,
             playlist_pin,
             playlist_sync_status,
+            playlist_like_toggle,
+            playlist_liked_ids,
+            playlist_liked_name,
             peer_playlists,
             playlist_request,
             playlist_ingest_link,
