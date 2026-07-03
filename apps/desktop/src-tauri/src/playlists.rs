@@ -502,6 +502,55 @@ impl Playlists {
         Ok(())
     }
 
+    /// "Unshare" — make a shared own playlist private again *without losing the data*
+    /// (unlike delete). Publishes a tombstone (best-effort network retract: online
+    /// syncers drop it; the record dies at EOL ≤168h regardless), then keeps the row
+    /// local + editable with `published=0` and no record — off the disclosure set and no
+    /// longer re-announced. The seq advances past the tombstone so a later re-Share
+    /// supersedes it and revives holders' copies. Copies others already saved, forks, and
+    /// offline nodes persist — no gossip system can claw those back.
+    pub async fn unpublish(&self, name: &str) -> Result<()> {
+        let (key_name, published, seq) = {
+            let db = self.db.lock().unwrap();
+            db.query_row(
+                "SELECT key_name, published, seq FROM playlists WHERE name=?1 AND is_mine=1",
+                params![name],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, i64>(1)? != 0,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("not my playlist: {name}"))?
+        };
+        let mut new_seq = seq;
+        if published {
+            if let Some(key_name) = key_name {
+                let tomb =
+                    serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] })?;
+                let next = self.next_seq(name, seq).await;
+                match self.rpc.playlist_publish(&key_name, next, LIFETIME, tomb).await {
+                    // Best-effort: even if the tombstone fails to send, we still go private
+                    // locally and stop renewing — the live record then expires at EOL.
+                    Ok(_) => new_seq = next as i64,
+                    Err(e) => log::warn!("unshare tombstone publish failed for {name}: {e}"),
+                }
+            }
+        }
+        // Keep doc_json/title/tracks; only reset the publish state. tombstoned stays 0 —
+        // the local copy is a live private playlist, not a tombstone.
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "UPDATE playlists SET published=0, record_b64=NULL, eol=0, tombstoned=0, seq=?2,
+               last_update_at=?3 WHERE name=?1",
+            params![name, new_seq, now_secs()],
+        )?;
+        Ok(())
+    }
+
     // -- liked tracks (the private, per-client "Liked Tracks" playlist) --
 
     /// The name of the singleton "Liked Tracks" playlist, creating it on first use.
@@ -1311,6 +1360,44 @@ mod tests {
         // Surfaced in the library list with the liked flag set for the UI.
         let lib = pl.list("library").unwrap();
         assert!(lib.iter().any(|p| p.name == "likedname" && p.liked && p.is_mine));
+    }
+
+    // "Make private again": unpublish keeps the row + tracks but drops it from the
+    // disclosure set (record cleared, published=0) so it stops being shared. The network
+    // tombstone is best-effort and needs a live node, so this exercises the local state
+    // transition on an injected published row (rpc unreachable → tombstone logs + skips).
+    #[test]
+    fn unpublish_goes_private_but_keeps_the_data() {
+        let pl = mem();
+        let kp = Keypair::generate_ed25519();
+        let doc = doc_bytes("my mix");
+        let w = wire_for(&kp, &doc, 5);
+        pl.ingest_wire(&w).unwrap();
+        // Make it a published own row (as publish() would leave it).
+        {
+            let db = pl.db.lock().unwrap();
+            db.execute(
+                "UPDATE playlists SET is_mine=1, published=1, key_name='playlist-x' WHERE name=?1",
+                params![w.name],
+            )
+            .unwrap();
+        }
+        assert_eq!(pl.manifest().unwrap().len(), 1, "published own row is disclosed");
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(pl.unpublish(&w.name)).unwrap();
+
+        let got = pl.get(&w.name).unwrap().expect("row survives unpublish");
+        assert!(!got.meta.published, "now private");
+        assert!(!got.meta.tombstoned, "local copy is a live private playlist, not a tombstone");
+        assert_eq!(got.items.len(), 1, "tracks kept");
+        assert!(pl.manifest().unwrap().is_empty(), "off the disclosure set — no longer shared");
+        let rec: Option<String> = {
+            let db = pl.db.lock().unwrap();
+            db.query_row("SELECT record_b64 FROM playlists WHERE name=?1", params![w.name], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(rec.is_none(), "record cleared — announce loop won't re-gossip it");
     }
 
     #[test]

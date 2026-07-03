@@ -545,6 +545,15 @@ async fn playlist_publish(name: String, pl: State<'_, Arc<playlists::Playlists>>
     Ok(())
 }
 
+/// "Make private again" — best-effort tombstone retract, then keep the playlist local
+/// and editable (published=0). Distinct from delete, which also drops the data.
+#[tauri::command]
+async fn playlist_unpublish(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Result<(), String> {
+    pl.unpublish(&name).await.map_err(|e| e.to_string())?;
+    pl.push_manifest().await;
+    Ok(())
+}
+
 #[tauri::command]
 fn playlist_played(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Result<(), String> {
     pl.mark_played(&name).map_err(|e| e.to_string())
@@ -782,6 +791,7 @@ pub fn run() {
             playlist_update,
             playlist_delete,
             playlist_publish,
+            playlist_unpublish,
             playlist_played,
             playlist_pin,
             playlist_sync_status,
