@@ -187,6 +187,7 @@
   }
   .lheart {
     color: var(--hot);
+    margin-right: 0.35rem;
   }
   .badges {
     display: flex;
