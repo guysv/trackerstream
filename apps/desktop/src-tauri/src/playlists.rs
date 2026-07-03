@@ -363,16 +363,27 @@ impl Playlists {
     /// `playlist/publish` on the sidecar. Marks the row published and stores the record
     /// for the re-announce cycle.
     pub async fn publish(&self, name: &str) -> Result<()> {
-        let (key_name, doc_json, local_seq) = {
+        let (key_name, doc_json, local_seq, liked) = {
             let db = self.db.lock().unwrap();
             db.query_row(
-                "SELECT key_name, doc_json, seq FROM playlists WHERE name=?1 AND is_mine=1",
+                "SELECT key_name, doc_json, seq, liked FROM playlists WHERE name=?1 AND is_mine=1",
                 params![name],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)? != 0,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(|| anyhow!("not my playlist: {name}"))?
         };
+        // "Liked Tracks" is the private per-client playlist — never publishable.
+        if liked {
+            bail!("the Liked Tracks playlist is private and cannot be shared");
+        }
         let key_name = key_name.ok_or_else(|| anyhow!("playlist {name} has no key"))?;
         let seq = self.next_seq(name, local_seq).await;
         let (pub_name, record) = self
@@ -470,10 +481,10 @@ impl Playlists {
     /// Delete: a published own playlist gets a tombstone first (seq+1, 168h — syncers
     /// drop it, the record dies at EOL); a foreign playlist is just evicted locally.
     pub async fn delete(&self, name: &str) -> Result<()> {
-        let row: Option<(bool, bool, Option<String>, i64)> = {
+        let row: Option<(bool, bool, Option<String>, i64, bool)> = {
             let db = self.db.lock().unwrap();
             db.query_row(
-                "SELECT is_mine, published, key_name, seq FROM playlists WHERE name=?1",
+                "SELECT is_mine, published, key_name, seq, liked FROM playlists WHERE name=?1",
                 params![name],
                 |r| {
                     Ok((
@@ -481,12 +492,17 @@ impl Playlists {
                         r.get::<_, i64>(1)? != 0,
                         r.get::<_, Option<String>>(2)?,
                         r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
             .optional()?
         };
-        let Some((is_mine, published, key_name, seq)) = row else { return Ok(()) };
+        let Some((is_mine, published, key_name, seq, liked)) = row else { return Ok(()) };
+        // "Liked Tracks" is a permanent per-client playlist — not user-deletable.
+        if liked {
+            bail!("the Liked Tracks playlist cannot be deleted");
+        }
         if is_mine && published {
             if let Some(key_name) = key_name {
                 let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] })?;
@@ -576,10 +592,9 @@ impl Playlists {
     }
 
     /// Toggle a track's membership in "Liked Tracks" (Spotify-style ♥), creating the
-    /// liked playlist on first use. Returns the new state: `true` = now liked. Private by
-    /// default (nothing hits the network), but if the user has *shared* their liked
-    /// playlist this republishes it (seq+1) so the public copy stays current — the toggle
-    /// routes through `update()`, which owns that republish-if-published logic.
+    /// liked playlist on first use. Returns the new state: `true` = now liked. Always
+    /// private — the liked playlist can never be published (see `publish`/`delete` guards),
+    /// so this only mutates local state and never touches the network.
     pub async fn like_toggle(&self, track: (i64, String, String)) -> Result<bool> {
         let name = self.ensure_liked().await?;
         let (title, tracks, liked_now) = {

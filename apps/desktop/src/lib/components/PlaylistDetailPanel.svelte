@@ -185,7 +185,11 @@
       >
         ▶ play
       </button>
-      {#if detail.isMine}
+      {#if detail.isMine && detail.liked}
+        <!-- "Liked Tracks" is the private per-client playlist: never shared, never
+             deleted from the UI. Only play/edit affordances apply. -->
+        <span class="likednote">private · your Liked Tracks</span>
+      {:else if detail.isMine}
         {#if !confirmShare}
           <button onclick={() => (confirmShare = true)} disabled={busy}>
             {detail.published ? "re-share" : "share"}
@@ -332,6 +336,11 @@
   .play {
     color: var(--accent);
     border-color: var(--accent);
+  }
+  .likednote {
+    align-self: center;
+    color: var(--dim);
+    font-size: 11px;
   }
   .confirm {
     border: 1px solid var(--amber);
