@@ -7,6 +7,7 @@
 pub mod catalog;
 pub mod ipfs;
 pub mod ipns;
+pub mod link;
 pub mod playlists;
 pub mod rpc;
 pub mod sidecar;
@@ -489,14 +490,17 @@ fn playlist_list(
 }
 
 /// Add/remove a foreign playlist to/from the library (the "holder" tier — backed,
-/// never evicted, re-announced).
+/// never evicted, re-announced). Pushes the disclosure-set manifest right away so
+/// peer-list answers and beacons reflect the change without waiting a sync tick.
 #[tauri::command]
-fn playlist_hold(
+async fn playlist_hold(
     name: String,
     held: bool,
     pl: State<'_, Arc<playlists::Playlists>>,
 ) -> Result<(), String> {
-    pl.set_held(&name, held).map_err(|e| e.to_string())
+    pl.set_held(&name, held).map_err(|e| e.to_string())?;
+    pl.push_manifest().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -528,13 +532,17 @@ async fn playlist_update(
 
 #[tauri::command]
 async fn playlist_delete(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Result<(), String> {
-    pl.delete(&name).await.map_err(|e| e.to_string())
+    pl.delete(&name).await.map_err(|e| e.to_string())?;
+    pl.push_manifest().await;
+    Ok(())
 }
 
 /// The explicit "Share" action — the ONLY path that makes a playlist public.
 #[tauri::command]
 async fn playlist_publish(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Result<(), String> {
-    pl.publish(&name).await.map_err(|e| e.to_string())
+    pl.publish(&name).await.map_err(|e| e.to_string())?;
+    pl.push_manifest().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -554,6 +562,96 @@ fn playlist_sync_status(pl: State<'_, Arc<playlists::Playlists>>) -> Result<play
     pl.status().map_err(|e| e.to_string())
 }
 
+// ---- playlist-list peer protocol (PLAYLISTS.md §10, shipped) ----
+
+/// One disclosed playlist of a peer, joined against the local DB for the
+/// "in your library / you have this" markers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerPlaylistEntry {
+    name: String,
+    seq: u64,
+    title: String,
+    have: bool,
+    held: bool,
+    mine: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerPlaylists {
+    supported: bool,
+    playlists: Vec<PeerPlaylistEntry>,
+}
+
+/// Ask one connected peer for its disclosure set (deliberate 1:1 pull — the peer card's
+/// "playlists" section). supported=false = old build or the seed, a normal answer.
+#[tauri::command]
+async fn peer_playlists(
+    peer_id: String,
+    state: State<'_, NodeState>,
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<PeerPlaylists, String> {
+    let (entries, _reann, supported) =
+        state.rpc.playlist_peer_list(&peer_id, &[]).await.map_err(|e| e.to_string())?;
+    let playlists = entries
+        .into_iter()
+        .map(|e| {
+            let (mine, held, have) = pl.local_flags(&e.name);
+            PeerPlaylistEntry { name: e.name, seq: e.seq, title: e.title, have, held, mine }
+        })
+        .collect();
+    Ok(PeerPlaylists { supported, playlists })
+}
+
+/// Request a targeted re-announce of one playlist from a peer that holds it (the peer
+/// card's "get" button; also the name-only deep-link resolver). The doc then arrives
+/// through the normal gossip → sync path. Returns how many entries were re-announced.
+#[tauri::command]
+async fn playlist_request(
+    peer_id: String,
+    name: String,
+    state: State<'_, NodeState>,
+) -> Result<u64, String> {
+    let (_, reann, _) =
+        state.rpc.playlist_peer_list(&peer_id, &[name]).await.map_err(|e| e.to_string())?;
+    Ok(reann)
+}
+
+// ---- deep links (PLAYLISTS.md §10, shipped) ----
+
+/// Handle an incoming trackerstream:// or https://trackerstream.xyz/p/ link: verify the
+/// fragment payload through the normal ingest path, or chase a name-only link via
+/// gossip. Returns {name, status: "ready" | "pending"}.
+#[tauri::command]
+async fn playlist_ingest_link(
+    url: String,
+    pl: State<'_, Arc<playlists::Playlists>>,
+) -> Result<playlists::LinkStatus, String> {
+    pl.ingest_link(&url).await.map_err(|e| e.to_string())
+}
+
+/// Build the shareable HTTPS link for a stored playlist (requires a live record).
+#[tauri::command]
+fn playlist_copy_link(name: String, pl: State<'_, Arc<playlists::Playlists>>) -> Result<String, String> {
+    pl.copy_link(&name).map_err(|e| e.to_string())
+}
+
+/// Name-only links still waiting on gossip (drives the "syncing…" placeholder).
+#[tauri::command]
+fn playlist_pending(pl: State<'_, Arc<playlists::Playlists>>) -> Vec<String> {
+    pl.pending_names()
+}
+
+/// Hold-beacon backer counts for the given names (discover ranking, "backed by ~N").
+#[tauri::command]
+async fn playlist_backers(
+    names: Vec<String>,
+    state: State<'_, NodeState>,
+) -> Result<HashMap<String, u64>, String> {
+    state.rpc.playlist_backers(&names).await.map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // The client log hub: everything routed through the `log` facade (backend, frontend via
@@ -570,6 +668,16 @@ pub fn run() {
             log::LevelFilter::Info
         });
     tauri::Builder::default()
+        // Single-instance MUST be the first plugin registered (Tauri docs): on
+        // Win/Linux a deep-link click launches a second process, whose argv URL the
+        // "deep-link" feature forwards into onOpenUrl on THIS instance — registered
+        // any later, that URL is lost. The callback just surfaces the window.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(level)
@@ -651,7 +759,13 @@ pub fn run() {
             playlist_publish,
             playlist_played,
             playlist_pin,
-            playlist_sync_status
+            playlist_sync_status,
+            peer_playlists,
+            playlist_request,
+            playlist_ingest_link,
+            playlist_copy_link,
+            playlist_pending,
+            playlist_backers
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

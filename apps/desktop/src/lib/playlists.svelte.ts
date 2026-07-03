@@ -66,6 +66,27 @@ export const plDelete = (name: string) => invoke<void>("playlist_delete", { name
 export const plPublish = (name: string) => invoke<void>("playlist_publish", { name });
 export const plStatus = () => invoke<PlaylistSyncStatus>("playlist_sync_status");
 
+// ---- deep links ----
+
+export interface LinkStatus {
+  name: string;
+  /** "ready" = row present locally; "pending" = name-only link, chasing via gossip. */
+  status: "ready" | "pending";
+}
+
+/** Ingest an incoming playlist link (payload verified in Rust; name-only pends). */
+export const plIngestLink = (url: string) =>
+  invoke<LinkStatus>("playlist_ingest_link", { url });
+/** Shareable HTTPS link for a stored playlist (errors if it has no live record). */
+export const plCopyLink = (name: string) => invoke<string>("playlist_copy_link", { name });
+/** Names from name-only links still waiting on gossip (the "syncing…" placeholder). */
+export const plPending = () => invoke<string[]>("playlist_pending");
+
+/** Hold-beacon backer counts (windowed distinct holders) for the given names.
+ * 0 = no beacon heard — normal for the first hour after startup. */
+export const plBackers = (names: string[]) =>
+  invoke<Record<string, number>>("playlist_backers", { names });
+
 export const hitTuple = (h: ModuleHit): TrackTuple => [h.id, h.filename, h.title];
 export const itemTuples = (items: PlaylistItem[]): TrackTuple[] =>
   items.map((i) => [i.id, i.modName, i.title]);

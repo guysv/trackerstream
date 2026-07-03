@@ -1,0 +1,84 @@
+<!doctype html>
+<!--
+  trackerstream playlist deep-link handoff (PLAYLISTS.md §10).
+
+  Served for every /p/* request (Caddyfile rewrites to this file). The URL is
+  /p/<name>#<b64url(record ++ doc)> — the fragment is the SAME self-certifying
+  envelope that rides gossip, and it NEVER reaches this server (fragments are not
+  sent in HTTP requests; nothing here logs, stores, or can even see it). This page
+  only: parses the name client-side, hands off to the desktop app via the
+  trackerstream:// scheme with the fragment passed through verbatim, and pitches
+  the install when the app isn't there. No external requests, no analytics, no og:
+  preview tags (a preview would require telling the server about the playlist).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" />
+  <meta name="robots" content="noindex" />
+  <title>trackerstream — playlist</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: #101014; color: #d8d8e0;
+      font: 14px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    main { max-width: 34rem; padding: 2rem; text-align: center; }
+    h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.04em; color: #a89bf0; }
+    .name { color: #6c6c78; font-size: 11px; word-break: break-all; margin: 0.6rem 0 1.6rem; }
+    a.btn, button.btn {
+      display: inline-block; margin: 0.3rem; padding: 0.55rem 1.2rem;
+      border: 1px solid #a89bf0; border-radius: 6px; background: none;
+      color: #a89bf0; font: inherit; cursor: pointer; text-decoration: none;
+    }
+    a.btn:hover, button.btn:hover { background: #a89bf01a; }
+    .dim { color: #6c6c78; font-size: 12px; margin-top: 1.4rem; }
+    .bad { color: #e07a7a; }
+    code { color: #8fd0b8; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>trackerstream</h1>
+    <div id="content">
+      <p>someone shared a tracker-music playlist with you.</p>
+      <div class="name" id="plname"></div>
+      <button class="btn" id="open">open in trackerstream</button>
+      <p class="dim">
+        nothing happened? you need the app — playlists live on a peer-to-peer network,
+        not on this server.
+        <!-- TODO: point at the real download page when one exists. -->
+        <a class="btn" href="/" rel="noreferrer">get trackerstream</a>
+      </p>
+      <p class="dim">
+        this page holds no data: the playlist travels inside the link itself
+        (<code>#…</code> never leaves your browser) and is verified by the app against
+        its author's signature.
+      </p>
+    </div>
+  </main>
+  <script>
+    (function () {
+      var m = location.pathname.match(/^\/p\/([1-9A-HJ-NP-Za-km-z]{1,128})\/?$/);
+      var content = document.getElementById("content");
+      if (!m) {
+        content.innerHTML = '<p class="bad">that’s not a valid playlist link.</p>';
+        return;
+      }
+      var name = m[1];
+      document.getElementById("plname").textContent = name;
+      // location.hash includes the leading '#' (empty string for name-only links);
+      // passed through VERBATIM — the app re-verifies the payload itself.
+      var target = "trackerstream://playlist/" + name + location.hash;
+      var go = function () { location.href = target; };
+      document.getElementById("open").addEventListener("click", go);
+      // Best-effort auto-handoff; browsers may require the click when no app is
+      // registered (they show their own "open app?" prompt when it is).
+      setTimeout(go, 400);
+    })();
+  </script>
+</body>
+</html>

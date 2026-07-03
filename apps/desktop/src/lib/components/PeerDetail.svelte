@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
   import { peers, speedHistory, connectedSince, clearSelection } from "$lib/peers.svelte";
-  import { peerDetail, type PeerDetail } from "$lib/p2p";
+  import { peerDetail, peerPlaylists, requestPlaylist, type PeerDetail, type PeerPlaylists } from "$lib/p2p";
   import { fmtBytes } from "$lib/format";
 
   let { peerId }: { peerId: string } = $props();
@@ -55,6 +55,33 @@
       await navigator.clipboard.writeText(peerId);
     } catch {
       /* clipboard unavailable */
+    }
+  }
+
+  // Peer's disclosed playlists: a deliberate 1:1 pull — fetched once when the card
+  // opens (and on the refresh button), never polled.
+  let plist = $state<PeerPlaylists | null>(null);
+  let plistLoading = $state(false);
+  let requested = $state<Set<string>>(new Set());
+
+  async function loadPlaylists(): Promise<void> {
+    plistLoading = true;
+    try {
+      plist = await peerPlaylists(peerId);
+    } catch {
+      plist = null; // peer gone / timeout — the section shows a retry
+    } finally {
+      plistLoading = false;
+    }
+  }
+  void loadPlaylists();
+
+  async function getPlaylist(name: string): Promise<void> {
+    requested = new Set(requested).add(name);
+    try {
+      await requestPlaylist(peerId, name);
+    } catch {
+      /* peer gone — the row stays marked; a re-open retries */
     }
   }
 </script>
@@ -126,6 +153,40 @@
         <span class="sub mono">{detail.protocols.join("  ")}</span>
       </div>
     {/if}
+
+    <!-- Peer's disclosed playlists (held + published-mine; pull, 1:1) -->
+    <div class="block">
+      <div class="plhead">
+        <span class="lbl">playlists</span>
+        <button class="mini" onclick={loadPlaylists} disabled={plistLoading} title="refresh">
+          {plistLoading ? "…" : "↻"}
+        </button>
+      </div>
+      {#if plist === null}
+        <span class="sub">{plistLoading ? "asking…" : "couldn't ask — retry ↻"}</span>
+      {:else if !plist.supported}
+        <span class="sub">peer doesn't share lists</span>
+      {:else if plist.playlists.length === 0}
+        <span class="sub">nothing shared</span>
+      {:else}
+        {#each plist.playlists as p (p.name)}
+          <div class="plrow">
+            <span class="pltitle" title={p.name}>{p.title || "(untitled)"}</span>
+            {#if p.mine}
+              <span class="plmark">yours</span>
+            {:else if p.held}
+              <span class="plmark ok">in library ✓</span>
+            {:else if p.have}
+              <span class="plmark">in discover</span>
+            {:else if requested.has(p.name)}
+              <span class="plmark">requested — check discover shortly</span>
+            {:else}
+              <button class="mini" onclick={() => getPlaylist(p.name)}>get</button>
+            {/if}
+          </div>
+        {/each}
+      {/if}
+    </div>
   </div>
 </div>
 
@@ -236,5 +297,43 @@
     display: flex;
     flex-direction: column;
     gap: 0.15rem;
+  }
+  .plhead {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .plrow {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.15rem 0;
+  }
+  .pltitle {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .plmark {
+    font-size: 10px;
+    color: var(--dim);
+    white-space: nowrap;
+  }
+  .plmark.ok {
+    color: var(--green, #7dcfa0);
+  }
+  .mini {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 10px;
+    padding: 0.05rem 0.4rem;
+  }
+  .mini:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 </style>

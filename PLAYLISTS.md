@@ -161,6 +161,9 @@ but is no longer load-bearing there); serve view `main ∪ fwd` into `bitswap.Ne
 | `playlist/publish?key=<name>&seq=<n>&lifetime=168h` (doc bytes in body) | node computes `cid = raw-sha256(doc)`, signs the record (value `/ipfs/<cid>`), stores it, gossips the binary `{name, record, doc}` envelope (no DHT). Returns `{Name, Seq, Record}`. |
 | `playlist/records?since=<v>` | drain the ingest buffer as ndjson `{Name, Seq, Record(b64), Doc(b64)}` with a monotonic version counter — cheap no-change poll. |
 | `playlist/announce` (body: `{record, doc}` entries) | Rust-driven re-announce of held playlists, taken verbatim (no re-signing); node applies last-seen suppression before publishing. |
+| `playlist/manifest` (body: `[{Name, Seq, Title}]`) | Rust posts the **disclosure set** (held + published-mine; §9 №15-16) — what playlist-list answers with and what beacons hash. Full replacement, idempotent; a change kicks an early beacon (floor 10 min). |
+| `playlist/peer-list?peer=<id>&want=<a,b>` | dial a peer's `/trackerstream/playlist-list/1.0.0` stream: its disclosure set as `{name, seq, title}`, plus targeted re-announce of the `want` names (suppression bypassed, 30s/name cooldown). `Supported:false` = old build / the seed. |
+| `playlist/backers` (body: `{Names:[...]}`) | windowed (24h) distinct-holder counts from the beacon topic, keyed by name (the node hashes; Rust never sees the hash scheme). |
 
 Existing `routing/get` serves seq recovery. Poll (every ~20s), not push: the Rust↔Go
 boundary is strictly HTTP today; SSE is a clean later upgrade.
@@ -260,6 +263,14 @@ rendered lengths.
 - **Multi-device / collaboration (out of scope):** keys live in one keystore; concurrent
   same-name edits race newest-seq-wins wholesale. The `v` field keeps the doc evolvable
   (CRDT ordering keys or an op log would be `v:2`).
+- **Phase 5–7 surfaces:** playlist-list requests are per-peer rate-limited (0.1/s,
+  burst 4) with bounded response/request frames; `want` re-gossip is bounded by a
+  30s/name cooldown and only ever serves manifest names (the node is not a re-gossip
+  oracle for its whole buffer). Beacons: format violations die at the first hop
+  (Reject), repeats within 2 min per origin are Ignored, counts saturate at 512 origins
+  per hash, and Sybil inflation is accepted-until-identity (§10) — beacons only rank
+  discover, they gate nothing. Deep links re-anchor on the same Rust verifier as
+  gossip; a crafted fragment is exactly as powerless as a crafted gossip message.
 
 ## 8. Execution plan
 
@@ -296,6 +307,41 @@ plays on the other.
 **Phase 4 — polish.**
 Re-announce tuning; `playlist_sync_status` footer. (Per-peer rate limiting: shipped.
 Deep links: moved to §10 future work — web redirect + fragment payload design.)
+
+**Phase 5 — playlist-list peer protocol (§10 → shipped).**
+`node/playlistlist.go`: `/trackerstream/playlist-list/1.0.0` (msgio, one JSON frame each
+way, ≤256 entries), served from the Rust-posted manifest (`playlist/manifest`), clients
+only; `want` = targeted re-announce, suppression bypassed with a 30s/name cooldown.
+`playlists.rs`: `manifest()` + hash-gated `push_manifest()` on every sync tick and after
+share/hold/delete. Peer card gains a "playlists" section (fetch-on-open pull + "get").
+*Verify:* `node/playlistlist_test.go` — B gets exactly A's manifest; the seed reads as
+unsupported; `want` re-gossips a suppressed playlist into B's buffer, repeat hits the
+cooldown; non-manifest names never served. Rust: disclosure-set query includes held +
+published-mine only.
+
+**Phase 6 — deep links (§10 → shipped).**
+`link.rs`: fragment = b64url of the **verbatim gossip envelope** (uvarint name ++ record
+++ doc, byte-compatible with `encodePlaylistMsg`); >8000-char URLs degrade to name-only.
+`ingest_link` re-anchors on `ingest_wire` (path-name vs envelope-name mismatch = reject);
+name-only links pend (in-memory, 15 min) + fire `want` at ≤8 connected peers. "copy
+link" on any row with a live record; `trackerstream://playlist/<name>#<frag>` handled
+(single-instance plugin forwards Win/Linux second launches). Web tier: ONE static page
+(`deploy/site/p.html`, Caddy `handle /p/*`) that hands off client-side — the fragment
+never reaches the server.
+*Verify:* Rust — copy_link→ingest_link roundtrip on a fresh store (lands seen-tier),
+tampered fragment rejected + remembered, name mismatch rejected, oversized doc →
+name-only URL, pending clears when the row arrives via sync.
+
+**Phase 7 — hold beacons (§10 → shipped).**
+`node/beacon.go`: `/trackerstream/playlist-beacon/1.0.0`, hourly ±15min jittered
+`[0x01][uvarint N][N × sha256(name)[:8]]` (N ≤ 4096) of the manifest; every node counts
+hash → distinct origins over 24h (LRU 16384 × ≤512 origins, saturating); validator =
+first-hop rate → format Reject → 2-min per-origin gap; manifest change kicks early
+(floor 10 min). `playlist/backers` feeds the UI: discover ranks by backing, "backed by
+~N holders" in the detail pane, "rare" badge on held rows with ≤1 backer.
+*Verify:* `node/beacon_test.go` — codec bounds; two clients converge on count 2 for a
+shared name / 1 for a solo one on both sides; repeats Ignored; window decay; origin-set
+saturation; malformed dies at the local validator.
 
 ## 9. Decisions log
 
@@ -344,70 +390,37 @@ Deep links: moved to §10 future work — web redirect + fragment payload design
     lifetime. Held rows survive local decay even with an expired record (the user chose
     to keep the data; it just can't propagate until the author returns). UI: library
     default + discover tab; "add to library" ≠ "duplicate to mine" (fork) ≠ delete.
+15. **No "back silently", ever (user call 2026-07-03,** superseding the earlier §10
+    note that floated a per-playlist opt-out). Holding or publishing a public playlist
+    is inherently a public act; the privacy path is forking to a private (unpublished)
+    copy. The **disclosure set** — held + published-mine rows with a live, announceable
+    record — is used identically by playlist-list answers and hold beacons. Private
+    playlists and the seen tier are never disclosed, structurally.
+16. **`playlist/manifest` RPC.** Rust posts the disclosure set `{name, seq, title}` on
+    startup and whenever the library changes (hash-gated); the node serves playlist-list
+    responses and generates beacons from this in-memory manifest. The node stays a
+    stateless relay — nothing durable added.
+17. **Deep-link fragment is the verbatim gossip envelope** (uvarint name ++ record ++
+    doc, b64url), verified by the same `ingest_wire` path as gossip; the web tier is one
+    static handoff page under Caddy (`/p/*`) and the fragment never reaches the server.
+    No browser app. Oversized docs degrade to a name-only link resolved by gossip + a
+    targeted `want`.
+18. **`want` re-announce bypasses suppression** (30s per-name cooldown): the asker
+    demonstrably missed the last announce — the pull-triggered push for late joiners and
+    name-only links, still pure pubsub+seq (zero-DHT unchanged).
 
 ## 10. Future (documented, deliberately not built)
 
-Captured while fresh — none of this is v1 scope. Ordered roughly nearest-first.
+The three near/mid-term items that used to live here — the **playlist-list peer
+protocol**, **deep links**, and **hold beacons** — shipped as Phases 5–7 (§8; design
+calls in §9 №15-18). What remains is the long-term work. Notable scope trims from the
+original sketches, decided at build time (2026-07-03):
 
-### Playlist-list peer protocol (near-term)
-
-A direct request/response stream protocol (`/trackerstream/playlist-list/1.0.0`,
-sibling of `PeerProtocol`): ask a connected peer "what playlists do you hold?", get back
-its library as `{name, seq, title}` entries — surfaced as a section in the peer card
-(PeersPanel/PeerDetail). Browsing a peer's library becomes a discovery channel in
-itself, and the social one: "what is this person into?"
-
-- **Disclosure model is pull, 1:1** — you reveal your library to the specific peer who
-  asked, not to the whole network (contrast with hold beacons below, which broadcast).
-  The responder answers with **held + published-mine only** — both are explicit public
-  acts (backing / sharing). PRIVATE (unpublished) playlists and the seen tier are never
-  disclosed. A "back silently" per-playlist toggle can exempt held entries too.
-- Response is names+titles only (no docs — the normal gossip path distributes those);
-  rate-limit requests per peer like everything else. An entry the asker doesn't hold
-  yet can be requested via the ordinary announce machinery (the responder just
-  re-announces it, suppression permitting).
-
-### Deep links via web redirect + fragment payload (near-term, Phase 4 shape)
-
-`https://trackerstream.xyz/p/<name>#<b64(record ++ doc)>` — an HTTPS link (clickable in
-any chat app, unlike custom schemes) served by the existing apps/server as a dumb
-landing page: app installed → fires `trackerstream://playlist/<name>` with the fragment
-passed through; not installed → download page. The onboarding funnel in one URL.
-
-- **The fragment IS the content channel.** Fragments never reach the server, and the
-  payload is the same self-certifying `{record, doc}` envelope as gossip — the app
-  verifies it identically (signature → doc hash → CID). A fresh install resolves
-  INSTANTLY, no gossip warmup, and then follows updates via the normal tiers. The link
-  is a third transport (gossip = push, playlist-list = pull, link = out-of-band), all
-  with identical trust.
-- Server stores and sees nothing — the seed-holds-no-docs principle extends to the web
-  tier. No DHT needed; a DHT wouldn't have helped anyway (records ≠ docs).
-- A compact 20-track playlist ≈ ~3 KB URL. Oversized playlists fall back to a name-only
-  link resolved by gossip (pending "syncing…" state, ≤ one announce cycle). Rich chat
-  previews (og: tags) need server-side knowledge — off by default; optionally an
-  explicit `?t=<title>` the author consciously includes at share time.
-- If name-only links ever feel slow, the fix is a targeted re-announce request over the
-  playlist-list protocol (below) — pull-triggered push, still pure pubsub+seq.
-
-### Hold beacons — popularity measurement (mid-term)
-
-Announce suppression deliberately hides holders (~one voice per playlist per cycle), so
-popularity is invisible today. Restore the signal on a cheap side channel:
-
-- Each node broadcasts a small jittered **hold manifest** (~hourly): truncated 8-byte
-  name-hashes of its held + published-mine playlists (never private/unpublished ones,
-  never the seen tier) — a 200-playlist library ≈ 1.6 KB message.
-  Gossipsub already signs messages, so origin authenticity is free.
-- Every node counts locally: name → distinct origins over a 24h sliding window (bounded
-  LRU). Frequency = holder-set liveness; variety = breadth. No consensus, none needed.
-- Uses: discover-tab ranking by backing, "backed by ~N holders" in the detail pane, and
-  a "rare — you're one of few holders" nudge (seeder culture, motivates the hold button).
-- **Privacy tension, decide when building:** beacons broadcast (hashed) library
-  contents under a peer id. Coherent stance: backing is public like seeding; only
-  held/mine beacon, never seen; still deserves a visible "back silently" opt-out, since
-  publish-is-explicit exists precisely to protect listening habits.
-- Sybil-gameable until the identity layer lands — accepted. The beacon FEED never
-  changes; only the weighting function does (see below).
+- No "back silently" toggle, ever (§9 №15) — backing is public, period.
+- No browser app edition: the `/p/` URL is served by a single static handoff page; the
+  web client remains future work. If it ever lands, `/p/<name>` is its natural entry.
+- No og:/`?t=` rich chat previews — a preview requires telling the server about the
+  playlist, and the server seeing nothing is the point.
 
 ### Identity + friends tiers — Sybil resistance (long-term)
 

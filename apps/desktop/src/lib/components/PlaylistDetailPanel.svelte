@@ -5,6 +5,9 @@
     plDelete,
     plPublish,
     plHold,
+    plCopyLink,
+    plPending,
+    plBackers,
     plState,
     plBump,
     playPlaylist,
@@ -20,6 +23,8 @@
   let confirmDelete = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
+  let pending = $state(false); // selected name is a name-only deep link awaiting gossip
+  let linkCopied = $state(false);
   let loadedFor: string | null = null; // last name a fetch completed for (not reactive)
 
   $effect(() => {
@@ -28,6 +33,7 @@
     if (!cur) {
       detail = null;
       loadedFor = null;
+      pending = false;
       return;
     }
     if (cur !== loadedFor) {
@@ -37,16 +43,35 @@
       confirmShare = false;
       confirmDelete = false;
       error = null;
+      linkCopied = false;
     }
     plGet(cur)
-      .then((d) => {
-        if (name === cur) {
-          detail = d;
-          loadedFor = cur;
-        }
+      .then(async (d) => {
+        if (name !== cur) return;
+        detail = d;
+        loadedFor = cur;
+        // No local row: a name-only deep link may still be syncing from the network.
+        pending = d === null && (await plPending().catch((): string[] => [])).includes(cur);
+        backerCount = d
+          ? ((await plBackers([cur]).catch((): Record<string, number> => ({})))[cur] ?? 0)
+          : 0;
       })
       .catch((e) => (error = String(e)));
   });
+
+  // Hold-beacon holder count (24h window; 0 = none heard yet — beacons are hourly).
+  let backerCount = $state(0);
+
+  async function copyLink() {
+    if (!detail) return;
+    try {
+      await navigator.clipboard.writeText(await plCopyLink(detail.name));
+      linkCopied = true;
+      setTimeout(() => (linkCopied = false), 2000);
+    } catch (e) {
+      error = String(e);
+    }
+  }
 
   async function removeTrack(i: number) {
     if (!detail?.isMine) return;
@@ -92,7 +117,17 @@
     <div class="error">{error}</div>
   {/if}
   {#if !detail}
-    <div class="placeholder">select a playlist</div>
+    {#if pending}
+      <div class="placeholder">
+        syncing playlist from the network…<br />
+        <span class="pendsub">
+          a holder needs to be online — this usually lands within a few minutes. if it
+          never does, the link's holder may be offline.
+        </span>
+      </div>
+    {:else}
+      <div class="placeholder">select a playlist</div>
+    {/if}
   {:else}
     <div class="title">{detail.title || "(untitled)"}</div>
     <div class="sub">
@@ -101,6 +136,11 @@
       {#if detail.held}· <span class="heldtxt">in library</span>{/if}
       {#if detail.dormant}· <span class="dormant">dormant</span>{/if}
       {#if detail.published}· <span class="pub">shared</span>{/if}
+      {#if detail.held && backerCount <= 1}
+        · <span class="dormant" title="you're one of the only holders — keep backing it">backed only by you</span>
+      {:else if backerCount > 1}
+        · <span title="distinct holders heard on the network (24h)">backed by ~{backerCount} holders</span>
+      {/if}
     </div>
 
     {#if detail.dormant}
@@ -131,6 +171,9 @@
             {detail.published ? "re-share" : "share"}
           </button>
         {/if}
+        {#if detail.published && !detail.dormant}
+          <button onclick={copyLink}>{linkCopied ? "✓ copied" : "copy link"}</button>
+        {/if}
         {#if !confirmDelete}
           <button onclick={() => (confirmDelete = true)} disabled={busy}>delete</button>
         {/if}
@@ -148,6 +191,9 @@
           {detail.held ? "✓ in library" : "＋ add to library"}
         </button>
         <button onclick={() => detail && duplicatePlaylist(detail)}>duplicate to mine</button>
+        {#if !detail.dormant}
+          <button onclick={copyLink}>{linkCopied ? "✓ copied" : "copy link"}</button>
+        {/if}
         {#if !detail.held}
           <button onclick={del} disabled={busy}>remove</button>
         {/if}
@@ -202,6 +248,9 @@
     color: var(--dim);
     padding-top: 2rem;
     text-align: center;
+  }
+  .pendsub {
+    font-size: 11px;
   }
   .error {
     color: var(--hot);

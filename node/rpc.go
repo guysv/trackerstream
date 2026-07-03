@@ -2,7 +2,9 @@ package tsnode
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -60,6 +62,11 @@ func NewRPCServer(n *Node) *RPCServer {
 	s.mux.HandleFunc("/api/v0/playlist/publish", s.handlePlaylistPublish)
 	s.mux.HandleFunc("/api/v0/playlist/records", s.handlePlaylistRecords)
 	s.mux.HandleFunc("/api/v0/playlist/announce", s.handlePlaylistAnnounce)
+	// Playlist-list (§10, shipped): Rust posts the disclosure set; peer-list dials a peer.
+	s.mux.HandleFunc("/api/v0/playlist/manifest", s.handlePlaylistManifest)
+	s.mux.HandleFunc("/api/v0/playlist/peer-list", s.handlePlaylistPeerList)
+	// Hold beacons (§10, shipped): windowed backer counts from the beacon topic.
+	s.mux.HandleFunc("/api/v0/playlist/backers", s.handlePlaylistBackers)
 	return s
 }
 
@@ -396,6 +403,70 @@ func (s *RPCServer) handlePlaylistAnnounce(w http.ResponseWriter, r *http.Reques
 	}
 	announced, suppressed, rejected := s.node.AnnouncePlaylists(r.Context(), entries)
 	writeJSON(w, map[string]any{"Announced": announced, "Suppressed": suppressed, "Rejected": rejected})
+}
+
+// handlePlaylistManifest replaces the node's disclosure-set manifest — the exact set the
+// playlist-list protocol answers with (and the hold-beacon source). Full replacement,
+// idempotent; the desktop posts it on startup and whenever its library changes.
+func (s *RPCServer) handlePlaylistManifest(w http.ResponseWriter, r *http.Request) {
+	var entries []PlaylistListEntry
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&entries); err != nil {
+		rpcErr(w, http.StatusBadRequest, fmt.Errorf("playlist/manifest: %w", err))
+		return
+	}
+	count := s.node.plList.setManifest(entries)
+	// A changed disclosure set beacons ahead of the hourly cycle (floor-limited in
+	// KickBeacon; the desktop only posts manifests that actually changed).
+	s.node.KickBeacon(r.Context())
+	writeJSON(w, map[string]any{"Count": count})
+}
+
+// handlePlaylistBackers maps names → windowed distinct-origin holder counts from the
+// beacon topic: `playlist/backers` body {"Names":[...]}. The hash scheme stays
+// node-side (the node hashes; Rust only ever sees names). 0 = no beacon heard.
+func (s *RPCServer) handlePlaylistBackers(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Names []string `json:"Names"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 256<<10)).Decode(&req); err != nil {
+		rpcErr(w, http.StatusBadRequest, fmt.Errorf("playlist/backers: %w", err))
+		return
+	}
+	if len(req.Names) > 512 {
+		req.Names = req.Names[:512]
+	}
+	writeJSON(w, map[string]any{"Counts": s.node.beacons.backers(req.Names)})
+}
+
+// handlePlaylistPeerList asks one connected peer for its disclosure set:
+// `playlist/peer-list?peer=<id>&want=<a,b,c>`. A peer that doesn't speak the protocol
+// (old build, the seed) is a normal answer — Supported=false — not an error.
+func (s *RPCServer) handlePlaylistPeerList(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	p, err := peer.Decode(q.Get("peer"))
+	if err != nil {
+		rpcErr(w, http.StatusBadRequest, fmt.Errorf("playlist/peer-list: peer: %w", err))
+		return
+	}
+	var want []string
+	if v := q.Get("want"); v != "" {
+		want = strings.Split(v, ",")
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	entries, reann, err := s.node.PeerPlaylists(ctx, p, want)
+	if errors.Is(err, ErrPlaylistListUnsupported) {
+		writeJSON(w, map[string]any{"Playlists": []PlaylistListEntry{}, "Reannounced": 0, "Supported": false})
+		return
+	}
+	if err != nil {
+		rpcErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if entries == nil {
+		entries = []PlaylistListEntry{}
+	}
+	writeJSON(w, map[string]any{"Playlists": entries, "Reannounced": reann, "Supported": true})
 }
 
 // handleRoutingGet mirrors kubo `routing/get?arg=/ipns/<name>` — returns the signed record

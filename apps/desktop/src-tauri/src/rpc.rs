@@ -26,6 +26,18 @@ pub struct PlaylistWire {
     pub doc: String,
 }
 
+/// One disclosure-set entry on the `playlist/manifest` / `playlist/peer-list` wire —
+/// name + seq + title only, never docs (the normal gossip path distributes those).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Seq", default)]
+    pub seq: u64,
+    #[serde(rename = "Title", default)]
+    pub title: String,
+}
+
 /// A handle to the local tsnode RPC. Cheap to clone (wraps a reqwest client + base URL).
 #[derive(Clone)]
 pub struct NodeRpc {
@@ -347,6 +359,76 @@ impl NodeRpc {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    /// `playlist/manifest` — replace the node's disclosure-set manifest (held +
+    /// published-mine): what the playlist-list protocol answers with and the hold-beacon
+    /// source. Full replacement, idempotent.
+    pub async fn playlist_manifest(&self, entries: &[ManifestEntry]) -> Result<()> {
+        self.http
+            .post(self.url("playlist/manifest"))
+            .timeout(Duration::from_secs(10))
+            .json(entries)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// `playlist/peer-list?peer&want` — ask one connected peer for its disclosure set,
+    /// optionally requesting a targeted re-announce of `want` names. Returns
+    /// (entries, reannounced, supported) — supported=false is a normal answer (old build
+    /// or the seed), not an error.
+    pub async fn playlist_peer_list(
+        &self,
+        peer: &str,
+        want: &[String],
+    ) -> Result<(Vec<ManifestEntry>, u64, bool)> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(rename = "Playlists", default)]
+            playlists: Vec<ManifestEntry>,
+            #[serde(rename = "Reannounced", default)]
+            reannounced: u64,
+            #[serde(rename = "Supported", default)]
+            supported: bool,
+        }
+        let mut url = format!("playlist/peer-list?peer={}", urlencode(peer));
+        if !want.is_empty() {
+            url.push_str(&format!("&want={}", urlencode(&want.join(","))));
+        }
+        let resp: Resp = self
+            .http
+            .post(self.url(&url))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await?
+            .error_for_status()
+            .with_context(|| format!("playlist/peer-list {peer}"))?
+            .json()
+            .await?;
+        Ok((resp.playlists, resp.reannounced, resp.supported))
+    }
+
+    /// `playlist/backers` — windowed distinct-holder counts from the hold-beacon
+    /// topic, keyed by name (the node hashes; 0 = no beacon heard for it).
+    pub async fn playlist_backers(&self, names: &[String]) -> Result<HashMap<String, u64>> {
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(rename = "Counts", default)]
+            counts: HashMap<String, u64>,
+        }
+        let resp: Resp = self
+            .http
+            .post(self.url("playlist/backers"))
+            .timeout(Duration::from_secs(5))
+            .json(&serde_json::json!({ "Names": names }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(resp.counts)
     }
 
     /// `node/status` — reachability verdict + relay-hop breakdown + peer/byte counts.

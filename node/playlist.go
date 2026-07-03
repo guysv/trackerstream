@@ -256,6 +256,19 @@ func (s *playlistStore) getRecord(name string) ([]byte, bool) {
 	return nil, false
 }
 
+// getFull returns record+doc+seq for name — the targeted-reannounce (`want`) source.
+// ok only when the DOC is present too: a record alone can't be re-announced (no fetch
+// path exists), so a doc evicted past the byte budget reads as a miss.
+func (s *playlistStore) getFull(name string) (rec, doc []byte, seq uint64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, found := s.entries[name]
+	if !found || len(e.doc) == 0 {
+		return nil, nil, 0, false
+	}
+	return e.rec, e.doc, e.seq, true
+}
+
 // since snapshots entries written after version v (the poll cursor) plus the current
 // store version. Entries evicted since a caller's last poll are simply absent — the
 // durable ledger is the caller's.
