@@ -48,3 +48,16 @@ echo "building tsnode → $OUT ($GOOS/$GOARCH)"
 chmod +x "$OUT"
 touch "$STAMP"
 echo "sidecar ready: $OUT"
+
+# In dev, the app spawns the externalBin copy Tauri drops next to the dev executable
+# (target/<profile>/tsnode), not $OUT. Tauri only re-copies during a Rust rebuild, so a
+# Go-only change would rebuild $OUT but leave the spawned copy stale. Refresh it here —
+# atomically (temp + mv) so a currently-running node keeps its open binary and only the
+# NEXT spawn picks up the new one. Skip when the target dir doesn't exist yet.
+TARGET_DIR="$HERE/target"
+for profile in debug release; do
+  dst="$TARGET_DIR/$profile/tsnode$EXT"
+  [ -d "$TARGET_DIR/$profile" ] || continue
+  cp "$OUT" "$dst.new" && chmod +x "$dst.new" && mv -f "$dst.new" "$dst"
+  echo "refreshed dev spawn copy: $dst"
+done

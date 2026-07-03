@@ -50,6 +50,10 @@ function startTauri() {
     cwd: DESKTOP,
     stdio: 'inherit',
     detached: true,
+    // We already watch rust+go here and drive our own restarts; tell the sidecar
+    // watcher (started by `pnpm dev` via beforeDevCommand) to stand down so a go
+    // change isn't rebuilt twice.
+    env: { ...process.env, TS_DEV_LOCKED: '1' },
   })
   child.on('exit', (code, signal) => {
     if (restarting) return // expected kill during a rebuild
