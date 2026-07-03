@@ -107,9 +107,6 @@
         <span class="badges">
           {#if p.isMine}<span class="badge mine">mine</span>{/if}
           {#if p.held}<span class="badge held">held</span>{/if}
-          {#if p.held && (backers[p.name] ?? 0) <= 1}
-            <span class="badge rare" title="you're one of the only holders — keep backing it">rare</span>
-          {/if}
           {#if p.dormant}<span class="badge dormant" title="record expired — author absent; fork to keep it shareable">dormant</span>{/if}
           {#if p.published}<span class="badge pub">shared</span>{/if}
           {#if (backers[p.name] ?? 0) > 1}
@@ -233,10 +230,6 @@
   .badge.pub {
     color: var(--cyan);
     border-color: var(--cyan);
-  }
-  .badge.rare {
-    color: var(--hot);
-    border-color: var(--hot);
   }
   .badge.backers {
     color: var(--green, #7dcfa0);
