@@ -117,35 +117,52 @@ impl Drop for Sidecar {
 /// Forward one of the child's output streams into the log hub, line by line, on a detached
 /// reader thread (exits when the pipe closes, i.e. when the child dies). The Go side prefixes
 /// its own lines with "[tsnode] " — stripped here since the log target already says tsnode.
-/// go-log (libp2p internals, enabled via GOLOG_LOG_LEVEL, which the child inherits) tags lines
-/// with a tab-separated level — mapped so real errors keep their severity in the file.
+/// Each line is sorted into a territory + level by `classify_tsnode` so subsystems can be
+/// traced in isolation (`TS_LOG=info,dial=debug`).
 fn forward_output(stream: impl std::io::Read + Send + 'static) {
     use std::io::{BufRead, BufReader};
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines() {
             let Ok(line) = line else { break };
             let msg = line.strip_prefix("[tsnode] ").unwrap_or(&line);
-            let level = if line.contains("\tERROR\t") {
-                log::Level::Error
-            } else if line.contains("\tWARN\t") {
-                log::Level::Warn
-            } else if line.contains("\tDEBUG\t") || is_dial_noise(msg) {
-                log::Level::Debug
-            } else {
-                log::Level::Info
-            };
-            log::log!(target: "tsnode", level, "{msg}");
+            let (target, level) = classify_tsnode(&line, msg);
+            log::log!(target: target, level, "{msg}");
         }
     });
+}
+
+/// Route a sidecar output line to a (territory, level). go-log (libp2p internals, enabled
+/// via GOLOG_LOG_LEVEL) tags lines with a tab-separated level — that severity wins so real
+/// errors keep it. Otherwise lines are sorted into dedicated territories, each traceable on
+/// its own: `dial` is the noisy per-attempt connection-failure chatter (demoted to DEBUG so
+/// it's off by default — `TS_LOG=info,dial=debug` brings it back), `nat` is NAT-traversal
+/// signal (reachability changes, hole punching, relay circuits), and everything else —
+/// `connected … via`, `listen …`, startup — stays under `tsnode`.
+fn classify_tsnode(line: &str, msg: &str) -> (&'static str, log::Level) {
+    let tagged = if line.contains("\tERROR\t") {
+        Some(log::Level::Error)
+    } else if line.contains("\tWARN\t") {
+        Some(log::Level::Warn)
+    } else if line.contains("\tDEBUG\t") {
+        Some(log::Level::Debug)
+    } else {
+        None
+    };
+    if is_dial_noise(msg) {
+        ("dial", tagged.unwrap_or(log::Level::Debug))
+    } else if is_nat_event(msg) {
+        ("nat", tagged.unwrap_or(log::Level::Info))
+    } else {
+        ("tsnode", tagged.unwrap_or(log::Level::Info))
+    }
 }
 
 /// go-libp2p dial failures are logged per attempt and render multi-line: a header
 /// (`dial provider <peer> failed: …`) followed by one bullet per candidate address
 /// (`  * [/ip4/…] dial backoff`). Only the header carries the "[tsnode] " prefix — the
 /// bullets arrive as their own bare lines. Behind NAT / hole-punch churn this is the bulk
-/// of the sidecar's output and drowns real events, so it rides at DEBUG (comes back with
-/// TS_LOG=debug). Success/lifecycle lines — `connected … via`, `listen …`,
-/// `reachability → …` — are untouched and stay at INFO.
+/// of the sidecar's output and drowns real events, so it rides in the DEBUG `dial`
+/// territory. Checked before `is_nat_event`, so relay-circuit dial bullets count as dial.
 fn is_dial_noise(msg: &str) -> bool {
     let bullet = msg.trim_start().starts_with("* [");
     let header = msg.contains("failed")
@@ -153,6 +170,14 @@ fn is_dial_noise(msg: &str) -> bool {
             || msg.contains("keepalive redial ")
             || msg.contains("bootstrap dial "));
     bullet || header
+}
+
+/// NAT-traversal signal — the territory that matters when peers can't reach each other:
+/// reachability flips (`reachability → Public/Private`), hole-punch tracer events, and relay
+/// circuit reservations. Low volume, so it stays at INFO (visible by default); isolate it
+/// with `TS_LOG=warn,nat=info`.
+fn is_nat_event(msg: &str) -> bool {
+    msg.contains("reachability →") || msg.contains("[holepunch]") || msg.contains("-circuit]")
 }
 
 /// Best-effort: terminate any leftover tsnode process still bound to `repo` (an orphan from a

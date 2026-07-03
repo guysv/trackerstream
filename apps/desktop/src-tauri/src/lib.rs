@@ -687,18 +687,78 @@ async fn playlist_backers(
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Parse a RUST_LOG-style `TS_LOG` value into a global level plus per-target overrides.
+/// A bare level token sets the default (`debug`); a `topic=level` pair raises one target
+/// (`playlist=debug`). Order-independent; the last bare level wins. Unparsable tokens are
+/// ignored so a malformed `TS_LOG` can never panic startup. Default when unset: info.
+fn parse_ts_log(raw: Option<&str>) -> (log::LevelFilter, Vec<(String, log::LevelFilter)>) {
+    let mut level = log::LevelFilter::Info;
+    let mut overrides = Vec::new();
+    let Some(raw) = raw else { return (level, overrides) };
+    for tok in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        match tok.split_once('=') {
+            // Bare level → the global default (last one wins).
+            None => {
+                if let Ok(l) = tok.parse::<log::LevelFilter>() {
+                    level = l;
+                }
+            }
+            // topic=level → raise/lower a single target.
+            Some((target, lvl)) => {
+                if let Ok(l) = lvl.trim().parse::<log::LevelFilter>() {
+                    overrides.push((ts_log_target(target.trim()), l));
+                }
+            }
+        }
+    }
+    (level, overrides)
+}
+
+/// Map a friendly topic alias to its real log target; unknown names pass through verbatim
+/// so full module paths (`desktop_lib::playlists`) still work. Territories: `playlist` the
+/// playlist subsystem (`playlists.rs`), `stream` the streaming path (`ipfs.rs`), `webview`
+/// the frontend (`debug.ts`); and three carved out of the sidecar stream by
+/// `sidecar::classify_tsnode` — `dial` the connection-failure chatter, `nat` NAT-traversal
+/// signal (reachability / hole punch / relay), `tsnode` everything else. `reqwest` is the
+/// HTTP client's own logging.
+fn ts_log_target(alias: &str) -> String {
+    match alias {
+        "playlist" | "playlists" | "sync" => "playlist",
+        "tsnode" | "node" => "tsnode",
+        "dial" => "dial",
+        "nat" | "holepunch" | "hp" => "nat",
+        "webview" | "ui" | "frontend" => "webview",
+        "catalog" => "desktop_lib::catalog",
+        "stream" => "stream",
+        "reqwest" | "net" | "http" => "reqwest",
+        other => other,
+    }
+    .to_string()
+}
+
 pub fn run() {
     // The client log hub: everything routed through the `log` facade (backend, frontend via
     // the plugin's JS API, tsnode sidecar output via sidecar.rs) lands in one rotating file
     // in the OS app-log dir (macOS: ~/Library/Logs/xyz.trackerstream/) plus stdout for dev.
-    // TS_LOG=error|warn|info|debug|trace overrides the level (default: info in both dev and
-    // release) — a runtime knob, no rebuild needed. Set TS_LOG=debug to bring back the
-    // frontend trace (debug.ts `pos.order`/`ev.*` events) and the sidecar's per-address
-    // dial chatter (see `sidecar::forward_output`).
-    let level = std::env::var("TS_LOG")
-        .ok()
-        .and_then(|v| v.parse::<log::LevelFilter>().ok())
-        .unwrap_or(log::LevelFilter::Info);
+    // TS_LOG is RUST_LOG-style so one topic can be traced without the global firehose: a
+    // bare level sets the default (`TS_LOG=debug`), and `topic=level` pairs raise a single
+    // target (`TS_LOG=info,playlist=debug` times a share landing; see `parse_ts_log` for
+    // the topic aliases). Default is info everywhere; a runtime knob, no rebuild needed.
+    let (level, overrides) = parse_ts_log(std::env::var("TS_LOG").ok().as_deref());
+    let mut log_builder = tauri_plugin_log::Builder::new().level(level);
+    for (target, lvl) in overrides {
+        log_builder = log_builder.level_for(target, lvl);
+    }
+    let log_plugin = log_builder
+        .targets([
+            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                file_name: Some("trackerstream".into()),
+            }),
+        ])
+        .max_file_size(2_000_000)
+        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+        .build();
     tauri::Builder::default()
         // Single-instance MUST be the first plugin registered (Tauri docs): on
         // Win/Linux a deep-link click launches a second process, whose argv URL the
@@ -710,19 +770,7 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }))
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(level)
-                .targets([
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
-                        file_name: Some("trackerstream".into()),
-                    }),
-                ])
-                .max_file_size(2_000_000)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
-                .build(),
-        )
+        .plugin(log_plugin)
         .plugin(tauri_plugin_opener::init())
         // Deep links: trackerstream://share/<code> (E2).
         .plugin(tauri_plugin_deep_link::init())
