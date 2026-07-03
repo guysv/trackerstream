@@ -129,7 +129,7 @@ fn forward_output(stream: impl std::io::Read + Send + 'static) {
                 log::Level::Error
             } else if line.contains("\tWARN\t") {
                 log::Level::Warn
-            } else if line.contains("\tDEBUG\t") {
+            } else if line.contains("\tDEBUG\t") || is_dial_noise(msg) {
                 log::Level::Debug
             } else {
                 log::Level::Info
@@ -137,6 +137,22 @@ fn forward_output(stream: impl std::io::Read + Send + 'static) {
             log::log!(target: "tsnode", level, "{msg}");
         }
     });
+}
+
+/// go-libp2p dial failures are logged per attempt and render multi-line: a header
+/// (`dial provider <peer> failed: …`) followed by one bullet per candidate address
+/// (`  * [/ip4/…] dial backoff`). Only the header carries the "[tsnode] " prefix — the
+/// bullets arrive as their own bare lines. Behind NAT / hole-punch churn this is the bulk
+/// of the sidecar's output and drowns real events, so it rides at DEBUG (comes back with
+/// TS_LOG=debug). Success/lifecycle lines — `connected … via`, `listen …`,
+/// `reachability → …` — are untouched and stay at INFO.
+fn is_dial_noise(msg: &str) -> bool {
+    let bullet = msg.trim_start().starts_with("* [");
+    let header = msg.contains("failed")
+        && (msg.contains("dial provider ")
+            || msg.contains("keepalive redial ")
+            || msg.contains("bootstrap dial "));
+    bullet || header
 }
 
 /// Best-effort: terminate any leftover tsnode process still bound to `repo` (an orphan from a
