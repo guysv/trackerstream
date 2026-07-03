@@ -181,11 +181,11 @@
     {#if mainView === "tracks"}
       <Sidebar {formats} {total} bind:format bind:sort />
       <section class="results">
-        <ResultsTable {rows} bind:selectedId onplay={play} />
+        <ResultsTable {rows} bind:selectedId onplay={play} onselect={() => (rightView = "detail")} />
       </section>
     {:else}
       <section class="results">
-        <PlaylistsView {query} bind:selectedName={selectedPlaylist} />
+        <PlaylistsView {query} bind:selectedName={selectedPlaylist} onselect={() => (rightView = "detail")} />
       </section>
     {/if}
     <aside class="detail">

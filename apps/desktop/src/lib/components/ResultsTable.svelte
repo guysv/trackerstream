@@ -6,10 +6,12 @@
     rows,
     selectedId = $bindable(null),
     onplay,
+    onselect,
   }: {
     rows: ModuleHit[];
     selectedId?: number | null;
     onplay: (h: ModuleHit) => void;
+    onselect?: () => void;
   } = $props();
 
   const ROW_H = 24;
@@ -73,7 +75,7 @@
         role="option"
         aria-selected={row.id === selectedId}
         tabindex="-1"
-        onclick={() => (selectedId = row.id)}
+        onclick={() => { selectedId = row.id; onselect?.(); }}
         ondblclick={() => onplay(row)}
       >
         <span class="c-title">{row.title || row.filename}</span>

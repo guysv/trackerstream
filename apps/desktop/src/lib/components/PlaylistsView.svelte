@@ -17,7 +17,8 @@
   let {
     query,
     selectedName = $bindable(null),
-  }: { query: string; selectedName: string | null } = $props();
+    onselect,
+  }: { query: string; selectedName: string | null; onselect?: () => void } = $props();
 
   let rows = $state<PlaylistMeta[]>([]);
   let error = $state<string | null>(null);
@@ -95,7 +96,7 @@
       <div
         class="prow"
         class:sel={p.name === selectedName}
-        onclick={() => (selectedName = p.name)}
+        onclick={() => { selectedName = p.name; onselect?.(); }}
         ondblclick={() => play(p)}
         role="button"
         tabindex="-1"
