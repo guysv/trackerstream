@@ -67,6 +67,8 @@ export const plUpdate = (name: string, title: string, tracks: TrackTuple[]) =>
 export const plDelete = (name: string) => invoke<void>("playlist_delete", { name });
 /** The explicit "Share" action — the only thing that makes a playlist public. */
 export const plPublish = (name: string) => invoke<void>("playlist_publish", { name });
+/** "Make private again": best-effort tombstone retract, keep the data local (published=0). */
+export const plUnpublish = (name: string) => invoke<void>("playlist_unpublish", { name });
 export const plStatus = () => invoke<PlaylistSyncStatus>("playlist_sync_status");
 
 // ---- liked tracks (the private "Liked Tracks" playlist — Spotify-style ♥) ----

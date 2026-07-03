@@ -210,7 +210,8 @@ Delete of a published playlist publishes the tombstone first, then removes local
 **Tauri commands** (register in `src-tauri/src/lib.rs:537-551`):
 `playlist_search(q)` / `playlist_list(sort)` / `playlist_get(name)` — local SQLite;
 `playlist_create(title, tracks)` / `playlist_update(name, doc)` / `playlist_delete(name)`
-/ `playlist_publish(name)`; `playlist_sync_status()` — counts, bytes, budget;
+/ `playlist_publish(name)` / `playlist_unpublish(name)` — "make private again" (§9 №20);
+`playlist_sync_status()` — counts, bytes, budget;
 `playlist_like_toggle(track)` / `playlist_liked_ids()` / `playlist_liked_name()` — the
 private "Liked Tracks" playlist (§9 №19).
 
@@ -424,6 +425,18 @@ saturation; malformed dies at the local validator.
     the public copy stays current. New column `liked`; new RPCs `playlist_like_toggle`,
     `playlist_liked_ids`, `playlist_liked_name`. The UI pins it to the top of the library,
     marks it ♥, and drops it from the "add to playlist" menu (the heart is its one path).
+20. **"Make private again" / unshare (user call 2026-07-03).** Sharing was one-way (only
+    delete → tombstone retracted it, discarding the local data) — wrong for a persistent
+    fixture like Liked Tracks, which needs to toggle public↔private while keeping its
+    tracks. `unpublish()` reuses the tombstone as a **best-effort retract** (online
+    syncers drop it; the record dies at EOL ≤168h regardless), then **keeps the row local
+    and editable** with `published=0` and no record — off the disclosure set, no longer
+    re-announced. The seq advances past the tombstone so a later re-Share supersedes it
+    and revives holders' copies (the same seq+1-revives path as №6). General to all own
+    playlists, not just Liked Tracks. **Inherent limit, stated plainly:** copies others
+    already saved, forks, deep-link recipients, and offline nodes persist — no gossip
+    system can claw those back; unshare stops *future* propagation and asks the reachable
+    network to forget.
 
 ## 10. Future (documented, deliberately not built)
 

@@ -4,6 +4,7 @@
     plUpdate,
     plDelete,
     plPublish,
+    plUnpublish,
     plHold,
     plCopyLink,
     plPending,
@@ -21,6 +22,7 @@
 
   let detail = $state<PlaylistDetail | null>(null);
   let confirmShare = $state(false);
+  let confirmUnshare = $state(false);
   let confirmDelete = $state(false);
   let busy = $state(false);
   let error = $state<string | null>(null);
@@ -42,6 +44,7 @@
       // tick) keeps the current detail on screen and swaps in place — no flicker.
       detail = null;
       confirmShare = false;
+      confirmUnshare = false;
       confirmDelete = false;
       error = null;
       linkCopied = false;
@@ -95,6 +98,21 @@
     } finally {
       busy = false;
       confirmShare = false;
+    }
+  }
+
+  async function unshare() {
+    if (!detail) return;
+    busy = true;
+    error = null;
+    try {
+      await plUnpublish(detail.name);
+      plBump();
+    } catch (e) {
+      error = `make private failed: ${e}`;
+    } finally {
+      busy = false;
+      confirmUnshare = false;
     }
   }
 
@@ -178,6 +196,9 @@
         {#if detail.published && !detail.dormant}
           <button onclick={copyLink}>{linkCopied ? "✓ copied" : "copy link"}</button>
         {/if}
+        {#if detail.published && !detail.dormant && !confirmUnshare}
+          <button onclick={() => (confirmUnshare = true)} disabled={busy}>make private</button>
+        {/if}
         {#if !confirmDelete}
           <button onclick={() => (confirmDelete = true)} disabled={busy}>delete</button>
         {/if}
@@ -212,10 +233,22 @@
         {:else}
           sharing publishes this playlist to <b>everyone</b> on the network.
         {/if}
-        it can be tombstoned later (delete), but copies may persist.
+        you can make it private again later, but copies may persist.
         <div class="cbtns">
           <button class="go" onclick={share} disabled={busy}>share it</button>
           <button onclick={() => (confirmShare = false)}>cancel</button>
+        </div>
+      </div>
+    {/if}
+    {#if confirmUnshare}
+      <div class="confirm">
+        {#if detail.liked}making your <b>Liked Tracks</b> private again{:else}making this private again{/if}
+        publishes a tombstone asking the network to drop the shared copy, then keeps it
+        here local + editable. best-effort: copies others already saved, forks, or offline
+        nodes may persist (any straggler record expires within ~7 days).
+        <div class="cbtns">
+          <button class="go" onclick={unshare} disabled={busy}>make private</button>
+          <button onclick={() => (confirmUnshare = false)}>cancel</button>
         </div>
       </div>
     {/if}
