@@ -139,6 +139,12 @@ export function playNext(): void {
 }
 
 export function playPrev(): void {
+  // 5s+ into the track: rewind to the start rather than skipping to the previous
+  // queue entry — matches the standard media-player back-button convention.
+  if ((player.pos?.seconds ?? 0) >= 5) {
+    player.seekSeconds(0);
+    return;
+  }
   if (queue.index > 0) playList(queue.items, queue.index - 1);
 }
 
