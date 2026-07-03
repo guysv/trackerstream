@@ -22,6 +22,12 @@ const (
 	// travels INLINE (no bitswap fetch path exists for playlists); see playlist.go.
 	PlaylistTopic             = "/trackerstream/playlist/1.0.0"
 	PeerProtocol  protocol.ID = "/trackerstream/peer/1.0.0"
+	// PlaylistListProtocol is the direct "what playlists do you hold?" request/response
+	// stream (disclosure set = held + published-mine only; see playlistlist.go).
+	PlaylistListProtocol protocol.ID = "/trackerstream/playlist-list/1.0.0"
+	// PlaylistBeaconTopic carries hourly hold beacons — truncated name-hashes of each
+	// client's disclosure set, counted locally for popularity (see beacon.go).
+	PlaylistBeaconTopic = "/trackerstream/playlist-beacon/1.0.0"
 	// FwdProtocol is the public, content-addressed block-forwarding stream (R5; see fwd.go).
 	FwdProtocol protocol.ID = "/trackerstream/fwd/1.0.0"
 )

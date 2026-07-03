@@ -32,7 +32,10 @@ if ! command -v caddy >/dev/null; then
 fi
 echo "caddy $(caddy version | head -1)"
 
-echo "=== [2/6] render Caddyfile for $TS_DOMAIN ==="
+echo "=== [2/6] render Caddyfile for $TS_DOMAIN + install static site ==="
+# The playlist deep-link handoff page (/p/*) — installed under /var/www so Caddy's
+# systemd sandbox can read it without granting access into /opt/trackerstream.
+install -D -m 0644 "$PREFIX/deploy/site/p.html" /var/www/trackerstream/p.html
 TS_DOMAIN="$TS_DOMAIN" envsubst '${TS_DOMAIN}' < "$PREFIX/deploy/Caddyfile" > /etc/caddy/Caddyfile
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
@@ -56,6 +59,13 @@ if [ "$ok" = 1 ]; then
   echo "HTTPS OK: $(curl -fsS -m 5 "https://$TS_DOMAIN/healthz")"
 else
   echo "!! HTTPS not reachable yet — check: journalctl -u caddy -n 50" >&2
+  exit 1
+fi
+# Deep-link handoff page: any /p/<name> must serve the static page.
+if curl -fsS -m 5 "https://$TS_DOMAIN/p/12D3KooWTest" | grep -q "trackerstream"; then
+  echo "deep-link page OK: /p/* serves p.html"
+else
+  echo "!! /p/* not serving the handoff page — check the Caddyfile handle block" >&2
   exit 1
 fi
 

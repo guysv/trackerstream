@@ -54,6 +54,8 @@ type Node struct {
 	ipns      *ipnsStore
 	playlists *playlistStore                  // bounded playlist relay buffer + announce-suppression ledger
 	plLims    *lru.Cache[peer.ID, *plLimiter] // per-peer playlist-topic rate buckets (first-hop flood cap)
+	plList    *plListState                    // disclosure-set manifest + playlist-list serving state
+	beacons   *beaconState                    // hold-beacon counts (hash → origins, 24h window)
 	pubsub    *PubSub
 	pins      *Pinset
 	control   *control
@@ -261,6 +263,8 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		// (it must subscribe to relay the mesh) but saves records alone — never content.
 		playlists: newPlaylistStore(cfg.Role == RoleClient),
 		plLims:    mustLRU[peer.ID, *plLimiter](plPeerLims),
+		plList:    newPlListState(),
+		beacons:   newBeaconState(),
 		pubsub:    ps,
 		pins:      pins,
 		fwd:       newFwdState(),
@@ -279,6 +283,9 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	// further gates on public reachability, so only public client donors actually carry forwarding.
 	if cfg.Role == RoleClient {
 		n.host.SetStreamHandler(FwdProtocol, n.handleFwd)
+		// Playlist-list serving is also client-only: the seed holds no library
+		// (its manifest is forever empty), so it never answers.
+		n.host.SetStreamHandler(PlaylistListProtocol, n.handlePlaylistList)
 	}
 	// Zero-resolve wiring (Phase D): every signed catalog record pushed on the gossipsub topic
 	// is validated + stored locally (newest-seq wins), so a client's `routing/get` answers
@@ -297,6 +304,14 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	// buffer that the desktop drains via `playlist/records`.
 	if err := n.pubsub.SetupPlaylist(ctx, n.playlistValidator, n.playlistSink); err != nil {
 		return nil, fmt.Errorf("playlist topic: %w", err)
+	}
+	// Hold-beacon topic (PLAYLISTS.md §10): every role subscribes (relay + count);
+	// only clients publish — the seed holds no library, its manifest stays empty.
+	if err := n.pubsub.SetupBeacon(ctx, n.beaconValidator, n.beaconSink); err != nil {
+		return nil, fmt.Errorf("beacon topic: %w", err)
+	}
+	if cfg.Role == RoleClient {
+		go n.beaconLoop(ctx)
 	}
 	// Reprovide pinned roots to the custom DHT (Provide.Strategy=roots; 22h in prod). The loop also
 	// advertises the donor rendezvous (R5) while this node is a public CLIENT donor — the seed never

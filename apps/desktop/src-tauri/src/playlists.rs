@@ -8,13 +8,15 @@
 //! ("Share") — playlists are local-only by default.
 
 use crate::ipns;
-use crate::rpc::{NodeRpc, PlaylistWire};
+use crate::link;
+use crate::rpc::{ManifestEntry, NodeRpc, PlaylistWire};
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
 use cid::Cid;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,6 +29,8 @@ const FIELD_MAX: usize = 512;
 const LIFETIME: &str = "168h";
 /// Republish an own record when it has less than this long to live.
 const RENEW_MARGIN_SECS: i64 = 24 * 3600;
+/// A name-only deep link stops waiting for gossip after this (≈ one announce cycle).
+const PENDING_EXPIRY_SECS: i64 = 15 * 60;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -133,6 +137,15 @@ pub struct PlaylistDetail {
     pub items: Vec<TrackUi>,
 }
 
+/// Outcome of an incoming deep link: the row is either present ("ready") or being
+/// chased over gossip ("pending" — the UI shows a syncing state until it lands).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkStatus {
+    pub name: String,
+    pub status: &'static str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
@@ -158,6 +171,13 @@ pub struct Playlists {
     /// NOT the held tier: in-memory only, never re-announced, cleared when playback
     /// moves to another source.
     pinned: Mutex<Option<String>>,
+    /// Hash of the last disclosure-set manifest successfully posted to the node —
+    /// `push_manifest` short-circuits when the set hasn't changed. None = never posted.
+    manifest_hash: Mutex<Option<u64>>,
+    /// Names from name-only deep links awaiting arrival via gossip (name → asked-at).
+    /// In-memory only: a link click is interactive; a rare transient doesn't merit
+    /// surviving restarts. Entries resolve when the row lands, or expire (~15 min).
+    pending: Mutex<HashMap<String, i64>>,
 }
 
 impl Playlists {
@@ -200,7 +220,14 @@ impl Playlists {
             .unwrap_or(50)
             * 1024
             * 1024;
-        Ok(Self { db: Mutex::new(conn), rpc, budget, pinned: Mutex::new(None) })
+        Ok(Self {
+            db: Mutex::new(conn),
+            rpc,
+            budget,
+            pinned: Mutex::new(None),
+            manifest_hash: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+        })
     }
 
     // -- ingest (the sync loop's per-entry work) --
@@ -520,6 +547,21 @@ impl Playlists {
         Ok(())
     }
 
+    /// (mine, held, exists) flags for a name — the peer-card "you have this" markers.
+    pub fn local_flags(&self, name: &str) -> (bool, bool, bool) {
+        let db = self.db.lock().unwrap();
+        db.query_row(
+            "SELECT is_mine, held FROM playlists WHERE name=?1",
+            params![name],
+            |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|(m, h)| (m, h, true))
+        .unwrap_or((false, false, false))
+    }
+
     pub fn get(&self, name: &str) -> Result<Option<PlaylistDetail>> {
         let db = self.db.lock().unwrap();
         let row = db
@@ -574,6 +616,165 @@ impl Playlists {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
         Ok(SyncStatus { total, mine, held, seen, dormant, bytes, budget: self.budget })
+    }
+
+    // -- deep links (link.rs carries the envelope; trust re-anchors in ingest_wire) --
+
+    /// Ingest an incoming playlist link. A payload link verifies through the normal
+    /// `ingest_wire` path (signature → EOL → doc hash → schema) and lands in the seen
+    /// tier immediately; a name-only link goes pending and is chased with a targeted
+    /// `want` at connected peers (the doc then arrives via the ordinary sync loop).
+    pub async fn ingest_link(&self, url: &str) -> Result<LinkStatus> {
+        let (name, envelope) = link::parse_link(url)?;
+        if let Some(env) = envelope {
+            let (env_name, record, doc) = link::decode_envelope(&env)?;
+            // The path name is what the user *saw*; the envelope is what verifies.
+            // A mismatch is a crafted link — reject, don't silently trust the payload.
+            if env_name != name {
+                bail!("link name does not match its payload");
+            }
+            let w = PlaylistWire {
+                name: name.clone(),
+                seq: 0, // ignored: ingest_wire trusts only the seq inside the verified record
+                record: base64::engine::general_purpose::STANDARD.encode(&record),
+                doc: base64::engine::general_purpose::STANDARD.encode(&doc),
+            };
+            // Ok(true) = stored; Ok(false) = an equal/newer copy is already local OR the
+            // (name, seq) is known-bad — the flags check below tells those apart.
+            self.ingest_wire(&w)?;
+            let (_, _, have) = self.local_flags(&name);
+            if have {
+                return Ok(LinkStatus { name, status: "ready" });
+            }
+            bail!("link payload was rejected");
+        }
+        // Name-only: pend + chase. Skip both if we already hold any copy.
+        let (_, _, have) = self.local_flags(&name);
+        if have {
+            return Ok(LinkStatus { name, status: "ready" });
+        }
+        self.pending.lock().unwrap().insert(name.clone(), now_secs());
+        self.request_from_peers(&name).await;
+        Ok(LinkStatus { name, status: "pending" })
+    }
+
+    /// Fire a targeted `want` for `name` at up to 8 connected non-master peers (the
+    /// master/seed holds no docs). Stops at the first peer that re-announced or lists
+    /// the name — the doc rides gossip into the normal sync loop from there.
+    async fn request_from_peers(&self, name: &str) {
+        let Ok(peers) = self.rpc.swarm_peers().await else { return };
+        let master = crate::ipfs::master_peer_id();
+        let want = [name.to_string()];
+        let mut asked = 0;
+        for p in peers {
+            if p.peer == master || asked >= 8 {
+                continue;
+            }
+            asked += 1;
+            match self.rpc.playlist_peer_list(&p.peer, &want).await {
+                Ok((entries, reann, _supported)) => {
+                    if reann > 0 || entries.iter().any(|e| e.name == name) {
+                        return; // someone has it — gossip is on its way
+                    }
+                }
+                Err(e) => log::debug!("want {} at {}: {e}", name, p.peer),
+            }
+        }
+    }
+
+    /// Names still awaiting a name-only link resolution (pruned: arrived rows and
+    /// expired asks drop out). The UI polls this for its "syncing…" state.
+    pub fn pending_names(&self) -> Vec<String> {
+        let mut pending = self.pending.lock().unwrap();
+        pending.retain(|name, asked| {
+            *asked > now_secs() - PENDING_EXPIRY_SECS && !self.local_flags_locked(name)
+        });
+        pending.keys().cloned().collect()
+    }
+
+    /// Existence check that does NOT take self.pending (called under its lock).
+    fn local_flags_locked(&self, name: &str) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row("SELECT 1 FROM playlists WHERE name=?1", params![name], |_| Ok(()))
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// Build the shareable HTTPS link for a stored playlist. Requires a live record:
+    /// unpublished own playlists have none ("share first"), tombstoned rows had theirs
+    /// cleared, and an expired record would just be rejected by every receiver.
+    pub fn copy_link(&self, name: &str) -> Result<String> {
+        let row: Option<(Option<String>, String, i64)> = {
+            let db = self.db.lock().unwrap();
+            db.query_row(
+                "SELECT record_b64, doc_json, tombstoned FROM playlists WHERE name=?1",
+                params![name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+        };
+        let Some((record, doc_json, tombstoned)) = row else { bail!("unknown playlist") };
+        if tombstoned != 0 {
+            bail!("this playlist was deleted by its author — nothing to link to");
+        }
+        let Some(record) = record else {
+            bail!("share the playlist first — links carry the signed record");
+        };
+        if ipns::verify_b64_seq(name, &record).is_err() {
+            bail!("this playlist's record has expired — it can't be shared onward");
+        }
+        link::build_link(name, &record, &doc_json)
+    }
+
+    // -- disclosure-set manifest (playlist-list protocol + hold beacons) --
+
+    /// The disclosure set: held + published-mine rows with a live, announceable record —
+    /// exactly what `announce_once` would re-gossip. Holding or publishing a public
+    /// playlist is inherently a public act (decision 15); private (unpublished) and
+    /// seen-tier rows are never disclosed, structurally.
+    pub fn manifest(&self) -> Result<Vec<ManifestEntry>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare(
+            "SELECT name, seq, title FROM playlists
+             WHERE record_b64 IS NOT NULL AND tombstoned=0
+               AND (held=1 OR (is_mine=1 AND published=1))
+             ORDER BY name LIMIT 1024",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ManifestEntry {
+                name: r.get(0)?,
+                seq: r.get::<_, i64>(1)?.max(0) as u64,
+                title: r.get(2)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Post the disclosure set to the node iff it changed since the last successful
+    /// post. Called every sync tick (covers all mutation paths, including gossip-driven
+    /// updates of held rows) and directly after share/hold/delete for snappiness.
+    pub async fn push_manifest(&self) {
+        let entries = match self.manifest() {
+            Ok(e) => e,
+            Err(e) => {
+                log::debug!("playlist manifest query failed: {e}");
+                return;
+            }
+        };
+        let hash = {
+            let bytes = serde_json::to_vec(&entries).unwrap_or_default();
+            let d = Sha256::digest(&bytes);
+            u64::from_le_bytes(d[..8].try_into().unwrap())
+        };
+        if *self.manifest_hash.lock().unwrap() == Some(hash) {
+            return;
+        }
+        match self.rpc.playlist_manifest(&entries).await {
+            Ok(()) => *self.manifest_hash.lock().unwrap() = Some(hash),
+            Err(e) => log::debug!("playlist manifest push failed: {e}"), // retried next tick
+        }
     }
 
     // -- background loops --
@@ -808,6 +1009,7 @@ pub async fn run_loops(pl: Arc<Playlists>) {
     let mut next_announce: u64 = 2;
     loop {
         cursor = pl.sync_once(cursor).await;
+        pl.push_manifest().await; // no-op unless the disclosure set changed
         ticks += 1;
         if ticks >= next_announce {
             pl.announce_once().await;
@@ -940,6 +1142,51 @@ mod tests {
         assert_eq!(back.meta.title, "reborn");
     }
 
+    // Disclosure set (decision 15: no "back silently", ever): held + published-mine
+    // exactly — seen rows, unpublished own rows, and tombstoned rows never appear.
+    #[test]
+    fn manifest_is_held_plus_published_mine_only() {
+        let pl = mem();
+        let k1 = Keypair::generate_ed25519();
+        let k2 = Keypair::generate_ed25519();
+        let seen = wire_for(&k1, &doc_bytes("just seen"), 1);
+        let held = wire_for(&k2, &doc_bytes("backed"), 2);
+        pl.ingest_wire(&seen).unwrap();
+        pl.ingest_wire(&held).unwrap();
+
+        // Seen tier: never disclosed.
+        assert!(pl.manifest().unwrap().is_empty());
+
+        // Held: disclosed, with seq + title.
+        pl.set_held(&held.name, true).unwrap();
+        let m = pl.manifest().unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].name.as_str(), m[0].seq, m[0].title.as_str()), (held.name.as_str(), 2, "backed"));
+
+        // Own rows: only when published (an unpublished own playlist is PRIVATE).
+        {
+            let db = pl.db.lock().unwrap();
+            db.execute(
+                "UPDATE playlists SET is_mine=1, held=0, published=0 WHERE name=?1",
+                params![seen.name],
+            )
+            .unwrap();
+        }
+        assert_eq!(pl.manifest().unwrap().len(), 1);
+        {
+            let db = pl.db.lock().unwrap();
+            db.execute("UPDATE playlists SET published=1 WHERE name=?1", params![seen.name]).unwrap();
+        }
+        assert_eq!(pl.manifest().unwrap().len(), 2);
+
+        // A tombstoned held row (record cleared, dormant) drops out of the disclosure set.
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        pl.ingest_wire(&wire_for(&k2, &tomb, 3)).unwrap();
+        let m = pl.manifest().unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].name, seen.name);
+    }
+
     #[test]
     fn search_finds_by_title_and_track() {
         let pl = mem();
@@ -1005,6 +1252,70 @@ mod tests {
         let got = pl.get(&w.name).unwrap().unwrap();
         assert_eq!(got.meta.title, "go fixture");
         assert_eq!(got.items[0].mod_name, "fix.it");
+    }
+
+    // Deep links ride the same trust path: an envelope built from stored row fields
+    // round-trips copy_link → ingest_link on a fresh store, a tampered fragment is
+    // rejected + remembered, and a path/payload name mismatch is rejected outright.
+    #[tokio::test]
+    async fn deep_link_roundtrip_tamper_and_mismatch() {
+        let src = mem();
+        let kp = Keypair::generate_ed25519();
+        let w = wire_for(&kp, &doc_bytes("linked"), 4);
+        src.ingest_wire(&w).unwrap();
+        let url = src.copy_link(&w.name).unwrap();
+        assert!(url.starts_with(crate::link::WEB_BASE));
+
+        // Fresh store: the link alone materializes the playlist (seen tier).
+        let dst = mem();
+        let st = dst.ingest_link(&url).await.unwrap();
+        assert_eq!((st.status, st.name.as_str()), ("ready", w.name.as_str()));
+        let got = dst.get(&w.name).unwrap().unwrap();
+        assert!(!got.meta.is_mine && !got.meta.held, "link ingest lands in the seen tier");
+        assert_eq!(got.meta.title, "linked");
+
+        // Tampered fragment: flip one payload byte → rejected, remembered.
+        let (name, frag) = url.split_once('#').map(|(u, f)| (u.to_string(), f.to_string())).unwrap();
+        let mut env = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&frag).unwrap();
+        let last = env.len() - 1;
+        env[last] ^= 0x01;
+        let bad = format!("{name}#{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&env));
+        let dst2 = mem();
+        assert!(dst2.ingest_link(&bad).await.is_err());
+        assert!(dst2.get(&w.name).unwrap().is_none());
+
+        // Path/payload name mismatch: valid envelope under a different path name.
+        let other = wire_for(&Keypair::generate_ed25519(), &doc_bytes("other"), 1);
+        let crafted = format!("{}{}#{frag}", crate::link::WEB_BASE, other.name);
+        assert!(dst2.ingest_link(&crafted).await.is_err());
+
+        // copy_link preconditions: unknown and tombstoned rows refuse.
+        assert!(dst2.copy_link("12D3KooWNoSuchName").is_err());
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        src.set_held(&w.name, true).unwrap();
+        src.ingest_wire(&wire_for(&kp, &tomb, 5)).unwrap();
+        assert!(src.copy_link(&w.name).is_err(), "tombstoned row must not produce a link");
+    }
+
+    // Name-only links pend until the row arrives via gossip, then resolve; stale asks
+    // expire out of the pending set.
+    #[tokio::test]
+    async fn name_only_link_pends_then_resolves() {
+        let pl = mem();
+        let kp = Keypair::generate_ed25519();
+        let name = kp.public().to_peer_id().to_string();
+        // request_from_peers hits the (unreachable) test RPC and degrades to a no-op.
+        let st = pl.ingest_link(&format!("trackerstream://playlist/{name}")).await.unwrap();
+        assert_eq!(st.status, "pending");
+        assert_eq!(pl.pending_names(), vec![name.clone()]);
+
+        // The doc arrives through the normal sync path → pending clears.
+        pl.ingest_wire(&wire_for(&kp, &doc_bytes("arrived"), 1)).unwrap();
+        assert!(pl.pending_names().is_empty());
+
+        // An already-held name short-circuits to ready.
+        let st = pl.ingest_link(&format!("trackerstream://playlist/{name}")).await.unwrap();
+        assert_eq!(st.status, "ready");
     }
 
     // Live-node harness: run with a local tsnode (`tsnode -rpc 127.0.0.1:47701`) via

@@ -63,6 +63,32 @@ export interface PeerDetail {
 export const peerDetail = (id: string): Promise<PeerDetail> =>
   invoke<PeerDetail>("peer_detail", { peerId: id });
 
+/** One playlist a peer discloses (held + published-mine only), joined with local
+ *  library state so the UI can mark "in your library" / offer "get". */
+export interface PeerPlaylistEntry {
+  name: string;
+  seq: number;
+  title: string;
+  have: boolean; // any local copy (seen tier included)
+  held: boolean;
+  mine: boolean;
+}
+
+export interface PeerPlaylists {
+  supported: boolean; // false = old build or the seed — a normal answer, not an error
+  playlists: PeerPlaylistEntry[];
+}
+
+/** Ask one connected peer what playlists it holds (deliberate 1:1 pull — fetched on
+ *  demand from the peer card, never polled). */
+export const peerPlaylists = (id: string): Promise<PeerPlaylists> =>
+  invoke<PeerPlaylists>("peer_playlists", { peerId: id });
+
+/** Request a targeted re-announce of one playlist from a peer that holds it; the doc
+ *  arrives through the normal gossip → sync path (check discover shortly after). */
+export const requestPlaylist = (peerId: string, name: string): Promise<number> =>
+  invoke<number>("playlist_request", { peerId, name });
+
 export const connectPeer = (addr: string): Promise<void> => invoke("connect_peer", { addr });
 
 /** Queue-driven pre-connection: ask the tracker who holds `root` and warm-connect

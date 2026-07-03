@@ -5,6 +5,7 @@
     plCreate,
     plGet,
     plStatus,
+    plBackers,
     plState,
     plBump,
     playPlaylist,
@@ -32,13 +33,27 @@
       .catch(() => (status = null));
   });
 
+  // Hold-beacon backer counts for the visible rows: ranks discover by backing and
+  // feeds the ~N chips. Missing/0 counts are normal (beacons are hourly).
+  let backers = $state<Record<string, number>>({});
+
   $effect(() => {
     const q = query.trim();
     const t = tab;
     void plState.version; // re-query after any mutation + the sync tick
     (q ? plSearch(q) : plList(t === "library" ? "library" : "seen"))
-      .then((r) => {
-        rows = r;
+      .then(async (r) => {
+        backers = await plBackers(r.map((p) => p.name)).catch(() => ({}));
+        // Discover ranks by backing (holder count desc, then recency): popularity =
+        // durability on this network, so back-worthy lists float up.
+        rows =
+          t === "discover" && !q
+            ? r.toSorted(
+                (a, b) =>
+                  (backers[b.name] ?? 0) - (backers[a.name] ?? 0) ||
+                  b.lastUpdateAt - a.lastUpdateAt,
+              )
+            : r;
         error = null;
         if (!rows.some((p) => p.name === selectedName)) selectedName = rows[0]?.name ?? null;
       })
@@ -89,8 +104,14 @@
         <span class="badges">
           {#if p.isMine}<span class="badge mine">mine</span>{/if}
           {#if p.held}<span class="badge held">held</span>{/if}
+          {#if p.held && (backers[p.name] ?? 0) <= 1}
+            <span class="badge rare" title="you're one of the only holders — keep backing it">rare</span>
+          {/if}
           {#if p.dormant}<span class="badge dormant" title="record expired — author absent; fork to keep it shareable">dormant</span>{/if}
           {#if p.published}<span class="badge pub">shared</span>{/if}
+          {#if (backers[p.name] ?? 0) > 1}
+            <span class="badge backers" title="distinct holders heard on the network (24h)">~{backers[p.name]}</span>
+          {/if}
         </span>
         <span class="count">{p.tracks} trk</span>
         <span class="age">{fmtAge(p.lastUpdateAt)}</span>
@@ -205,6 +226,14 @@
   .badge.pub {
     color: var(--cyan);
     border-color: var(--cyan);
+  }
+  .badge.rare {
+    color: var(--hot);
+    border-color: var(--hot);
+  }
+  .badge.backers {
+    color: var(--green, #7dcfa0);
+    border-color: var(--green, #7dcfa0);
   }
   .count,
   .age {

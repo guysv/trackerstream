@@ -18,6 +18,8 @@
   import { playList, playNext, playPrev, player, nowPlaying, queue } from "$lib/player.svelte";
   import { peers, startPeerPolling } from "$lib/peers.svelte";
   import { initDeepLinks } from "$lib/deeplink";
+  import { plIngestLink, plBump } from "$lib/playlists.svelte";
+  import { dbg } from "$lib/debug";
   import { keepaliveMaster } from "$lib/p2p";
   import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
 
@@ -80,8 +82,19 @@
     getFormats()
       .then((f) => ((formats = f.formats), (total = f.total)))
       .catch(() => (apiError = true));
-    // E2: register the trackerstream:// scheme (handlers land with P2P sharing).
-    void initDeepLinks();
+    // Deep links: an incoming trackerstream:// (or /p/ handoff) URL is verified and
+    // ingested in Rust (`playlist_ingest_link`), then the playlists view opens on it —
+    // "pending" (name-only link) rows show a syncing placeholder until gossip delivers.
+    void initDeepLinks(async (url) => {
+      try {
+        const st = await plIngestLink(url);
+        mainView = "playlists";
+        selectedPlaylist = st.name;
+        plBump();
+      } catch (e) {
+        dbg("deep link rejected", { url, error: String(e) });
+      }
+    });
     // Hold a persistent master connection from startup (not lazily per-play), so
     // the peers pane reflects reality and uncached playback skips the re-dial.
     void keepaliveMaster(BOOTSTRAP_MULTIADDRS);

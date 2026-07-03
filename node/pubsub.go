@@ -19,6 +19,7 @@ type PubSub struct {
 	ps       *pubsub.PubSub
 	catalog  *pubsub.Topic
 	playlist *pubsub.Topic
+	beacon   *pubsub.Topic
 
 	mu       sync.Mutex
 	onRecord func(name string, record []byte) // catalog-record sink (the client IPNS cache)
@@ -87,6 +88,45 @@ func (p *PubSub) PublishPlaylist(ctx context.Context, data []byte) error {
 		return fmt.Errorf("playlist topic not set up")
 	}
 	return p.playlist.Publish(ctx, data)
+}
+
+// SetupBeacon mirrors SetupPlaylist for the hold-beacon topic: validator before Join,
+// then a drain goroutine feeding the sink with the message's authenticated ORIGIN
+// (GetFrom — the signer under default StrictSign, not the last hop). ALL roles
+// subscribe: subscription is what makes a node forward the mesh; the seed counts
+// uselessly but relays usefully.
+func (p *PubSub) SetupBeacon(ctx context.Context, val pubsub.ValidatorEx, sink func(origin peer.ID, data []byte)) error {
+	if err := p.ps.RegisterTopicValidator(PlaylistBeaconTopic, val); err != nil {
+		return fmt.Errorf("beacon validator: %w", err)
+	}
+	t, err := p.ps.Join(PlaylistBeaconTopic)
+	if err != nil {
+		return fmt.Errorf("join beacon topic: %w", err)
+	}
+	p.beacon = t
+	sub, err := t.Subscribe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		defer sub.Cancel()
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return // ctx cancelled / topic closed
+			}
+			sink(msg.GetFrom(), msg.Data)
+		}
+	}()
+	return nil
+}
+
+// PublishBeacon pushes an encoded hold beacon onto the beacon topic.
+func (p *PubSub) PublishBeacon(ctx context.Context, data []byte) error {
+	if p.beacon == nil {
+		return fmt.Errorf("beacon topic not set up")
+	}
+	return p.beacon.Publish(ctx, data)
 }
 
 // OnCatalogRecord registers the sink invoked for every valid-shaped catalog message received

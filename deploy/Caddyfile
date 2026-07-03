@@ -16,13 +16,26 @@
 
 ${TS_DOMAIN} {
 	encode zstd gzip
-	respond /healthz "ok" 200
-	respond "trackerstream" 200
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options nosniff
 		Referrer-Policy no-referrer
 		-Server
+	}
+
+	# Playlist deep-link handoff (PLAYLISTS.md §10): every /p/<name> serves the ONE
+	# static page (deploy/site/p.html, installed by setup-tls.sh), which parses the
+	# name client-side and hands off to the desktop app. The payload rides the URL
+	# FRAGMENT — it never reaches this server, so there is nothing to store or log.
+	handle /p/* {
+		root * /var/www/trackerstream
+		rewrite * /p.html
+		file_server
+	}
+
+	handle {
+		respond /healthz "ok" 200
+		respond "trackerstream" 200
 	}
 	# Access logs go to journald (the default) — kept inside Caddy's systemd
 	# sandbox, retention via journald (see deploy/backup.sh / D3 log rotation).
