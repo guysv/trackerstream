@@ -170,7 +170,9 @@ export async function playPlaylist(detail: PlaylistDetail, index = 0): Promise<v
   const at = Math.max(0, hits.findIndex((h) => h.id === wantedId));
   playList(hits, at); // fires the source-change hook first, releasing any prior pin
   void invoke("playlist_pin", { name: detail.name }).catch(() => {});
-  void invoke("playlist_played", { name: detail.name }).catch(() => {});
+  // Bump only after the mark lands, so the library re-query reads the fresh
+  // last_played_at and the just-played playlist visibly rises to the top of its tier.
+  void invoke("playlist_played", { name: detail.name }).then(plBump).catch(() => {});
 }
 
 /** Append a track to one of my playlists (no-op if it's already in). */

@@ -674,7 +674,9 @@ impl Playlists {
         let mut stmt = db.prepare(&format!(
             "SELECT name, title, doc_json, is_mine, held, published, size_bytes,
                     last_update_at, last_played_at, eol, tombstoned, liked
-             FROM playlists {filter} ORDER BY is_mine DESC, held DESC, last_update_at DESC LIMIT 500",
+             FROM playlists {filter}
+             ORDER BY is_mine DESC, held DESC,
+                      MAX(last_update_at, COALESCE(last_played_at, 0)) DESC LIMIT 500",
         ))?;
         let rows = stmt.query_map([], row_meta)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1427,6 +1429,29 @@ mod tests {
         assert_eq!(pl.search("chiptune").unwrap().len(), 1);
         assert_eq!(pl.search("song").unwrap().len(), 1); // track title
         assert_eq!(pl.search("nomatch").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn playing_bumps_a_playlist_up_in_the_library() {
+        let pl = mem();
+        let (ka, kb) = (Keypair::generate_ed25519(), Keypair::generate_ed25519());
+        let a = wire_for(&ka, &doc_bytes("older-play"), 1);
+        let b = wire_for(&kb, &doc_bytes("newer-update"), 1);
+        pl.ingest_wire(&a).unwrap();
+        pl.ingest_wire(&b).unwrap();
+        // Give B the newer *update* time so by the old sort it would lead.
+        {
+            let db = pl.db.lock().unwrap();
+            db.execute("UPDATE playlists SET last_update_at=1 WHERE name=?1", params![a.name]).unwrap();
+            db.execute("UPDATE playlists SET last_update_at=1000000000 WHERE name=?1", params![b.name])
+                .unwrap();
+        }
+        let order = |pl: &Playlists| pl.list("all").unwrap().into_iter().map(|m| m.name).collect::<Vec<_>>();
+        assert_eq!(order(&pl), vec![b.name.clone(), a.name.clone()], "newer update leads before any play");
+
+        // Playing A (mark_played uses now, which outranks B's update time) bumps it above B.
+        pl.mark_played(&a.name).unwrap();
+        assert_eq!(order(&pl), vec![a.name.clone(), b.name.clone()], "the just-played playlist leads");
     }
 
     #[test]
