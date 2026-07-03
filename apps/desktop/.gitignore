@@ -1,5 +1,8 @@
 .DS_Store
 node_modules
+
+# dev-locked.mjs tree lock — local dev side channel, never shared
+/.dev-lock
 /build
 /.svelte-kit
 /package

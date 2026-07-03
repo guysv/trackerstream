@@ -7,6 +7,7 @@
     "build:worklet": "node scripts/build-worklet.mjs",
     "predev": "pnpm prepare:sidecar && node scripts/build-worklet.mjs",
     "dev": "vite dev",
+    "dev:locked": "node scripts/dev-locked.mjs",
     "prebuild": "pnpm prepare:sidecar && node scripts/build-worklet.mjs",
     "build": "vite build",
     "preview": "vite preview",
