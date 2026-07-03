@@ -32,8 +32,7 @@
   });
 
   async function openPlMenu() {
-    // Own playlists, minus "Liked Tracks" — the ♥ button is its canonical path.
-    if (!plMenu) myLists = (await plList().catch(() => [])).filter((p) => p.isMine && !p.liked);
+    if (!plMenu) myLists = (await plList().catch(() => [])).filter((p) => p.isMine);
     plMenu = !plMenu;
   }
 
