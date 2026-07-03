@@ -423,8 +423,11 @@ saturation; malformed dies at the local validator.
     playing bar) toggles membership by catalog id; **the toggle routes through `update()`**
     so that while the liked playlist is shared, each like/unlike republishes (seq+1) and
     the public copy stays current. New column `liked`; new RPCs `playlist_like_toggle`,
-    `playlist_liked_ids`, `playlist_liked_name`. The UI pins it to the top of the library,
-    marks it ♥, and drops it from the "add to playlist" menu (the heart is its one path).
+    `playlist_liked_ids`, `playlist_liked_name`. **UI-wise it is an ordinary mine playlist**
+    (same "mine" badge, same "add to playlist" menu, same share/delete) — the flag's *only*
+    display effect is a ♥ marker beside it in the library list; the ♥ buttons (module
+    detail + now-playing bar) drive membership. Deliberately NOT pinned/hidden/renamed:
+    the flag adds a heart, nothing more (user call 2026-07-03).
 20. **"Make private again" / unshare (user call 2026-07-03).** Sharing was one-way (only
     delete → tombstone retracted it, discarding the local data) — wrong for a persistent
     fixture like Liked Tracks, which needs to toggle public↔private while keeping its

@@ -53,9 +53,7 @@
                   (backers[b.name] ?? 0) - (backers[a.name] ?? 0) ||
                   b.lastUpdateAt - a.lastUpdateAt,
               )
-            : // "Liked Tracks" pins to the top of the library (Spotify-style); the rest
-              // keep Rust's mine → held → recency order (toSorted is stable).
-              r.toSorted((a, b) => Number(b.liked) - Number(a.liked));
+            : r;
         error = null;
         if (!rows.some((p) => p.name === selectedName)) selectedName = rows[0]?.name ?? null;
       })
@@ -103,11 +101,11 @@
         tabindex="-1"
       >
         <span class="title">
-          {#if p.liked}<span class="lheart" title="your private Liked Tracks">♥</span> {/if}{p.title ||
+          {#if p.liked}<span class="lheart" title="your Liked Tracks">♥</span> {/if}{p.title ||
             "(untitled)"}
         </span>
         <span class="badges">
-          {#if p.isMine && !p.liked}<span class="badge mine">mine</span>{/if}
+          {#if p.isMine}<span class="badge mine">mine</span>{/if}
           {#if p.held}<span class="badge held">held</span>{/if}
           {#if p.held && (backers[p.name] ?? 0) <= 1}
             <span class="badge rare" title="you're one of the only holders — keep backing it">rare</span>
