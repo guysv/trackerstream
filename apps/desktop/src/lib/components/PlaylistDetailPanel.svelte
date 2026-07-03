@@ -224,9 +224,7 @@
       {#if detail.held}· <span class="heldtxt">in library</span>{/if}
       {#if detail.dormant}· <span class="dormant">dormant</span>{/if}
       {#if detail.published}· <span class="pub">shared</span>{/if}
-      {#if detail.held && backerCount <= 1}
-        · <span class="dormant" title="you're one of the only holders — keep backing it">backed only by you</span>
-      {:else if backerCount > 1}
+      {#if backerCount > 1}
         · <span title="distinct holders heard on the network (24h)">backed by ~{backerCount} holders</span>
       {/if}
     </div>
