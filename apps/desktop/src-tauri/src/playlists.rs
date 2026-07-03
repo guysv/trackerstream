@@ -492,7 +492,7 @@ impl Playlists {
                 let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] })?;
                 let next = self.next_seq(name, seq).await;
                 if let Err(e) = self.rpc.playlist_publish(&key_name, next, LIFETIME, tomb).await {
-                    log::warn!("playlist tombstone publish failed for {name}: {e}");
+                    log::warn!(target: "playlist", "tombstone publish failed for {name}: {e}");
                 }
             }
         }
@@ -536,7 +536,7 @@ impl Playlists {
                     // Best-effort: even if the tombstone fails to send, we still go private
                     // locally and stop renewing — the live record then expires at EOL.
                     Ok(_) => new_seq = next as i64,
-                    Err(e) => log::warn!("unshare tombstone publish failed for {name}: {e}"),
+                    Err(e) => log::warn!(target: "playlist", "unshare tombstone publish failed for {name}: {e}"),
                 }
             }
         }
@@ -806,7 +806,7 @@ impl Playlists {
                         return; // someone has it — gossip is on its way
                     }
                 }
-                Err(e) => log::debug!("want {} at {}: {e}", name, p.peer),
+                Err(e) => log::debug!(target: "playlist", "want {} at {}: {e}", name, p.peer),
             }
         }
     }
@@ -888,7 +888,7 @@ impl Playlists {
         let entries = match self.manifest() {
             Ok(e) => e,
             Err(e) => {
-                log::debug!("playlist manifest query failed: {e}");
+                log::debug!(target: "playlist", "manifest query failed: {e}");
                 return;
             }
         };
@@ -902,7 +902,7 @@ impl Playlists {
         }
         match self.rpc.playlist_manifest(&entries).await {
             Ok(()) => *self.manifest_hash.lock().unwrap() = Some(hash),
-            Err(e) => log::debug!("playlist manifest push failed: {e}"), // retried next tick
+            Err(e) => log::debug!(target: "playlist", "manifest push failed: {e}"), // retried next tick
         }
     }
 
@@ -914,13 +914,17 @@ impl Playlists {
         let (ver, recs) = match self.rpc.playlist_records(cursor).await {
             Ok(v) => v,
             Err(e) => {
-                log::debug!("playlist records poll failed: {e}");
+                log::debug!(target: "playlist", "records poll failed: {e}");
                 return cursor;
             }
         };
         for w in &recs {
-            if let Err(e) = self.ingest_wire(w) {
-                log::debug!("playlist ingest {} rejected: {e}", w.name);
+            match self.ingest_wire(w) {
+                // The moment a shared playlist lands locally: `TS_LOG=info,playlist=debug`
+                // times a share end-to-end without the frontend/dial firehose.
+                Ok(true) => log::debug!(target: "playlist", "ingested {} seq {}", w.name, w.seq),
+                Ok(false) => {} // not newer / already rejected — nothing to trace
+                Err(e) => log::debug!(target: "playlist", "ingest {} rejected: {e}", w.name),
             }
         }
         if !recs.is_empty() {
@@ -992,7 +996,7 @@ impl Playlists {
             let alive = ipns::verify_b64_seq(&name, &record).is_ok();
             if is_mine && (!alive || record_near_eol(&record)) {
                 if let Err(e) = self.publish(&name).await {
-                    log::warn!("playlist renewal failed for {name}: {e}");
+                    log::warn!(target: "playlist", "renewal failed for {name}: {e}");
                 }
                 continue; // publish already gossiped the fresh record
             }
@@ -1010,7 +1014,7 @@ impl Playlists {
             return;
         }
         if let Err(e) = self.rpc.playlist_announce(&entries).await {
-            log::debug!("playlist announce failed: {e}");
+            log::debug!(target: "playlist", "announce failed: {e}");
         }
     }
 }
@@ -1141,7 +1145,7 @@ pub async fn run_loops(pl: Arc<Playlists>) {
         let pl = pl.clone();
         async move {
             if let Err(e) = pl.ensure_liked().await {
-                log::debug!("liked playlist ensure at startup failed (retries on first like): {e}");
+                log::debug!(target: "playlist", "liked ensure at startup failed (retries on first like): {e}");
             }
         }
     });
