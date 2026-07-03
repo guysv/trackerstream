@@ -18,6 +18,9 @@ export interface PlaylistMeta {
   dormant: boolean;
   /** The author published a deletion; library copies are preserved dormant. */
   tombstoned: boolean;
+  /** The private per-client "Liked Tracks" playlist (Spotify-style) — own, never
+   * published; the UI pins it and hides share/delete. */
+  liked: boolean;
   sizeBytes: number;
   lastUpdateAt: number;
   lastPlayedAt: number | null;
@@ -66,6 +69,17 @@ export const plDelete = (name: string) => invoke<void>("playlist_delete", { name
 export const plPublish = (name: string) => invoke<void>("playlist_publish", { name });
 export const plStatus = () => invoke<PlaylistSyncStatus>("playlist_sync_status");
 
+// ---- liked tracks (the private "Liked Tracks" playlist — Spotify-style ♥) ----
+
+/** Toggle a track in "Liked Tracks" (creates the private playlist on first use).
+ * Returns true if the track is now liked. */
+export const plLikeToggle = (track: TrackTuple) =>
+  invoke<boolean>("playlist_like_toggle", { track });
+/** The catalog ids currently liked — what the heart buttons check membership against. */
+export const plLikedIds = () => invoke<number[]>("playlist_liked_ids");
+/** The liked playlist's name (creating it if needed) — for opening it in the view. */
+export const plLikedName = () => invoke<string>("playlist_liked_name");
+
 // ---- deep links ----
 
 export interface LinkStatus {
@@ -95,13 +109,42 @@ export const itemTuples = (items: PlaylistItem[]): TrackTuple[] =>
 export const plState = $state({ version: 0 });
 export const plBump = () => plState.version++;
 
+// The set of catalog ids in the private "Liked Tracks" playlist. Every ♥ button across
+// the UI reads this reactively; kept warm by refreshLiked() on the sync cadence and
+// flipped optimistically on toggle so the heart reacts instantly.
+export const liked = $state<{ ids: Set<number> }>({ ids: new Set() });
+export const isLiked = (id: number): boolean => liked.ids.has(id);
+
+export async function refreshLiked(): Promise<void> {
+  try {
+    liked.ids = new Set(await plLikedIds());
+  } catch {
+    /* keep the last known set on a transient failure */
+  }
+}
+
+/** Toggle a track's membership in "Liked Tracks". Reassigns the reactive set so the
+ * heart flips without waiting for the next refresh. */
+export async function toggleLike(h: ModuleHit): Promise<void> {
+  const nowLiked = await plLikeToggle(hitTuple(h));
+  const ids = new Set(liked.ids);
+  if (nowLiked) ids.add(h.id);
+  else ids.delete(h.id);
+  liked.ids = ids;
+  plBump();
+}
+
 // The Rust sync loop writes into playlists.db behind the UI's back (20s poll of the
 // sidecar), so bump the counter on a timer too — otherwise a playlist synced from the
 // network stays invisible until some local mutation happens to refresh the views.
 // Queries only actually run while playlist components are mounted, and they're local
 // SQLite reads. (window guard: this module also loads during SSR prerender.)
 if (typeof window !== "undefined") {
-  setInterval(plBump, 10_000);
+  void refreshLiked();
+  setInterval(() => {
+    plBump();
+    void refreshLiked(); // catches unlikes done from the playlist detail (splice + update)
+  }, 10_000);
 }
 
 // Play-time pin: while the queue is sourced from a playlist, Rust protects that row

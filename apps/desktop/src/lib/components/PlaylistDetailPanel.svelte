@@ -13,6 +13,7 @@
     playPlaylist,
     duplicatePlaylist,
     itemTuples,
+    refreshLiked,
     type PlaylistDetail,
   } from "$lib/playlists.svelte";
 
@@ -78,6 +79,7 @@
     const tuples = itemTuples(detail.items);
     tuples.splice(i, 1);
     await plUpdate(detail.name, detail.title, tuples);
+    if (detail.liked) void refreshLiked(); // keep the ♥ set in sync when un-liking here
     plBump();
   }
 
@@ -129,10 +131,12 @@
       <div class="placeholder">select a playlist</div>
     {/if}
   {:else}
-    <div class="title">{detail.title || "(untitled)"}</div>
+    <div class="title">
+      {#if detail.liked}<span class="lheart">♥</span> {/if}{detail.title || "(untitled)"}
+    </div>
     <div class="sub">
       {detail.items.length} tracks
-      {#if detail.isMine}· mine{/if}
+      {#if detail.liked}· <span class="lheart">liked</span>{#if !detail.published} · private{/if}{:else if detail.isMine}· mine{/if}
       {#if detail.held}· <span class="heldtxt">in library</span>{/if}
       {#if detail.dormant}· <span class="dormant">dormant</span>{/if}
       {#if detail.published}· <span class="pub">shared</span>{/if}
@@ -202,8 +206,13 @@
 
     {#if confirmShare}
       <div class="confirm">
-        sharing publishes this playlist to <b>everyone</b> on the network. it can be
-        tombstoned later, but copies may persist.
+        {#if detail.liked}
+          sharing your <b>Liked Tracks</b> makes your liked songs public — everyone on the
+          network can see them, and later likes keep publishing while it stays shared.
+        {:else}
+          sharing publishes this playlist to <b>everyone</b> on the network.
+        {/if}
+        it can be tombstoned later (delete), but copies may persist.
         <div class="cbtns">
           <button class="go" onclick={share} disabled={busy}>share it</button>
           <button onclick={() => (confirmShare = false)}>cancel</button>
@@ -214,6 +223,7 @@
       <div class="confirm">
         {#if detail.published}delete publishes a tombstone (syncers drop it), then removes it locally.
         {:else}delete removes this playlist.{/if}
+        {#if detail.liked} a fresh empty Liked Tracks comes back next time you like a track.{/if}
         <div class="cbtns">
           <button class="go" onclick={del} disabled={busy}>delete</button>
           <button onclick={() => (confirmDelete = false)}>cancel</button>
@@ -231,7 +241,11 @@
           {/if}
         </div>
       {/each}
-      {#if !detail.items.length}<div class="empty">no tracks — add from a module's detail pane</div>{/if}
+      {#if !detail.items.length}<div class="empty">
+          {detail.liked
+            ? "no liked tracks yet — tap ♥ on any track"
+            : "no tracks — add from a module's detail pane"}
+        </div>{/if}
     </div>
   {/if}
 </div>
@@ -272,6 +286,9 @@
   }
   .heldtxt {
     color: var(--violet);
+  }
+  .lheart {
+    color: var(--hot);
   }
   .dormant {
     color: var(--hot);
