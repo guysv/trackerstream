@@ -28,6 +28,8 @@
   let error = $state<string | null>(null);
   let pending = $state(false); // selected name is a name-only deep link awaiting gossip
   let linkCopied = $state(false);
+  let editingTitle = $state(false); // title shown as an editable input
+  let titleDraft = $state("");
   let loadedFor: string | null = null; // last name a fetch completed for (not reactive)
 
   $effect(() => {
@@ -46,6 +48,7 @@
       confirmShare = false;
       confirmUnshare = false;
       confirmDelete = false;
+      editingTitle = false;
       error = null;
       linkCopied = false;
     }
@@ -84,6 +87,37 @@
     await plUpdate(detail.name, detail.title, tuples);
     if (detail.liked) void refreshLiked(); // keep the ♥ set in sync when un-liking here
     plBump();
+  }
+
+  // Rename reuses the generic update path (rewrites the doc's title, republishing at
+  // seq+1 if shared); only `title` changes — `name` is the stable IPNS identity.
+  function startRename() {
+    if (!detail?.isMine || detail.liked) return; // Liked Tracks title is fixed
+    titleDraft = detail.title;
+    editingTitle = true;
+  }
+
+  function cancelRename() {
+    editingTitle = false;
+  }
+
+  async function commitRename() {
+    if (!detail || !editingTitle) return; // guard the double-fire from Enter → blur
+    editingTitle = false;
+    const next = titleDraft.trim();
+    if (!next || next === detail.title) return; // no-op on empty or unchanged
+    try {
+      await plUpdate(detail.name, next, itemTuples(detail.items));
+      plBump();
+    } catch (e) {
+      error = `rename failed: ${e}`;
+    }
+  }
+
+  // Focus + select the input the moment it mounts, so the title is ready to overtype.
+  function focusSelect(node: HTMLInputElement) {
+    node.focus();
+    node.select();
   }
 
   async function share() {
@@ -149,7 +183,41 @@
       <div class="placeholder">select a playlist</div>
     {/if}
   {:else}
-    <div class="title">{detail.title || "(untitled)"}</div>
+    {#if editingTitle}
+      <input
+        class="title titleedit"
+        bind:value={titleDraft}
+        maxlength="200"
+        autocomplete="off"
+        autocorrect="off"
+        autocapitalize="off"
+        spellcheck="false"
+        onkeydown={(e) => {
+          if (e.key === "Enter") commitRename();
+          else if (e.key === "Escape") cancelRename();
+        }}
+        onblur={commitRename}
+        use:focusSelect
+      />
+    {:else if detail.isMine && !detail.liked}
+      <div
+        class="title renamable"
+        role="button"
+        tabindex="0"
+        title="click to rename"
+        onclick={startRename}
+        onkeydown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            startRename();
+          }
+        }}
+      >
+        {detail.title || "(untitled)"}
+      </div>
+    {:else}
+      <div class="title">{detail.title || "(untitled)"}</div>
+    {/if}
     <div class="sub">
       {detail.items.length} tracks
       {#if detail.isMine}· mine{/if}
@@ -190,6 +258,9 @@
              deleted from the UI. Only play/edit affordances apply. -->
         <span class="likednote">private · your Liked Tracks</span>
       {:else if detail.isMine}
+        {#if !editingTitle}
+          <button onclick={startRename} disabled={busy}>rename</button>
+        {/if}
         {#if !confirmShare}
           <button onclick={() => (confirmShare = true)} disabled={busy}>
             {detail.published ? "re-share" : "share"}
@@ -300,6 +371,25 @@
   .title {
     color: var(--violet);
     font-size: 15px;
+  }
+  .renamable {
+    cursor: text;
+    border-radius: 3px;
+    padding: 0 2px;
+    margin: 0 -2px; /* keep text baseline aligned despite the padding */
+  }
+  .renamable:hover {
+    background: var(--row-hover);
+  }
+  .titleedit {
+    font-family: inherit;
+    background: var(--row-hover);
+    border: 1px solid var(--violet);
+    border-radius: 3px;
+    padding: 0 2px;
+    margin: 0 -3px; /* offset border+padding so the text doesn't shift on edit */
+    width: 100%;
+    outline: none;
   }
   .sub {
     color: var(--dim);

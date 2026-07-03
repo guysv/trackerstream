@@ -61,7 +61,15 @@
   ];
 
   function globalKeys(e: KeyboardEvent) {
-    const inField = document.activeElement === searchEl;
+    // Any focused text-entry element must own its keystrokes — otherwise Space (play/
+    // pause), "/" and "?" get swallowed while the user is typing (e.g. renaming a
+    // playlist), not just when the search box has focus.
+    const el = document.activeElement as HTMLElement | null;
+    const inField =
+      el === searchEl ||
+      el?.tagName === "INPUT" ||
+      el?.tagName === "TEXTAREA" ||
+      el?.isContentEditable === true;
     if (e.key === "Escape") {
       showHelp = false;
       if (inField) searchEl?.blur();
