@@ -17,3 +17,10 @@ deploy/dist/
 # local agent / editor config — never shared
 CLAUDE.md
 .claude/
+
+# TMA API dumps: ignore the loose raw working files, but bank the dated snapshots.
+api-dumps/*
+!api-dumps/README.md
+!api-dumps/tma-genres-*.tsv
+!api-dumps/tma-genres-*.json
+!api-dumps/tma-genre-raw-*.zip
