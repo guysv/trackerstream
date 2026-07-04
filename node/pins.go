@@ -8,10 +8,20 @@ import (
 
 	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
+	"github.com/ipfs/go-datastore/query"
 )
 
-// pinKey namespaces the persisted pinset in the datastore.
+// pinKey is the LEGACY single-blob pinset key. It's folded into per-item keys and
+// deleted on first load (see newPinset); nothing writes it anymore.
 var pinKey = ds.NewKey("/trackerstream/pins")
+
+// pinPrefix namespaces the per-item pinset: one datastore entry per pinned CID
+// (value = the PinKind byte). Add/Remove are then O(1) single-key writes instead of
+// re-serializing and rewriting the WHOLE set on every change — which was O(n) per
+// pin, i.e. O(n²) over a bulk ingest (and ~GB–TB of leveldb write amplification).
+var pinPrefix = ds.NewKey("/trackerstream/pinset")
+
+func itemKey(c cid.Cid) ds.Key { return pinPrefix.ChildString(c.String()) }
 
 // PinKind tags WHY a CID is held, which drives the reprovide GRANULARITY:
 //   - KindRoot: a durability root (the seed's catalog root + track roots from ingest). Provided.
@@ -42,47 +52,75 @@ type Pinset struct {
 
 func newPinset(store ds.Batching) (*Pinset, error) {
 	p := &Pinset{roots: map[cid.Cid]PinKind{}, ds: store}
-	data, err := store.Get(context.Background(), pinKey)
-	if err == ds.ErrNotFound {
-		return p, nil
+	ctx := context.Background()
+	// One-time migration: fold a legacy single-blob pinset into per-item keys, then
+	// drop the blob. A pre-migration node persisted the whole set under pinKey.
+	if data, err := store.Get(ctx, pinKey); err == nil {
+		batch, err := store.Batch(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for c, k := range parseLegacyPins(data) {
+			p.roots[c] = k
+			if err := batch.Put(ctx, itemKey(c), []byte{byte(k)}); err != nil {
+				return nil, err
+			}
+		}
+		if err := batch.Delete(ctx, pinKey); err != nil {
+			return nil, err
+		}
+		if err := batch.Commit(ctx); err != nil {
+			return nil, err
+		}
+	} else if err != ds.ErrNotFound {
+		return nil, err
 	}
+	// Load the per-item pinset into memory (the reprovide + verify-pinset source).
+	res, err := store.Query(ctx, query.Query{Prefix: pinPrefix.String()})
 	if err != nil {
 		return nil, err
 	}
-	// New format: {cid: kind}. Legacy format: [cid,...] (all KindRoot). Try the map first; an
-	// array fails to unmarshal into a map, so the fallback discriminates cleanly.
+	defer res.Close()
+	for r := range res.Next() {
+		if r.Error != nil {
+			return nil, r.Error
+		}
+		c, err := cid.Decode(ds.NewKey(r.Key).BaseNamespace())
+		if err != nil {
+			continue // stray/undecodable key — skip
+		}
+		k := KindRoot
+		if len(r.Value) == 1 {
+			k = PinKind(r.Value[0])
+		}
+		p.roots[c] = k
+	}
+	return p, nil
+}
+
+// parseLegacyPins decodes the old single-blob pinset: new format {cid: kind} or the
+// original [cid,...] array (all KindRoot). Try the map first; an array fails to
+// unmarshal into a map, so the fallback discriminates cleanly.
+func parseLegacyPins(data []byte) map[cid.Cid]PinKind {
+	out := map[cid.Cid]PinKind{}
 	var kinds map[string]PinKind
 	if json.Unmarshal(data, &kinds) == nil {
 		for s, k := range kinds {
 			if c, err := cid.Decode(s); err == nil {
-				p.roots[c] = k
+				out[c] = k
 			}
 		}
-		return p, nil
+		return out
 	}
 	var saved []string
 	if json.Unmarshal(data, &saved) == nil {
 		for _, s := range saved {
 			if c, err := cid.Decode(s); err == nil {
-				p.roots[c] = KindRoot
+				out[c] = KindRoot
 			}
 		}
 	}
-	return p, nil
-}
-
-func (p *Pinset) persist(ctx context.Context) error {
-	p.mu.RLock()
-	out := make(map[string]PinKind, len(p.roots))
-	for c, k := range p.roots {
-		out[c.String()] = k
-	}
-	p.mu.RUnlock()
-	data, err := json.Marshal(out)
-	if err != nil {
-		return err
-	}
-	return p.ds.Put(ctx, pinKey, data)
+	return out
 }
 
 // Add pins a CID as a durability root (idempotent) and persists.
@@ -102,7 +140,7 @@ func (p *Pinset) add(ctx context.Context, c cid.Cid, k PinKind) error {
 	p.mu.Lock()
 	p.roots[c] = k
 	p.mu.Unlock()
-	return p.persist(ctx)
+	return p.ds.Put(ctx, itemKey(c), []byte{byte(k)})
 }
 
 // CountByKind returns how many CIDs are held per kind (for node/status metrics).
@@ -122,7 +160,7 @@ func (p *Pinset) Remove(ctx context.Context, c cid.Cid) error {
 	p.mu.Lock()
 	delete(p.roots, c)
 	p.mu.Unlock()
-	return p.persist(ctx)
+	return p.ds.Delete(ctx, itemKey(c))
 }
 
 // Has reports whether c is pinned.
