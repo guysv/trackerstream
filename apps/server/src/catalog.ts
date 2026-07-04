@@ -19,6 +19,7 @@ export interface ModuleRow {
   sizeBytes: number;
   instruments: string; // instrument + sample names, space-joined
   comment: string;
+  md5: string; // lowercase-hex md5 of the raw module file (TMA/ModArchive join key)
 }
 
 export class Catalog {
@@ -57,6 +58,7 @@ export class Catalog {
         size_bytes INTEGER,
         instruments TEXT,
         comment TEXT,
+        md5 TEXT,
         ingested_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_modules_format ON modules(format);
@@ -82,12 +84,25 @@ export class Catalog {
       -- are O(1) lookups, not full-table scans, when queried over the Bitswap VFS.
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
+    // Migration for catalogs created before the md5 column existed: CREATE TABLE
+    // IF NOT EXISTS never alters an existing table, so add the column explicitly.
+    // No-op on a fresh DB (the CREATE above already carries md5). Populate old rows
+    // with a BACKFILL_MD5 ingest pass. The md5 index is created after, since it
+    // references a column that may only just now exist.
+    const cols = this.db.prepare("PRAGMA table_info(modules)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "md5")) {
+      this.db.exec("ALTER TABLE modules ADD COLUMN md5 TEXT");
+    }
+    // Index the join key: md5 lookups (e.g. genre enrichment) hit the index, not a
+    // full scan — critical when the DB is queried page-by-page over the Bitswap VFS.
+    // Not UNIQUE: the corpus can hold the same file under multiple sources.
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_modules_md5 ON modules(md5);");
     this.insertStmt = this.db.prepare(`
       INSERT INTO modules
         (source, filename, format, title, duration, channels, num_samples,
          num_instruments, num_subsongs, root_cid, num_blocks, size_bytes,
-         instruments, comment, ingested_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         instruments, comment, md5, ingested_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(source) DO NOTHING
     `);
     this.hasSourceStmt = this.db.prepare("SELECT 1 FROM modules WHERE source = ? LIMIT 1");
@@ -102,7 +117,7 @@ export class Catalog {
     const res = this.insertStmt.run(
       m.source, m.filename, m.format, m.title, m.duration, m.channels,
       m.numSamples, m.numInstruments, m.numSubsongs, m.rootCid, m.numBlocks,
-      m.sizeBytes, m.instruments, m.comment, now,
+      m.sizeBytes, m.instruments, m.comment, m.md5, now,
     );
     if (res.changes > 0) {
       const id = res.lastInsertRowid as number;
@@ -128,6 +143,25 @@ export class Catalog {
       .prepare("UPDATE modules SET root_cid = ?, num_blocks = ? WHERE id = ?")
       .run(rootCid, numBlocks, row.id);
     return row.id;
+  }
+
+  /** A cataloged source that still has no md5 (a BACKFILL_MD5 target). Lets the
+   *  backfill pass skip hashing bytes for rows already filled — cheap, indexed. */
+  md5Missing(source: string): boolean {
+    return (
+      this.db
+        .prepare("SELECT 1 FROM modules WHERE source = ? AND md5 IS NULL LIMIT 1")
+        .get(source) !== undefined
+    );
+  }
+
+  /** Backfill the md5 for one source. Guarded by `md5 IS NULL` so it's idempotent
+   *  and never overwrites an existing hash. Returns whether a row was updated. */
+  setMd5(source: string, md5: string): boolean {
+    const res = this.db
+      .prepare("UPDATE modules SET md5 = ? WHERE source = ? AND md5 IS NULL")
+      .run(md5, source);
+    return res.changes > 0;
   }
 
   // Catalog search/browse/detail are no longer served here (R1): the published DB is

@@ -4,6 +4,8 @@
 //   LIMIT=500 FORMATS=mod,it,s3m,xm  ... (for a quick slice)
 //   REBUILD=1 ... (re-bake cataloged modules whose DAG root changed, e.g. to add
 //                  seek tables; repoints the catalog + re-pins, unpins old roots)
+//   BACKFILL_MD5=1 ... (fill the md5 column for already-cataloged rows: unzip+md5
+//                  only, no re-bake; re-publishes the catalog at the end)
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { runIngest } from "../src/ingest.ts";
@@ -14,11 +16,12 @@ const kuboApi = process.env.KUBO_API ?? "http://127.0.0.1:5001";
 const limit = +(process.env.LIMIT ?? 0);
 const formats = process.env.FORMATS?.split(",");
 const rebuild = /^(1|true|yes)$/i.test(process.env.REBUILD ?? "");
+const backfillMd5 = /^(1|true|yes)$/i.test(process.env.BACKFILL_MD5 ?? "");
 // Publish the catalog to IPNS at the end (R1). On by default; PUBLISH=0 for dev slices.
 const publish = !/^(0|false|no)$/i.test(process.env.PUBLISH ?? "");
 
 console.log(
-  `ingest: corpus=${root} db=${dbPath} kubo=${kuboApi} limit=${limit || "∞"}${rebuild ? " REBUILD" : ""}${publish ? "" : " NO-PUBLISH"}`,
+  `ingest: corpus=${root} db=${dbPath} kubo=${kuboApi} limit=${limit || "∞"}${rebuild ? " REBUILD" : ""}${backfillMd5 ? " BACKFILL_MD5" : ""}${publish ? "" : " NO-PUBLISH"}`,
 );
 const stats = await runIngest({
   root,
@@ -27,6 +30,7 @@ const stats = await runIngest({
   limit,
   formats,
   rebuild,
+  backfillMd5,
   publish,
   onProgress: (s) =>
     console.log(
