@@ -371,6 +371,15 @@ func (n *Node) PutBlock(ctx context.Context, b blocks.Block) error {
 	return n.bserv.AddBlock(ctx, b)
 }
 
+// PutBlocks stores many blocks in ONE leveldb batch — the blockservice routes to
+// blockstore.PutMany, which commits via a single datastore.Batch (one fsync for the
+// whole slice) instead of one fsync per block. On the sync-per-write leveldb (and
+// especially a high-latency network volume) this is the difference between the bulk
+// ingest floor and ~batch-size× that. Callers batch a whole module's DAG per call.
+func (n *Node) PutBlocks(ctx context.Context, blks []blocks.Block) error {
+	return n.bserv.AddBlocks(ctx, blks)
+}
+
 // GetBlock fetches a block: local blockstore, else Bitswap from connected peers / providers.
 func (n *Node) GetBlock(ctx context.Context, c cid.Cid) (blocks.Block, error) {
 	return n.bserv.GetBlock(ctx, c)

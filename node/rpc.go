@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +35,7 @@ func NewRPCServer(n *Node) *RPCServer {
 	s.mux.HandleFunc("/api/v0/id", s.handleID)
 	s.mux.HandleFunc("/api/v0/version", s.handleVersion)
 	s.mux.HandleFunc("/api/v0/block/put", s.handleBlockPut)
+	s.mux.HandleFunc("/api/v0/block/put-many", s.handleBlockPutMany)
 	s.mux.HandleFunc("/api/v0/block/get", s.handleBlockGet)
 	s.mux.HandleFunc("/api/v0/cat", s.handleCat)
 	s.mux.HandleFunc("/api/v0/add", s.handleAdd)
@@ -152,6 +154,54 @@ func (s *RPCServer) handleBlockPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]any{"Key": c.String(), "Size": len(data)})
+}
+
+// handleBlockPutMany is the batched bulk-ingest primitive: store a whole DAG's worth of
+// blocks in ONE leveldb batch (one fsync) instead of one block/put (one fsync) each. The
+// body is a raw framed stream of [uint32-BE codec][uint32-BE len][payload] entries; we
+// recompute each CID (sha2-256) exactly as handleBlockPut does, so CIDs stay self-verifying.
+// Returns {Keys:[...], Count}. Repack's loadDagToKubo posts one module's blocks per call.
+func (s *RPCServer) handleBlockPutMany(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		rpcErr(w, http.StatusBadRequest, err)
+		return
+	}
+	blks := make([]blocks.Block, 0, 64)
+	keys := make([]string, 0, 64)
+	for off := 0; off < len(body); {
+		if off+8 > len(body) {
+			rpcErr(w, http.StatusBadRequest, fmt.Errorf("block/put-many: truncated frame header at %d", off))
+			return
+		}
+		codec := uint64(binary.BigEndian.Uint32(body[off:]))
+		n := int(binary.BigEndian.Uint32(body[off+4:]))
+		off += 8
+		if off+n > len(body) {
+			rpcErr(w, http.StatusBadRequest, fmt.Errorf("block/put-many: frame len %d overruns body", n))
+			return
+		}
+		data := body[off : off+n]
+		off += n
+		hash, err := mh.Sum(data, mh.SHA2_256, -1)
+		if err != nil {
+			rpcErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		c := cid.NewCidV1(codec, hash)
+		blk, err := blocks.NewBlockWithCid(data, c)
+		if err != nil {
+			rpcErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		blks = append(blks, blk)
+		keys = append(keys, c.String())
+	}
+	if err := s.node.PutBlocks(r.Context(), blks); err != nil {
+		rpcErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, map[string]any{"Keys": keys, "Count": len(keys)})
 }
 
 func (s *RPCServer) handleBlockGet(w http.ResponseWriter, r *http.Request) {
