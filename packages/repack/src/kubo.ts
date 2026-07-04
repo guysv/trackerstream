@@ -42,6 +42,26 @@ export class KuboRpc {
     return CID.parse(Key);
   }
 
+  /** Batched block put — one HTTP round-trip AND one leveldb fsync (server-side
+   *  PutMany) for the whole slice, vs one of each per block. Body is a raw framed
+   *  stream of [uint32-BE codec][uint32-BE len][bytes] entries. Returns CIDs in order. */
+  async blockPutMany(entries: { bytes: Uint8Array; codec: number }[]): Promise<CID[]> {
+    let total = 0;
+    for (const e of entries) total += 8 + e.bytes.length;
+    const buf = new Uint8Array(total);
+    const dv = new DataView(buf.buffer);
+    let off = 0;
+    for (const e of entries) {
+      dv.setUint32(off, e.codec);
+      dv.setUint32(off + 4, e.bytes.length);
+      buf.set(e.bytes, off + 8);
+      off += 8 + e.bytes.length;
+    }
+    const res = await this.post("block/put-many", buf as BodyInit);
+    const { Keys } = (await res.json()) as { Keys: string[] };
+    return Keys.map((k) => CID.parse(k));
+  }
+
   async blockGet(cid: CID): Promise<Uint8Array> {
     const res = await this.post(`block/get?arg=${cid.toString()}`);
     return new Uint8Array(await res.arrayBuffer());
@@ -154,25 +174,18 @@ export class KuboRpc {
   }
 }
 
-/** Run `fn` over `items` with a bounded concurrency pool (order-independent). */
-async function mapPool<T>(items: T[], concurrency: number, fn: (t: T) => Promise<void>): Promise<void> {
-  let i = 0;
-  const worker = async () => {
-    while (i < items.length) await fn(items[i++]);
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
-}
-
 /**
- * Put every block of a built DAG into kubo and recursively pin the root.
+ * Put every block of a built DAG into the node and recursively pin the root.
  *
- * Block puts run CONCURRENTLY (bounded pool) — the previous serial loop was a
- * major ingest bottleneck (MVP-FOLLOWUP A2): a big module is hundreds of leaf
- * blocks, each a separate kubo RPC round-trip. `pin=false` on each put then a
- * single recursive pin of the root keeps the DAG self-verifying. (The other half
- * of the A2 fix is ops: Provide.Strategy=roots on the master so a per-block DHT
- * provide doesn't dominate — clients Bitswap-fetch all blocks from the always-on
- * master they bootstrap to, so only roots need provider records.)
+ * All of a module's blocks go up in ONE batched `block/put-many` request, which
+ * the node commits in a single leveldb batch — one HTTP round-trip and one fsync
+ * for the whole DAG, versus one of each per block. A big module is hundreds of
+ * leaf blocks; the per-block path made each a separate RPC + fsync, the dominant
+ * bulk-ingest floor (worst on the master's high-latency network volume). We still
+ * `pin=false` on the puts then a single recursive pin of the root, keeping the DAG
+ * self-verifying. (Ops half of the win: Provide.Strategy=roots on the master so a
+ * per-block DHT provide doesn't dominate — clients Bitswap-fetch all blocks from
+ * the always-on master they bootstrap to, so only roots need provider records.)
  */
 export async function loadDagToKubo(
   rpc: KuboRpc,
@@ -181,10 +194,18 @@ export async function loadDagToKubo(
   concurrency = 16,
 ): Promise<{ put: number; mismatched: string[] }> {
   const mismatched: string[] = [];
-  await mapPool(blocks, concurrency, async (b) => {
-    const got = await rpc.blockPut(b.bytes, b.cid.code);
-    if (got.toString() !== b.cid.toString()) mismatched.push(`${b.cid} != ${got}`);
-  });
+  // One batched put per (sub-)DAG: a single HTTP round-trip and a single leveldb
+  // fsync for the whole slice. Cap the sub-batch so a pathological DAG (max ~424
+  // blocks observed) can't build an unbounded body; `concurrency` reused as the cap.
+  const cap = Math.max(1, concurrency * 64);
+  for (let i = 0; i < blocks.length; i += cap) {
+    const slice = blocks.slice(i, i + cap);
+    const got = await rpc.blockPutMany(slice.map((b) => ({ bytes: b.bytes, codec: b.cid.code })));
+    for (let j = 0; j < slice.length; j++) {
+      if (got[j]?.toString() !== slice[j].cid.toString())
+        mismatched.push(`${slice[j].cid} != ${got[j]}`);
+    }
+  }
   await rpc.pinAdd(root, true);
   return { put: blocks.length, mismatched };
 }
