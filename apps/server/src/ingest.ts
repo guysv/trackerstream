@@ -2,7 +2,7 @@
 // formats the parsers don't cover) -> block-put + recursive pin on the master
 // kubo node (shared chunks stored once) -> libopenmpt metadata -> SQLite/FTS5
 // catalog row carrying the root CID. Incremental + re-runnable (skips by source).
-import { copyFileSync, unlinkSync } from "node:fs";
+import { unlinkSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { buildDagV2, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
 import { CATALOG_IPNS_KEY } from "@trackerstream/config";
@@ -200,13 +200,21 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
  *  hop. Snapshots the DB to a sibling file first — never adds the live path. */
 async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
   const snapshot = `${opts.dbPath}.snapshot`;
-  copyFileSync(opts.dbPath, snapshot);
-  // Convert the snapshot to a rollback-journal (DELETE) DB so a client can open it
-  // READ-ONLY over the Bitswap VFS without a sidecar -wal file (a WAL-format header
-  // makes SQLite demand the -wal, which the single published file doesn't carry).
-  const snapDb = new DatabaseSync(snapshot);
-  snapDb.exec("PRAGMA journal_mode = DELETE;");
-  snapDb.close();
+  // Atomic, race-free snapshot: VACUUM INTO reads the live DB in a single read
+  // transaction (consistent even if another writer is mid-checkpoint) and writes a fresh
+  // file in the default rollback-journal (DELETE) mode — so a client can open it READ-ONLY
+  // over the Bitswap VFS without a sidecar -wal file (a WAL header would make SQLite demand
+  // the -wal the single published file doesn't carry). Replaces a plain copyFileSync (which
+  // could capture a torn page mid-checkpoint) plus a separate WAL->DELETE conversion.
+  // VACUUM INTO requires the target not to pre-exist.
+  try {
+    unlinkSync(snapshot);
+  } catch {
+    /* no stale snapshot -> fine */
+  }
+  const src = new DatabaseSync(opts.dbPath);
+  src.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
+  src.close();
   try {
     const cid = await rpc.addFile(snapshot, {
       chunker: CATALOG_CHUNKER,
@@ -216,12 +224,17 @@ async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
     });
     const peerId = await rpc.keyGen(CATALOG_KEY_NAME); // idempotent; base58 PeerId
     await rpc.namePublish(cid, { key: CATALOG_KEY_NAME, lifetime: CATALOG_LIFETIME });
-    // Verify the publish landed on the node's own resolve path (DHT + gossipsub). The node
-    // signed/stored/distributed the record in namePublish above; there is no separate HTTP
-    // cache to feed anymore (the API server is retired).
-    const record = await rpc.routingGet(peerId);
-    if (!record) throw new Error(`publish verify: routingGet(${peerId}) returned no record`);
+    // namePublish already signed + stored + distributed the record (DHT PutValue +
+    // gossipsub, allow-offline) — the publish is done HERE. The routingGet below is only a
+    // read-back verify, so a transient RPC flake there must NOT be reported as a publish
+    // failure (it previously threw `fetch failed` after the record had already landed).
     console.log(`catalog published: cid=${cid} ipns=${peerId}`);
+    try {
+      const record = await rpc.routingGet(peerId);
+      if (!record) console.error(`  !! publish verify: routingGet(${peerId}) returned no record (may still be propagating)`);
+    } catch (e) {
+      console.error(`  publish verify skipped (transient, record already signed+stored): ${e}`);
+    }
     if (!CATALOG_IPNS_KEY) {
       console.log(`  -> set CATALOG_IPNS_KEY="${peerId}" in packages/config and ship a client build`);
     } else if (CATALOG_IPNS_KEY !== peerId) {
