@@ -28,6 +28,12 @@ export class Catalog {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
+    // Wait (don't error) for a lock — lets multiple sharded ingest workers open and
+    // write the catalog concurrently (WAL: one writer at a time). MUST be first: even
+    // `journal_mode = WAL` takes a brief exclusive lock, so without this a second
+    // worker starting at the same time dies with "database is locked". Harmless for
+    // the single-writer path.
+    this.db.exec("PRAGMA busy_timeout = 60000;");
     // page_size must be set before any table/WAL exists; it's a silent no-op on an
     // already-created DB (apply via a one-time REBUILD ingest into a fresh file).
     // 16 KB = the IPFS page-aligned chunk unit the catalog is published under, so
