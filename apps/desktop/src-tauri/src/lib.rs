@@ -805,7 +805,7 @@ pub fn run() {
                 playlists::Playlists::open(dir.as_deref(), rpc.clone())
                     .map_err(|e| format!("playlists store: {e}"))?,
             );
-            tauri::async_runtime::spawn(playlists::run_loops(pl.clone()));
+            tauri::async_runtime::spawn(playlists::run_loops(pl.clone(), app.handle().clone()));
 
             app.manage(NodeState { rpc, peer_id });
             app.manage(sc); // keep the child alive for the app's lifetime

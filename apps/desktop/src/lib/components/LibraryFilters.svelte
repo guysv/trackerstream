@@ -16,62 +16,48 @@
   const sorts: Array<"latest" | "random" | "title"> = ["latest", "random", "title"];
 </script>
 
-<nav class="sidebar">
-  <div class="brand">tracker<span>stream</span></div>
-
-  <div class="group">browse</div>
-  <button class="nav" class:active={format === null} onclick={() => (format = null)}>
-    <span>all</span><span class="count">{total}</span>
-  </button>
-  {#each formats as f}
-    <button class="nav" class:active={format === f.format} onclick={() => (format = f.format)}>
-      <span class="fmt-{f.format}">{f.format}</span><span class="count">{f.count}</span>
+<!-- Browse-view filter strip: the format/sort controls that used to be the left rail,
+     relocated to a header now that the left column is navigation + library. -->
+<div class="filters">
+  <div class="formats">
+    <button class="nav" class:active={format === null} onclick={() => (format = null)}>
+      all <span class="count">{total}</span>
     </button>
-  {/each}
-
-  <div class="group">sort</div>
+    {#each formats as f}
+      <button class="nav" class:active={format === f.format} onclick={() => (format = f.format)}>
+        <span class="fmt-{f.format}">{f.format}</span> <span class="count">{f.count}</span>
+      </button>
+    {/each}
+  </div>
   <div class="sorts">
     {#each sorts as s}
       <button class="chip" class:active={sort === s} onclick={() => (sort = s)}>{s}</button>
     {/each}
   </div>
-</nav>
+</div>
 
 <style>
-  .sidebar {
-    width: 180px;
-    background: var(--panel);
-    border-right: 1px solid var(--border);
-    padding: 0.8rem 0.6rem;
-    min-height: 0;
-    overflow-y: auto;
+  .filters {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.5rem 0.8rem;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
   }
-  .brand {
-    color: var(--accent);
-    font-size: 15px;
-    letter-spacing: 0.04em;
-    padding: 0 0.3rem 0.8rem;
-  }
-  .brand span {
-    color: var(--fg);
-  }
-  .group {
-    color: var(--dim);
-    text-transform: uppercase;
-    font-size: 10px;
-    letter-spacing: 0.08em;
-    margin: 0.8rem 0.3rem 0.3rem;
+  .formats {
+    display: flex;
+    gap: 0.3rem;
+    flex-wrap: wrap;
   }
   .nav {
-    display: flex;
-    justify-content: space-between;
-    width: 100%;
     background: none;
-    border: none;
+    border: 1px solid transparent;
     border-radius: 4px;
-    padding: 0.3rem 0.4rem;
+    padding: 0.2rem 0.5rem;
     text-transform: uppercase;
     font-size: 12px;
+    white-space: nowrap;
   }
   .nav:hover {
     background: var(--row-hover);
@@ -84,9 +70,8 @@
   }
   .sorts {
     display: flex;
-    flex-wrap: wrap;
     gap: 0.3rem;
-    padding: 0 0.3rem;
+    margin-left: auto;
   }
   .chip {
     background: var(--bg);

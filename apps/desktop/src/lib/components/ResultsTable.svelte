@@ -1,23 +1,42 @@
 <script lang="ts">
   import type { ModuleHit } from "$lib/catalog";
+  import type { Snippet } from "svelte";
   import { fmtTime } from "$lib/format";
+  import { openContextMenu } from "$lib/contextmenu.svelte";
+  import { trackMenuItems } from "$lib/menus";
 
   let {
     rows,
     selectedId = $bindable(null),
+    scrollTop = $bindable(0),
     onplay,
     onselect,
+    footer,
   }: {
     rows: ModuleHit[];
     selectedId?: number | null;
+    /** Scroll offset — bindable so a route can snapshot/restore it across navigation. */
+    scrollTop?: number;
     onplay: (h: ModuleHit) => void;
     onselect?: () => void;
+    /** Optional content rendered inside the scroll area, below the last row — used by
+     * search to flow the "discover playlists" section under the track results. */
+    footer?: Snippet;
   } = $props();
 
   const ROW_H = 24;
   let scrollEl: HTMLDivElement | undefined = $state();
-  let scrollTop = $state(0);
   let viewH = $state(400);
+
+  // Restore an incoming scroll offset once, when the list element first mounts (used by the
+  // browse route's snapshot on back/forward). Clamps naturally if rows haven't loaded yet.
+  let restored = false;
+  $effect(() => {
+    if (scrollEl && !restored) {
+      restored = true;
+      if (scrollTop > 0) scrollEl.scrollTop = scrollTop;
+    }
+  });
 
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - 6));
   const count = $derived(Math.ceil(viewH / ROW_H) + 12);
@@ -77,6 +96,7 @@
         tabindex="-1"
         onclick={() => { selectedId = row.id; onselect?.(); }}
         ondblclick={() => onplay(row)}
+        oncontextmenu={(e) => { selectedId = row.id; openContextMenu(e, () => trackMenuItems(row)); }}
       >
         <span class="c-title">{row.title || row.filename}</span>
         <span class="c-file">{row.filename}</span>
@@ -89,6 +109,7 @@
   {#if rows.length === 0}
     <div class="empty">no modules</div>
   {/if}
+  {#if footer}{@render footer()}{/if}
 </div>
 
 <style>
