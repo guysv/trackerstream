@@ -13,12 +13,17 @@
     type PlaylistSyncStatus,
   } from "$lib/playlists.svelte";
   import { fmtBytes } from "$lib/format";
+  import { openContextMenu } from "$lib/contextmenu.svelte";
+  import { playlistMenuItems } from "$lib/menus";
 
+  // Reused both as the nav-rail "Your Library" list and (potentially) elsewhere. Selection
+  // is driven by the caller (the open playlist's route param), so `selectedName` is a plain
+  // prop for highlighting; opening a row calls `onopen` (the caller navigates).
   let {
-    query,
-    selectedName = $bindable(null),
-    onselect,
-  }: { query: string; selectedName: string | null; onselect?: () => void } = $props();
+    query = "",
+    selectedName = null,
+    onopen,
+  }: { query?: string; selectedName?: string | null; onopen?: (name: string) => void } = $props();
 
   let rows = $state<PlaylistMeta[]>([]);
   let error = $state<string | null>(null);
@@ -56,7 +61,6 @@
               )
             : r;
         error = null;
-        if (!rows.some((p) => p.name === selectedName)) selectedName = rows[0]?.name ?? null;
       })
       .catch((e) => (error = String(e)));
   });
@@ -65,7 +69,7 @@
     try {
       const meta = await plCreate("new playlist", []);
       plBump();
-      selectedName = meta.name;
+      onopen?.(meta.name);
     } catch (e) {
       error = `create failed: ${e}`;
     }
@@ -75,11 +79,6 @@
     const d = await plGet(p.name);
     if (d) await playPlaylist(d).catch((e) => (error = String(e)));
   }
-
-  const fmtAge = (secs: number) => {
-    const d = Math.floor((Date.now() / 1000 - secs) / 86400);
-    return d <= 0 ? "today" : d === 1 ? "1 day" : `${d} days`;
-  };
 </script>
 
 <div class="plists">
@@ -96,8 +95,9 @@
       <div
         class="prow"
         class:sel={p.name === selectedName}
-        onclick={() => { selectedName = p.name; onselect?.(); }}
+        onclick={() => onopen?.(p.name)}
         ondblclick={() => play(p)}
+        oncontextmenu={(e) => openContextMenu(e, () => playlistMenuItems(p))}
         role="button"
         tabindex="-1"
       >
@@ -105,17 +105,6 @@
           {#if p.liked}<span class="lheart" title="your Liked Tracks">♥</span> {/if}{p.title ||
             "(untitled)"}
         </span>
-        <span class="badges">
-          {#if p.isMine}<span class="badge mine">mine</span>{/if}
-          {#if p.held}<span class="badge held">held</span>{/if}
-          {#if p.dormant}<span class="badge dormant" title="record expired — author absent; fork to keep it shareable">dormant</span>{/if}
-          {#if p.published}<span class="badge pub">shared</span>{/if}
-          {#if (backers[p.name] ?? 0) > 1}
-            <span class="badge backers" title="distinct holders heard on the network (24h)">~{backers[p.name]}</span>
-          {/if}
-        </span>
-        <span class="count">{p.tracks} trk</span>
-        <span class="age">{fmtAge(p.lastUpdateAt)}</span>
       </div>
     {/each}
     {#if error}
@@ -161,9 +150,7 @@
     overflow-y: auto;
   }
   .prow {
-    display: grid;
-    grid-template-columns: 1fr auto auto auto;
-    gap: 0.8rem;
+    display: flex;
     align-items: center;
     padding: 0.3rem 0.8rem;
     height: 28px;
@@ -187,29 +174,6 @@
     color: var(--hot);
     margin-right: 0.35rem;
   }
-  .badges {
-    display: flex;
-    gap: 0.3rem;
-  }
-  .badge {
-    font-size: 10px;
-    border: 1px solid var(--border-hi);
-    border-radius: 3px;
-    padding: 0 0.3rem;
-    color: var(--dim);
-  }
-  .badge.mine {
-    color: var(--amber);
-    border-color: var(--amber);
-  }
-  .badge.held {
-    color: var(--violet);
-    border-color: var(--violet);
-  }
-  .badge.dormant {
-    color: var(--hot);
-    border-color: var(--hot);
-  }
   .tabs {
     display: flex;
     align-items: center;
@@ -227,19 +191,6 @@
   .count {
     color: var(--dim);
     text-transform: none;
-  }
-  .badge.pub {
-    color: var(--cyan);
-    border-color: var(--cyan);
-  }
-  .badge.backers {
-    color: var(--green, #7dcfa0);
-    border-color: var(--green, #7dcfa0);
-  }
-  .count,
-  .age {
-    color: var(--dim);
-    font-size: 11px;
   }
   .empty {
     padding: 2rem;

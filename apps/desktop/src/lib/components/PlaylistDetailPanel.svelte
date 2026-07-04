@@ -17,6 +17,7 @@
     refreshLiked,
     type PlaylistDetail,
   } from "$lib/playlists.svelte";
+  import { ui } from "$lib/ui.svelte";
 
   let { name }: { name: string | null } = $props();
 
@@ -68,6 +69,11 @@
 
   // Hold-beacon holder count (24h window; 0 = none heard yet — beacons are hourly).
   let backerCount = $state(0);
+
+  const fmtAge = (secs: number) => {
+    const d = Math.floor((Date.now() / 1000 - secs) / 86400);
+    return d <= 0 ? "today" : d === 1 ? "1 day" : `${d} days`;
+  };
 
   async function copyLink() {
     if (!detail) return;
@@ -219,13 +225,13 @@
       <div class="title">{detail.title || "(untitled)"}</div>
     {/if}
     <div class="sub">
-      {detail.items.length} tracks
-      {#if detail.isMine}· mine{/if}
-      {#if detail.held}· <span class="heldtxt">in library</span>{/if}
-      {#if detail.dormant}· <span class="dormant">dormant</span>{/if}
-      {#if detail.published}· <span class="pub">shared</span>{/if}
+      <span class="metatxt">{detail.items.length} tracks · {fmtAge(detail.lastUpdateAt)}</span>
+      {#if detail.isMine && !detail.liked}<span class="badge mine">mine</span>{/if}
+      {#if detail.held}<span class="badge held">held</span>{/if}
+      {#if detail.dormant}<span class="badge dormant" title="record expired — author absent; fork to keep it shareable">dormant</span>{/if}
+      {#if detail.published}<span class="badge pub">shared</span>{/if}
       {#if backerCount > 1}
-        · <span title="distinct holders heard on the network (24h)">backed by ~{backerCount} holders</span>
+        <span class="badge backers" title="distinct holders heard on the network (24h)">~{backerCount}</span>
       {/if}
     </div>
 
@@ -331,11 +337,18 @@
 
     <div class="tlist">
       {#each detail.items as t, i (t.id + "-" + i)}
-        <div class="trow" ondblclick={() => detail && playPlaylist(detail, i)} role="button" tabindex="-1">
+        <div
+          class="trow"
+          class:sel={ui.inspectorTrackId === t.id}
+          onclick={() => { ui.inspectorTrackId = t.id; ui.right = "detail"; }}
+          ondblclick={() => detail && playPlaylist(detail, i)}
+          role="button"
+          tabindex="-1"
+        >
           <span class="num">{i + 1}</span>
           <span class="tname" title={t.modName}>{t.title || t.modName}</span>
           {#if detail.isMine}
-            <button class="rm" onclick={() => removeTrack(i)} title="remove">✕</button>
+            <button class="rm" onclick={(e) => { e.stopPropagation(); removeTrack(i); }} title="remove">✕</button>
           {/if}
         </div>
       {/each}
@@ -390,18 +403,43 @@
     outline: none;
   }
   .sub {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
     color: var(--dim);
     margin-bottom: 0.7rem;
     font-size: 11px;
   }
-  .pub {
-    color: var(--cyan);
+  .metatxt {
+    color: var(--dim);
   }
-  .heldtxt {
+  .badge {
+    font-size: 10px;
+    border: 1px solid var(--border-hi);
+    border-radius: 3px;
+    padding: 0 0.3rem;
+    color: var(--dim);
+  }
+  .badge.mine {
+    color: var(--amber);
+    border-color: var(--amber);
+  }
+  .badge.held {
     color: var(--violet);
+    border-color: var(--violet);
   }
-  .dormant {
+  .badge.dormant {
     color: var(--hot);
+    border-color: var(--hot);
+  }
+  .badge.pub {
+    color: var(--cyan);
+    border-color: var(--cyan);
+  }
+  .badge.backers {
+    color: var(--green, #7dcfa0);
+    border-color: var(--green, #7dcfa0);
   }
   .dnote {
     border: 1px solid var(--hot);
@@ -461,6 +499,9 @@
   }
   .trow:hover {
     background: var(--row-hover);
+  }
+  .trow.sel {
+    background: var(--row-sel);
   }
   .num {
     color: var(--dim);

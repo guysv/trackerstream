@@ -3,6 +3,7 @@
 // playlists.db; this layer is stateless except for a bump counter that tells views to
 // refresh after a mutation.
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getModule, type ModuleHit } from "$lib/catalog";
 import { playList, queue, setOnQueueSourceChange } from "$lib/player.svelte";
 
@@ -137,16 +138,26 @@ export async function toggleLike(h: ModuleHit): Promise<void> {
 }
 
 // The Rust sync loop writes into playlists.db behind the UI's back (20s poll of the
-// sidecar), so bump the counter on a timer too — otherwise a playlist synced from the
-// network stays invisible until some local mutation happens to refresh the views.
-// Queries only actually run while playlist components are mounted, and they're local
-// SQLite reads. (window guard: this module also loads during SSR prerender.)
+// sidecar). It now emits a coalesced `playlists:changed` whenever a tick actually changed
+// the store (synced/updated/tombstoned playlist, budget eviction, or seen-tier decay), so
+// the UI reconciles the instant the network moves — no longer up to 10s stale. Local
+// mutations keep bumping plState directly (optimistic + instant); this is the SAME channel
+// for network events. (window guard: this module also loads during SSR prerender.)
 if (typeof window !== "undefined") {
   void refreshLiked();
+  listen("playlists:changed", () => {
+    plBump();
+    void refreshLiked();
+  }).catch(() => {
+    /* off-Tauri (SSR/browser preview): no event bus — the safety-net timer below covers it */
+  });
+  // Backstop only (was the 10s primary signal): a slow reconcile in case an emit is ever
+  // missed. Queries run only while playlist components are mounted, and they're local
+  // SQLite reads, so a 60s catch-all is cheap.
   setInterval(() => {
     plBump();
     void refreshLiked(); // catches unlikes done from the playlist detail (splice + update)
-  }, 10_000);
+  }, 60_000);
 }
 
 // Play-time pin: while the queue is sourced from a playlist, Rust protects that row

@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { getModule, type ModuleDetail, type ModuleHit } from "$lib/catalog";
+  import { getModule, type ModuleDetail } from "$lib/catalog";
   import { fmtTime, fmtBytes } from "$lib/format";
-  import { enqueue } from "$lib/player.svelte";
+  import { enqueue, playList } from "$lib/player.svelte";
   import {
     plList,
     plCreate,
@@ -12,8 +12,10 @@
     isLiked,
     type PlaylistMeta,
   } from "$lib/playlists.svelte";
+  import { openContextMenu } from "$lib/contextmenu.svelte";
+  import { trackMenuItems } from "$lib/menus";
 
-  let { id, onplay }: { id: number | null; onplay: (h: ModuleHit) => void } = $props();
+  let { id }: { id: number | null } = $props();
 
   let detail = $state<ModuleDetail | null>(null);
   let plMenu = $state(false);
@@ -57,10 +59,13 @@
   {#if !detail}
     <div class="placeholder">select a module</div>
   {:else}
-    <div class="title">{detail.title || detail.filename}</div>
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="title" oncontextmenu={(e) => detail && openContextMenu(e, () => trackMenuItems(detail!))}>
+      {detail.title || detail.filename}
+    </div>
     <div class="file">{detail.filename}</div>
     <div class="actions">
-      <button class="play" onclick={() => onplay(detail!)}>▶ play</button>
+      <button class="play" onclick={() => detail && playList([detail], 0)}>▶ play</button>
       <button
         class="like"
         class:on={isLiked(detail.id)}

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+use tauri::Emitter;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -328,9 +329,10 @@ impl Playlists {
 
     /// Evict least-recently-updated FOREIGN playlists until under the byte budget.
     /// Own playlists are never evicted; neither is the pinned (currently playing) one.
-    pub fn enforce_budget(&self) {
+    pub fn enforce_budget(&self) -> bool {
         let pinned = self.pinned_name();
         let db = self.db.lock().unwrap();
+        let mut evicted = false;
         loop {
             let used: i64 = db
                 .query_row(
@@ -340,7 +342,7 @@ impl Playlists {
                 )
                 .unwrap_or(0);
             if used <= self.budget {
-                return;
+                return evicted;
             }
             let victim: Option<String> = db
                 .query_row(
@@ -351,9 +353,10 @@ impl Playlists {
                 )
                 .optional()
                 .unwrap_or(None);
-            let Some(name) = victim else { return };
+            let Some(name) = victim else { return evicted };
             let _ = db.execute("DELETE FROM playlists WHERE name=?1", params![name]);
             let _ = db.execute("DELETE FROM playlists_fts WHERE name=?1", params![name]);
+            evicted = true;
         }
     }
 
@@ -927,27 +930,31 @@ impl Playlists {
 
     /// One sync tick: drain the sidecar buffer from `cursor`, verify+store each entry,
     /// enforce the budget. Returns the next cursor.
-    pub async fn sync_once(&self, cursor: u64) -> u64 {
+    pub async fn sync_once(&self, cursor: u64) -> (u64, bool) {
         let (ver, recs) = match self.rpc.playlist_records(cursor).await {
             Ok(v) => v,
             Err(e) => {
                 log::debug!(target: "playlist", "records poll failed: {e}");
-                return cursor;
+                return (cursor, false);
             }
         };
+        let mut changed = false;
         for w in &recs {
             match self.ingest_wire(w) {
                 // The moment a shared playlist lands locally: `TS_LOG=info,playlist=debug`
                 // times a share end-to-end without the frontend/dial firehose.
-                Ok(true) => log::debug!(target: "playlist", "ingested {} seq {}", w.name, w.seq),
+                Ok(true) => {
+                    changed = true;
+                    log::debug!(target: "playlist", "ingested {} seq {}", w.name, w.seq);
+                }
                 Ok(false) => {} // not newer / already rejected — nothing to trace
                 Err(e) => log::debug!(target: "playlist", "ingest {} rejected: {e}", w.name),
             }
         }
         if !recs.is_empty() {
-            self.enforce_budget();
+            changed |= self.enforce_budget();
         }
-        ver
+        (ver, changed)
     }
 
     /// Decay (PLAYLISTS.md holder tier): purge SEEN-tier rows whose record has expired.
@@ -955,14 +962,15 @@ impl Playlists {
     /// playlist its record ages to EOL (≤168h) and every unbacked copy evaporates —
     /// network-wide decay within one record lifetime. Held and mine rows are exempt:
     /// the user chose to keep those, expired record or not.
-    pub fn decay_expired(&self) {
+    pub fn decay_expired(&self) -> bool {
         let pinned = self.pinned_name();
+        let mut removed = false;
         let seen: Vec<(String, Option<String>)> = {
             let db = self.db.lock().unwrap();
             let Ok(mut stmt) =
                 db.prepare("SELECT name, record_b64 FROM playlists WHERE is_mine=0 AND held=0")
             else {
-                return;
+                return removed;
             };
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -980,16 +988,18 @@ impl Playlists {
                 let db = self.db.lock().unwrap();
                 let _ = db.execute("DELETE FROM playlists WHERE name=?1", params![name]);
                 let _ = db.execute("DELETE FROM playlists_fts WHERE name=?1", params![name]);
+                removed = true;
             }
         }
+        removed
     }
 
     /// One announce tick: re-gossip the LIBRARY (mine + held — the node applies
     /// last-seen suppression, so this is cheap), dropping locally-expired records; own
     /// records within the renewal margin of EOL are re-signed at seq+1 first. Also runs
     /// the seen-tier decay pass, since both share the cycle cadence.
-    pub async fn announce_once(&self) {
-        self.decay_expired();
+    pub async fn announce_once(&self) -> bool {
+        let decayed = self.decay_expired();
         // Library-only: mine + held re-announce; the seen tier is relayed live by
         // gossipsub but NOT kept alive — unbacked playlists decay at record EOL.
         let held: Vec<(String, i64, String, String, bool)> = {
@@ -998,7 +1008,7 @@ impl Playlists {
                 "SELECT name, seq, record_b64, doc_json, is_mine FROM playlists
                  WHERE record_b64 IS NOT NULL AND (is_mine=1 OR held=1)",
             ) else {
-                return;
+                return decayed;
             };
             stmt.query_map([], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? != 0))
@@ -1028,11 +1038,12 @@ impl Playlists {
             });
         }
         if entries.is_empty() {
-            return;
+            return decayed;
         }
         if let Err(e) = self.rpc.playlist_announce(&entries).await {
             log::debug!(target: "playlist", "announce failed: {e}");
         }
+        decayed
     }
 }
 
@@ -1153,7 +1164,7 @@ fn row_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistMeta> {
 /// The background driver: a ~20s sync poll, and a jittered ~15-minute announce cycle
 /// (the suppression that makes this polite lives node-side; expired-own renewal lives
 /// in `announce_once`).
-pub async fn run_loops(pl: Arc<Playlists>) {
+pub async fn run_loops(pl: Arc<Playlists>, app: tauri::AppHandle) {
     // Every client always has a private "Liked Tracks" playlist (Spotify-style): create
     // it eagerly so it's in the library from first launch. Detached so a slow/absent
     // node's key_gen can't gate the sync loop; a failure is harmless — the first ♥
@@ -1171,14 +1182,23 @@ pub async fn run_loops(pl: Arc<Playlists>) {
     // First announce soon after startup (make our playlists discoverable), then ~15min.
     let mut next_announce: u64 = 2;
     loop {
-        cursor = pl.sync_once(cursor).await;
+        // Coalesced push: any tick that changed the local store (a synced/updated/
+        // tombstoned playlist, a budget eviction, or a seen-tier decay) emits a single
+        // `playlists:changed`. The frontend listens and re-queries — this is what makes
+        // network-driven changes reactive without the UI polling on a timer.
+        let (next_cursor, synced) = pl.sync_once(cursor).await;
+        cursor = next_cursor;
         pl.push_manifest().await; // no-op unless the disclosure set changed
         ticks += 1;
+        let mut decayed = false;
         if ticks >= next_announce {
-            pl.announce_once().await;
+            decayed = pl.announce_once().await;
             // 45 ticks ≈ 15min; ±20% jitter from the clock (no rand dependency).
             let jitter = (now_secs() as u64 % 19) as i64 - 9;
             next_announce = ticks + (45i64 + jitter).max(1) as u64;
+        }
+        if synced || decayed {
+            let _ = app.emit("playlists:changed", ());
         }
         tokio::time::sleep(Duration::from_secs(20)).await;
     }

@@ -2,6 +2,8 @@
   import { queue, playList, removeFromQueue, moveInQueue, clearQueue } from "$lib/player.svelte";
   import { saveQueueAsPlaylist } from "$lib/playlists.svelte";
   import { fmtTime } from "$lib/format";
+  import { openContextMenu } from "$lib/contextmenu.svelte";
+  import { trackMenuItems } from "$lib/menus";
 
   let saved = $state(false);
   async function saveAsPlaylist() {
@@ -25,7 +27,13 @@
 
   <div class="qlist">
     {#each queue.items as item, i (item.id + "-" + i)}
-      <div class="qrow" class:cur={i === queue.index}>
+      <div
+        class="qrow"
+        class:cur={i === queue.index}
+        oncontextmenu={(e) =>
+          openContextMenu(e, () => trackMenuItems(item, { inQueue: true, onRemove: () => removeFromQueue(i) }))}
+        role="presentation"
+      >
         <span class="num">{i + 1}</span>
         <span class="name" ondblclick={() => playList(queue.items, i)} role="button" tabindex="-1"
           >{item.title || item.filename}</span
