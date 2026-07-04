@@ -2,6 +2,7 @@
 // formats the parsers don't cover) -> block-put + recursive pin on the master
 // kubo node (shared chunks stored once) -> libopenmpt metadata -> SQLite/FTS5
 // catalog row carrying the root CID. Incremental + re-runnable (skips by source).
+import { createHash } from "node:crypto";
 import { unlinkSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { buildDagV2, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
@@ -30,6 +31,11 @@ export interface IngestOpts {
    *  catalog and unpin the superseded root. Without this, existing sources are
    *  skipped (the default incremental behavior). */
   rebuild?: boolean;
+  /** Backfill-only pass: for each corpus module already cataloged without an md5,
+   *  compute the md5 of the raw file and UPDATE the row (the TMA/ModArchive join
+   *  key). Skips DAG build / metadata / kubo entirely — I/O-bound, no re-bake. Used
+   *  once after the md5 column is added; then re-publishes the catalog. */
+  backfillMd5?: boolean;
   /** Publish the catalog DB to IPFS under the master-signed IPNS key at the end of
    *  ingest (R1). Default true; set false for dev slices. */
   publish?: boolean;
@@ -54,6 +60,8 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
   await initMeta();
   const rpc = new KuboRpc(opts.kuboApi);
   await rpc.id(); // fail fast if the master node is unreachable
+
+  if (opts.backfillMd5) return backfillMd5(cat, rpc, opts);
 
   const t0 = Date.now();
   let processed = 0,
@@ -164,6 +172,7 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
         sizeBytes: bytes.length,
         instruments: meta.instruments,
         comment: meta.comment,
+        md5: createHash("md5").update(bytes).digest("hex"),
       });
       processed++;
       if (isFlat) flat++;
@@ -189,6 +198,44 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
       // The module DAGs are already pinned; only the IPNS announce failed. Clients
       // keep resolving the previous record until the next rebake re-announces.
       console.error(`catalog publish failed (DAG pinned; IPNS not re-announced): ${e}`);
+    }
+  }
+  return stats;
+}
+
+/** One-shot md5 backfill (see IngestOpts.backfillMd5). Walks the corpus, hashes
+ *  each module file, and fills the md5 of its already-cataloged row. No DAG build,
+ *  no libopenmpt, no kubo block-put — just unzip + md5 — so it's I/O-bound and
+ *  orders of magnitude cheaper than a full re-bake. Re-runnable: rows already
+ *  carrying an md5 are skipped, so an interrupted pass resumes cleanly. */
+async function backfillMd5(cat: Catalog, rpc: KuboRpc, opts: IngestOpts): Promise<IngestStats> {
+  const t0 = Date.now();
+  let processed = 0,
+    skipped = 0;
+  await forEachModule(
+    opts.root,
+    async (m) => {
+      // Only hash sources that are cataloged *and* still missing an md5.
+      if (!cat.md5Missing(m.source)) {
+        skipped++;
+        return;
+      }
+      cat.setMd5(m.source, createHash("md5").update(m.bytes).digest("hex"));
+      processed++;
+      if (opts.onProgress && (processed + skipped) % 1000 === 0) {
+        opts.onProgress({ processed, skipped, failed: 0, flat: 0, rebuilt: 0, unchanged: 0, total: cat.count(), ms: Date.now() - t0 });
+      }
+    },
+    { formats: opts.formats, limit: opts.limit },
+  );
+  cat.checkpoint(); // fold the WAL in before the snapshot
+  const stats: IngestStats = { processed, skipped, failed: 0, flat: 0, rebuilt: 0, unchanged: 0, total: cat.count(), ms: Date.now() - t0 };
+  cat.close();
+  if (opts.publish !== false) {
+    try {
+      await publishCatalog(rpc, opts);
+    } catch (e) {
+      console.error(`catalog publish failed (md5 backfilled locally; IPNS not re-announced): ${e}`);
     }
   }
   return stats;
