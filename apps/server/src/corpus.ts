@@ -1,7 +1,9 @@
-// Walk the offline Mod Archive corpus (double-zipped: outer prefix-zip ->
-// per-module `name.ext.zip` -> module file) and yield each module's bytes with a
-// stable `source` key for incremental ingest. Streaming + sequential so memory
-// stays bounded over the full 52 GB / ~122k-module archive.
+// Walk the offline Mod Archive corpus and yield each module's bytes with a stable
+// `source` key for incremental ingest. Two zip layouts are accepted: the 2007
+// snapshot's double-zipped buckets (outer prefix-zip -> per-module `name.ext.zip`
+// -> module file) and the yearly-additions dumps (a per-module `name.ext.zip` with
+// the module file directly inside, no inner zip). Streaming + sequential so memory
+// stays bounded over the full ~60 GB / ~170k-module archive.
 import { readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 import yauzl from "yauzl";
@@ -79,9 +81,27 @@ export async function forEachModule(
 ): Promise<number> {
   const formats = opts.formats?.map((f) => f.toLowerCase());
   const limit = opts.limit ?? 0;
+  // Ops shard knob: SHARD="i/N" processes only the outer zips whose path hashes to
+  // shard i of N, letting N worker processes bake disjoint slices of the corpus into
+  // the same catalog in parallel. Unset (or N<=1) => process everything, so the
+  // normal timer-driven ingest is unaffected.
+  const [shardIdx, shardN] = (() => {
+    const m = /^(\d+)\/(\d+)$/.exec(process.env.SHARD ?? "");
+    return m ? [Number(m[1]), Number(m[2])] : [0, 1];
+  })();
+  const inShard = (rel: string): boolean => {
+    if (shardN <= 1) return true;
+    let h = 2166136261 >>> 0; // FNV-1a (32-bit)
+    for (let i = 0; i < rel.length; i++) {
+      h ^= rel.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h % shardN === shardIdx;
+  };
   let count = 0;
   for (const oz of listOuterZips(root)) {
     const outerRel = relative(root, oz);
+    if (!inShard(outerRel)) continue;
     let zf: yauzl.ZipFile;
     try {
       zf = await openZip(oz);
@@ -90,23 +110,38 @@ export async function forEachModule(
     }
     await walkZip(zf, async (entry) => {
       const nm = entry.fileName;
-      if (!nm.toLowerCase().endsWith(".zip")) return; // inner must be a module zip
-      const ext = nm.slice(0, -4).split(".").pop()?.toLowerCase();
-      if (formats && (!ext || !formats.includes(ext))) return;
-      const innerBuf = await readEntry(zf, entry);
-      let izf: yauzl.ZipFile;
-      try {
-        izf = await openZip(innerBuf);
-      } catch {
-        return;
-      }
-      await walkZip(izf, async (me) => {
-        if (me.fileName.endsWith("/")) return;
-        if (SIDECAR.test(me.fileName)) return; // skip .info etc. — not a module
-        const bytes = await readEntry(izf, me);
-        await cb({ source: `${outerRel}!${nm}!${me.fileName}`, name: me.fileName, bytes });
+      if (nm.endsWith("/")) return; // directory entry
+      if (nm.toLowerCase().endsWith(".zip")) {
+        // Two-level layout: outer prefix-zip -> inner `name.ext.zip` -> module
+        // file (the 2007 snapshot's bucket zips + our local-upload batches).
+        const ext = nm.slice(0, -4).split(".").pop()?.toLowerCase();
+        if (formats && (!ext || !formats.includes(ext))) return;
+        const innerBuf = await readEntry(zf, entry);
+        let izf: yauzl.ZipFile;
+        try {
+          izf = await openZip(innerBuf);
+        } catch {
+          return;
+        }
+        await walkZip(izf, async (me) => {
+          if (me.fileName.endsWith("/")) return;
+          if (SIDECAR.test(me.fileName)) return; // skip .info etc. — not a module
+          const bytes = await readEntry(izf, me);
+          await cb({ source: `${outerRel}!${nm}!${me.fileName}`, name: me.fileName, bytes });
+          count++;
+        });
+      } else {
+        // Single-level layout: the outer zip *is* a per-module `name.ext.zip` and
+        // holds the module file directly, with no inner zip (the yearly Mod Archive
+        // additions dumps). Empty middle key segment keeps these from ever
+        // colliding with a two-level `outerRel!innerZip!module` key.
+        if (SIDECAR.test(nm)) return; // skip .info etc. — not a module
+        const ext = nm.split(".").pop()?.toLowerCase();
+        if (formats && (!ext || !formats.includes(ext))) return;
+        const bytes = await readEntry(zf, entry);
+        await cb({ source: `${outerRel}!!${nm}`, name: nm, bytes });
         count++;
-      });
+      }
     });
     if (limit && count >= limit) break;
   }
