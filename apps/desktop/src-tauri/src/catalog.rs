@@ -38,7 +38,16 @@ const FETCH_CONCURRENCY: usize = 16;
 const VFS_NAME: &str = "ipfs-catalog";
 /// Absolute ceiling on a term's document frequency for bm25 ranking; on small catalogs
 /// the relative (fraction-of-total) guard in `is_selective` dominates. See that fn.
-const RANK_DOC_LIMIT: i64 = 4000;
+///
+/// Tuned to the Bitswap-VFS page cost, NOT just relevance: `ORDER BY bm25` scores every
+/// matching row, and each scored posting is a catalog page fetched over the network. Measured
+/// on the 170k catalog, bm25 pages grow ~1:1 with match count while the rowid-order fallback is
+/// flat at ~200 pages regardless. So above this many matches bm25 stops being worth its fetch
+/// cost — a term matching ~400 already reads ~520 pages (~8.5 MB); broader ones (jungle 1.8k,
+/// techno 5.8k) read thousands. Keeping this low bounds any single search's fetch (and thus the
+/// per-query provide set) — that's the "never bulk-download the DB for a query" guarantee. Was
+/// 4000, which let common words pull 30–70 MB per search.
+const RANK_DOC_LIMIT: i64 = 400;
 
 // ---------------------------------------------------------------------------------
 // The VFS: serves SQLite page reads from a CID over Bitswap.
@@ -331,6 +340,11 @@ pub async fn run_query(rpc: NodeRpc, cid: Cid, req: CatalogReq) -> Result<Value,
             )
             .map_err(|e| format!("open catalog {cid}: {e}"))?;
             conn.pragma_update(None, "query_only", true).ok();
+            // Larger page cache than SQLite's 2 MB default (~128 of these 16 KB pages): a
+            // bm25 scan's working set is several MB, and each connection is opened fresh per
+            // query, so a small cache thrashes and re-reads pages within a single scan. 64 MB
+            // holds any bounded query's working set. Negative = KiB (not page count).
+            conn.pragma_update(None, "cache_size", -65536i64).ok();
             dispatch(&conn, &req).map_err(|e| e.to_string())
         })();
         OPEN_CTX.with(|c| *c.borrow_mut() = None);

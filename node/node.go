@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -61,7 +62,23 @@ type Node struct {
 	control   *control
 	fwd       *fwdState            // block-forwarding donor state (rate cap + bounded cache)
 	seeds     map[peer.ID]struct{} // bootstrap (seed) peer IDs — excluded from peer-provider dialing
+
+	// Provide queue: catalog page-sharing advertises every fetched leaf CID, so a single
+	// broad query could fire hundreds of DHT Provides at once (one goroutine each) —
+	// a storm that saturates the DHT and, when NAT'd, floods the log with timeouts. All
+	// advertisements now funnel through this bounded, deduped, fixed-concurrency queue
+	// instead: page-sharing is preserved, but the advertise rate is capped by construction.
+	provideQ  chan cid.Cid                 // bounded; provideNow enqueues non-blocking (drops when full)
+	provDedup *lru.Cache[string, struct{}] // recently-Provided CIDs — skip the redundant DHT walk
+	provOK    atomic.Int64                 // advertise successes (summarised, not per-CID logged)
+	provFail  atomic.Int64                 // advertise failures
 }
+
+const (
+	provideQueueSize = 8192    // pending advertisements before overflow drops (best-effort)
+	provideWorkers   = 4       // concurrent DHT Provides — bounds the goroutine fan-out
+	provideDedupSize = 1 << 16 // recently-Provided CIDs remembered to coalesce re-fetches
+)
 
 // logf is the node's structured-ish log sink (stderr). Kept trivial; the deploy captures
 // stderr via journald.
@@ -313,6 +330,15 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	if cfg.Role == RoleClient {
 		go n.beaconLoop(ctx)
 	}
+	// Start the bounded provide queue before anything can advertise (CatCatalog / Provide*
+	// only run after New returns, so this is race-free).
+	n.provideQ = make(chan cid.Cid, provideQueueSize)
+	n.provDedup, _ = lru.New[string, struct{}](provideDedupSize)
+	for i := 0; i < provideWorkers; i++ {
+		go n.provideWorker(ctx)
+	}
+	go n.provideStatsLoop(ctx)
+
 	// Reprovide pinned roots to the custom DHT (Provide.Strategy=roots; 22h in prod). The loop also
 	// advertises the donor rendezvous (R5) while this node is a public CLIENT donor — the seed never
 	// advertises itself as a donor, because it never forwards.
@@ -527,19 +553,68 @@ func (n *Node) provideCatalogPieces(cids []cid.Cid) {
 	}
 }
 
-// provideNow fires a single best-effort DHT advertisement in the background (the reprovide loop
-// refreshes it on the long interval).
+// provideNow enqueues a single best-effort DHT advertisement onto the bounded provide queue
+// (drained by provideWorker). Non-blocking: if the queue is full it drops the advertisement
+// rather than spawn an unbounded goroutine — the reprovide loop re-advertises roots on its long
+// interval, and catalog pieces are best-effort (a dropped one just means a peer fetches that page
+// from another holder). This is what keeps a broad query from firing a provide storm.
 func (n *Node) provideNow(c cid.Cid) {
-	if n.dht == nil {
+	if n.dht == nil || n.provideQ == nil {
 		return
 	}
-	go func() {
-		cctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		if err := n.dht.Provide(cctx, c, true); err != nil {
-			n.logf("provide %s failed: %v", c, err)
+	select {
+	case n.provideQ <- c:
+	default: // queue full — drop (bounded by design)
+	}
+}
+
+// provideWorker drains the provide queue with fixed concurrency (provideWorkers of these run).
+// Deduped: a CID advertised recently is skipped, so re-reads of the same catalog pages don't
+// re-walk the DHT. Only successful advertisements enter the dedup set, so a transient failure
+// is retried when the page is fetched again.
+func (n *Node) provideWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case c := <-n.provideQ:
+			k := c.KeyString()
+			if _, dup := n.provDedup.Get(k); dup {
+				continue
+			}
+			cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			err := n.dht.Provide(cctx, c, true)
+			cancel()
+			if err != nil {
+				n.provFail.Add(1)
+			} else {
+				n.provDedup.Add(k, struct{}{})
+				n.provOK.Add(1)
+			}
 		}
-	}()
+	}
+}
+
+// provideStatsLoop replaces the old per-CID "provide … failed" log line with a periodic
+// summary — a NAT'd client can fail thousands of advertisements, and one line each buried the
+// log. Silent when there was no advertise activity in the window.
+func (n *Node) provideStatsLoop(ctx context.Context) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	var lastOK, lastFail int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			ok, fail := n.provOK.Load(), n.provFail.Load()
+			dOK, dFail := ok-lastOK, fail-lastFail
+			if dOK+dFail > 0 {
+				n.logf("provide: %d ok, %d failed (60s); queue=%d", dOK, dFail, len(n.provideQ))
+				lastOK, lastFail = ok, fail
+			}
+		}
+	}
 }
 
 // Unpin removes a root pin (idempotent).
