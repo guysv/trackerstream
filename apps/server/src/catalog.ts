@@ -73,9 +73,9 @@ export class Catalog {
         format, ingested_at DESC, id DESC, filename, title, duration, channels, root_cid);
       CREATE INDEX IF NOT EXISTS idx_browse_title ON modules(
         title COLLATE NOCASE, id, filename, format, duration, channels, root_cid);
-      -- prefix='2 3': dedicated 2- and 3-char prefix indexes so the client's `"ab"*` /
-      -- `"abc"*` prefix queries seek instead of scanning a wide dictionary range over the
-      -- Bitswap VFS. The search box gates on a 2-char minimum, so these cover the common case.
+      -- prefix='2 3': dedicated 2- and 3-char prefix indexes so the client's 2-3 char
+      -- prefix queries ("ab"* / "abc"*) seek instead of scanning a wide dictionary range
+      -- over the Bitswap VFS. The search box gates on a 2-char minimum, so these cover it.
       CREATE VIRTUAL TABLE IF NOT EXISTS modules_fts USING fts5(
         title, filename, instruments, comment,
         content='', tokenize='unicode61', prefix='2 3'
@@ -195,6 +195,28 @@ export class Catalog {
     const up = this.db.prepare("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
     up.run("total", String(total));
     up.run("format_counts", JSON.stringify(counts));
+  }
+
+  /** Rebuild the FTS index in place from the `modules` table, and drop the now-unused
+   *  fts5vocab table. Re-creates `modules_fts` with the CURRENT schema (the constructor's
+   *  `CREATE ... IF NOT EXISTS` can't alter an existing virtual table, so a schema change
+   *  like adding `prefix='2 3'` needs this), then repopulates every row. Touches only the
+   *  catalog's search index — the module DAGs, pins and root_cids are untouched, so it's a
+   *  cheap catalog-only republish, not a corpus re-bake. Returns the row count. */
+  reindexFts(): number {
+    this.db.exec("DROP TABLE IF EXISTS modules_vocab");
+    this.db.exec("DROP TABLE IF EXISTS modules_fts");
+    this.db.exec(`
+      CREATE VIRTUAL TABLE modules_fts USING fts5(
+        title, filename, instruments, comment,
+        content='', tokenize='unicode61', prefix='2 3'
+      );
+    `);
+    this.db.exec(`
+      INSERT INTO modules_fts(rowid, title, filename, instruments, comment)
+      SELECT id, title, filename, instruments, comment FROM modules;
+    `);
+    return this.scanCount();
   }
 
   /** Fold the WAL back into the main DB file so an on-disk copy of it is a
