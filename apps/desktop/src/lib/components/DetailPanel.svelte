@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getModule, type ModuleDetail } from "$lib/catalog";
+  import { getModule, getModuleByMd5, type ModuleDetail } from "$lib/catalog";
   import { fmtTime, fmtBytes } from "$lib/format";
   import { enqueue, playList } from "$lib/player.svelte";
   import {
@@ -15,20 +15,25 @@
   import { openContextMenu } from "$lib/contextmenu.svelte";
   import { trackMenuItems } from "$lib/menus";
 
-  let { id }: { id: number | null } = $props();
+  // Two ways in: `id` (search/browse rows — a live catalog rowid) or `md5` (playlist
+  // rows, which persist only the stable content hash). Prefer id; fall back to md5.
+  let { id, md5 = null }: { id: number | null; md5?: string | null } = $props();
 
   let detail = $state<ModuleDetail | null>(null);
   let plMenu = $state(false);
   let myLists = $state<PlaylistMeta[]>([]);
 
   $effect(() => {
-    const cur = id;
+    const curId = id;
+    const curMd5 = md5;
     detail = null;
     plMenu = false;
-    if (cur == null) return;
-    getModule(cur)
+    const load = curId != null ? getModule(curId) : curMd5 ? getModuleByMd5(curMd5) : null;
+    if (!load) return;
+    load
       .then((d) => {
-        if (id === cur) detail = d;
+        // Guard against a racing prop change resolving out of order.
+        if (id === curId && md5 === curMd5 && d) detail = d;
       })
       .catch(() => {});
   });
@@ -68,11 +73,11 @@
       <button class="play" onclick={() => detail && playList([detail], 0)}>▶ play</button>
       <button
         class="like"
-        class:on={isLiked(detail.id)}
-        title={isLiked(detail.id) ? "remove from Liked Tracks" : "add to Liked Tracks"}
+        class:on={isLiked(detail.md5)}
+        title={isLiked(detail.md5) ? "remove from Liked Tracks" : "add to Liked Tracks"}
         onclick={() => detail && toggleLike(detail)}
       >
-        {isLiked(detail.id) ? "♥" : "♡"}
+        {isLiked(detail.md5) ? "♥" : "♡"}
       </button>
       <button onclick={() => enqueue(detail!)}>+ queue</button>
       <button onclick={() => enqueue(detail!, true)}>play next</button>

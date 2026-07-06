@@ -472,6 +472,9 @@ pub enum CatalogReq {
         #[serde(default)] offset: Option<i64>,
     },
     Get { id: i64 },
+    /// Resolve by content md5 — the stable key playlists store (survives re-ingest,
+    /// unlike the rowid `id`). Answers with the same `ModuleDetail` shape as `Get`.
+    GetByMd5 { md5: String },
     Formats {},
 }
 
@@ -532,23 +535,27 @@ fn dispatch(conn: &Connection, req: &CatalogReq) -> rusqlite::Result<Value> {
             list(conn, format.as_deref(), sort.as_deref(), limit.unwrap_or(100), offset.unwrap_or(0))
         }
         CatalogReq::Get { id } => get(conn, *id),
+        CatalogReq::GetByMd5 { md5 } => get_by_md5(conn, md5),
         CatalogReq::Formats {} => formats(conn),
     }
 }
 
 const HIT_COLS: &str =
-    "m.id, m.filename, m.format, m.title, m.duration, m.channels, m.root_cid";
+    "m.id, m.md5, m.filename, m.format, m.title, m.duration, m.channels, m.root_cid";
 
-/// Map a 7-column hit row (id, filename, format, title, duration, channels, root_cid).
+/// Map an 8-column hit row (id, md5, filename, format, title, duration, channels, root_cid).
+/// `md5` is the content hash — the stable, cross-rebake key playlists store (the rowid `id`
+/// is reassigned on every full re-ingest, so it must never be persisted).
 fn hit_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     Ok(json!({
         "id": r.get::<_, i64>(0)?,
-        "filename": r.get::<_, String>(1)?,
-        "format": r.get::<_, String>(2)?,
-        "title": r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-        "duration": r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-        "channels": r.get::<_, Option<i64>>(5)?.unwrap_or(0),
-        "rootCid": r.get::<_, String>(6)?,
+        "md5": r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        "filename": r.get::<_, String>(2)?,
+        "format": r.get::<_, String>(3)?,
+        "title": r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        "duration": r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+        "channels": r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+        "rootCid": r.get::<_, String>(7)?,
     }))
 }
 
@@ -711,32 +718,43 @@ fn list(
     Ok(json!({ "results": results }))
 }
 
+const DETAIL_COLS: &str =
+    "id, md5, filename, format, title, duration, channels, root_cid, \
+     num_samples, num_instruments, num_subsongs, size_bytes, instruments, comment";
+
+/// Map a full detail row (the `DETAIL_COLS` order) to the `ModuleDetail` JSON shape.
+fn detail_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id": r.get::<_, i64>(0)?,
+        "md5": r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+        "filename": r.get::<_, String>(2)?,
+        "format": r.get::<_, String>(3)?,
+        "title": r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+        "duration": r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
+        "channels": r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+        "rootCid": r.get::<_, String>(7)?,
+        "numSamples": r.get::<_, Option<i64>>(8)?.unwrap_or(0),
+        "numInstruments": r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+        "numSubsongs": r.get::<_, Option<i64>>(10)?.unwrap_or(0),
+        "sizeBytes": r.get::<_, Option<i64>>(11)?.unwrap_or(0),
+        "instruments": r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+        "comment": r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+    }))
+}
+
 fn get(conn: &Connection, id: i64) -> rusqlite::Result<Value> {
-    let row = conn
-        .query_row(
-            "SELECT id, filename, format, title, duration, channels, root_cid, \
-                    num_samples, num_instruments, num_subsongs, size_bytes, instruments, comment \
-             FROM modules WHERE id = ?1",
-            [id],
-            |r| {
-                Ok(json!({
-                    "id": r.get::<_, i64>(0)?,
-                    "filename": r.get::<_, String>(1)?,
-                    "format": r.get::<_, String>(2)?,
-                    "title": r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    "duration": r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                    "channels": r.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                    "rootCid": r.get::<_, String>(6)?,
-                    "numSamples": r.get::<_, Option<i64>>(7)?.unwrap_or(0),
-                    "numInstruments": r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                    "numSubsongs": r.get::<_, Option<i64>>(9)?.unwrap_or(0),
-                    "sizeBytes": r.get::<_, Option<i64>>(10)?.unwrap_or(0),
-                    "instruments": r.get::<_, Option<String>>(11)?.unwrap_or_default(),
-                    "comment": r.get::<_, Option<String>>(12)?.unwrap_or_default(),
-                }))
-            },
-        )
-        .optional()?;
+    let sql = format!("SELECT {DETAIL_COLS} FROM modules WHERE id = ?1");
+    let row = conn.query_row(&sql, [id], detail_row).optional()?;
+    Ok(row.unwrap_or(Value::Null))
+}
+
+/// Resolve a module by its content md5 — the stable key playlists persist. Seeks the
+/// `idx_modules_md5` index (a handful of pages over the Bitswap VFS), not a full scan.
+/// md5 is not unique (the same file can be cataloged under multiple sources), but such
+/// rows are byte-identical, hence share a `root_cid` — `LIMIT 1` is well-defined.
+fn get_by_md5(conn: &Connection, md5: &str) -> rusqlite::Result<Value> {
+    let sql = format!("SELECT {DETAIL_COLS} FROM modules WHERE md5 = ?1 LIMIT 1");
+    let row = conn.query_row(&sql, [md5], detail_row).optional()?;
     Ok(row.unwrap_or(Value::Null))
 }
 

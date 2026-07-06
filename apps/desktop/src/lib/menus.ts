@@ -34,7 +34,7 @@ export interface TrackCtx {
 
 export function trackMenuItems(h: ModuleHit, ctx: TrackCtx = {}): MenuItem[] {
   void plState.version; // subscribe: a network sync / like elsewhere re-derives this menu
-  const liked = isLiked(h.id);
+  const liked = isLiked(h.md5);
   const items: MenuItem[] = [
     { kind: "action", label: "Play", icon: "▶", onSelect: () => playList([h], 0) },
     { kind: "action", label: "Play next", onSelect: () => enqueue(h, true) },

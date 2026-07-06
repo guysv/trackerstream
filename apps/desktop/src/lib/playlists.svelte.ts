@@ -4,7 +4,7 @@
 // refresh after a mutation.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getModule, type ModuleHit } from "$lib/catalog";
+import { getModuleByMd5, type ModuleHit } from "$lib/catalog";
 import { playList, queue, setOnQueueSourceChange } from "$lib/player.svelte";
 
 export interface PlaylistMeta {
@@ -28,7 +28,8 @@ export interface PlaylistMeta {
 }
 
 export interface PlaylistItem {
-  id: number;
+  /** Content md5 — the stable key this row resolves to a CID with at play time. */
+  md5: string;
   modName: string;
   title: string;
 }
@@ -48,8 +49,8 @@ export interface PlaylistSyncStatus {
   budget: number;
 }
 
-/** The compact doc's track tuple: [catalog id, module name, song title]. */
-export type TrackTuple = [number, string, string];
+/** The compact doc's track tuple: [content md5, module name, song title]. */
+export type TrackTuple = [string, string, string];
 
 export type PlaylistScope = "library" | "seen" | "all";
 
@@ -78,8 +79,8 @@ export const plStatus = () => invoke<PlaylistSyncStatus>("playlist_sync_status")
  * Returns true if the track is now liked. */
 export const plLikeToggle = (track: TrackTuple) =>
   invoke<boolean>("playlist_like_toggle", { track });
-/** The catalog ids currently liked — what the heart buttons check membership against. */
-export const plLikedIds = () => invoke<number[]>("playlist_liked_ids");
+/** The track md5s currently liked — what the heart buttons check membership against. */
+export const plLikedIds = () => invoke<string[]>("playlist_liked_ids");
 /** The liked playlist's name (creating it if needed) — for opening it in the view. */
 export const plLikedName = () => invoke<string>("playlist_liked_name");
 
@@ -104,19 +105,19 @@ export const plPending = () => invoke<string[]>("playlist_pending");
 export const plBackers = (names: string[]) =>
   invoke<Record<string, number>>("playlist_backers", { names });
 
-export const hitTuple = (h: ModuleHit): TrackTuple => [h.id, h.filename, h.title];
+export const hitTuple = (h: ModuleHit): TrackTuple => [h.md5, h.filename, h.title];
 export const itemTuples = (items: PlaylistItem[]): TrackTuple[] =>
-  items.map((i) => [i.id, i.modName, i.title]);
+  items.map((i) => [i.md5, i.modName, i.title]);
 
 /** Mutation counter: components re-query when this bumps. */
 export const plState = $state({ version: 0 });
 export const plBump = () => plState.version++;
 
-// The set of catalog ids in the private "Liked Tracks" playlist. Every ♥ button across
+// The set of track md5s in the private "Liked Tracks" playlist. Every ♥ button across
 // the UI reads this reactively; kept warm by refreshLiked() on the sync cadence and
 // flipped optimistically on toggle so the heart reacts instantly.
-export const liked = $state<{ ids: Set<number> }>({ ids: new Set() });
-export const isLiked = (id: number): boolean => liked.ids.has(id);
+export const liked = $state<{ ids: Set<string> }>({ ids: new Set() });
+export const isLiked = (md5: string): boolean => liked.ids.has(md5);
 
 export async function refreshLiked(): Promise<void> {
   try {
@@ -131,8 +132,8 @@ export async function refreshLiked(): Promise<void> {
 export async function toggleLike(h: ModuleHit): Promise<void> {
   const nowLiked = await plLikeToggle(hitTuple(h));
   const ids = new Set(liked.ids);
-  if (nowLiked) ids.add(h.id);
-  else ids.delete(h.id);
+  if (nowLiked) ids.add(h.md5);
+  else ids.delete(h.md5);
   liked.ids = ids;
   plBump();
 }
@@ -173,12 +174,12 @@ const RESOLVE_CAP = 200;
 
 export async function playPlaylist(detail: PlaylistDetail, index = 0): Promise<void> {
   const slice = detail.items.slice(0, RESOLVE_CAP);
-  const wantedId = detail.items[Math.min(index, slice.length - 1)]?.id;
+  const wantedMd5 = detail.items[Math.min(index, slice.length - 1)]?.md5;
   const hits = (
-    await Promise.all(slice.map((i) => getModule(i.id).catch(() => null)))
+    await Promise.all(slice.map((i) => getModuleByMd5(i.md5).catch(() => null)))
   ).filter(Boolean) as ModuleHit[];
   if (!hits.length) throw new Error("no playable tracks in playlist");
-  const at = Math.max(0, hits.findIndex((h) => h.id === wantedId));
+  const at = Math.max(0, hits.findIndex((h) => h.md5 === wantedMd5));
   playList(hits, at); // fires the source-change hook first, releasing any prior pin
   void invoke("playlist_pin", { name: detail.name }).catch(() => {});
   // Bump only after the mark lands, so the library re-query reads the fresh
@@ -191,11 +192,11 @@ export async function addTrackTo(name: string, h: ModuleHit): Promise<void> {
   const d = await plGet(name);
   if (!d) return;
   const tuples = itemTuples(d.items);
-  if (!tuples.some((t) => t[0] === h.id)) tuples.push(hitTuple(h));
+  if (!tuples.some((t) => t[0] === h.md5)) tuples.push(hitTuple(h));
   await plUpdate(name, d.title, tuples);
   // If this is the private Liked Tracks playlist, flip the ♥ optimistically (reassign
   // the reactive set) instead of waiting on the 10s refreshLiked() poll — mirrors toggleLike().
-  if (d.liked && !liked.ids.has(h.id)) liked.ids = new Set(liked.ids).add(h.id);
+  if (d.liked && !liked.ids.has(h.md5)) liked.ids = new Set(liked.ids).add(h.md5);
   plBump();
 }
 

@@ -17,6 +17,7 @@
   let scrollTop = $state(0);
   $effect(() => {
     ui.inspectorTrackId = selectedId;
+    ui.inspectorTrackMd5 = null; // this route inspects by rowid; drop any playlist md5
   });
 
   // Restore selection + scroll when returning to this route via back/forward. Scroll is

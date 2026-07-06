@@ -44,11 +44,11 @@
         {@const h = nowPlaying.hit}
         <button
           class="like"
-          class:on={isLiked(h.id)}
-          title={isLiked(h.id) ? "remove from Liked Tracks" : "add to Liked Tracks"}
+          class:on={isLiked(h.md5)}
+          title={isLiked(h.md5) ? "remove from Liked Tracks" : "add to Liked Tracks"}
           onclick={() => toggleLike(h)}
         >
-          {isLiked(h.id) ? "♥" : "♡"}
+          {isLiked(h.md5) ? "♥" : "♡"}
         </button>
       {/if}
       <span class="name">{nowPlaying.hit?.title || nowPlaying.hit?.filename || "—"}</span>
