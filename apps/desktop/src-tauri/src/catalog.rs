@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
 use cid::Cid;
@@ -98,9 +98,67 @@ pub fn cancel_inflight() {
     CANCEL_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Capacity of the shared page cache, in 16 KB chunks. 4096 × 16 KB = 64 MB — room for the
+/// schema, the FTS dictionary's upper B-tree, and a large working set of postings, so an
+/// interactive typing burst (and pagination) descends from warm pages instead of re-fetching
+/// the top-of-tree per Connection.
+const PAGE_CACHE_CHUNKS: usize = 4096;
+
+/// Process-global, CID-keyed page cache. Content addressing makes every `(CID, chunk)` value
+/// immutable, so entries never need invalidation — a new catalog CID just populates fresh keys
+/// and stale ones age out. Every query opens its own `Connection` with only query-LOCAL
+/// sequential state ([`Cache`]); the fetched *pages* live here, shared, so the debounce storm
+/// while typing and every `loadMore` reuse the schema + FTS top-of-tree instead of pulling them
+/// again. Tick-LRU: `get`/`put` stamp a monotonic tick; eviction is an O(n) min-scan run only
+/// when inserting past capacity (bounded by a query's fetch count — negligible next to a page RTT).
+struct PageCache {
+    map: HashMap<(Cid, u64), (Arc<Vec<u8>>, u64)>,
+    tick: u64,
+    cap: usize,
+}
+
+impl PageCache {
+    fn contains(&self, k: &(Cid, u64)) -> bool {
+        self.map.contains_key(k)
+    }
+    /// Fetch a page and mark it most-recently-used. Only real reads call this (not the
+    /// membership probes in `ensure_chunks`), so recency tracks what queries actually touch.
+    fn get(&mut self, k: &(Cid, u64)) -> Option<Arc<Vec<u8>>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(k).map(|e| {
+            e.1 = tick;
+            e.0.clone()
+        })
+    }
+    fn put(&mut self, k: (Cid, u64), v: Arc<Vec<u8>>) {
+        self.tick += 1;
+        self.map.insert(k, (v, self.tick));
+        while self.map.len() > self.cap {
+            let Some(lru) = self.map.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k) else {
+                break;
+            };
+            self.map.remove(&lru);
+        }
+    }
+}
+
+fn page_cache() -> &'static Mutex<PageCache> {
+    static CACHE: OnceLock<Mutex<PageCache>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(PageCache { map: HashMap::new(), tick: 0, cap: PAGE_CACHE_CHUNKS })
+    })
+}
+
+/// Drop every cached page (test hook). The fetch-byte benchmark calls this before each measured
+/// term so it reports true fresh-client cost — otherwise the shared cache would (correctly) show
+/// a re-queried client pulling far less than a cold one.
+pub fn clear_page_cache() {
+    page_cache().lock().unwrap().map.clear();
+}
+
 #[derive(Default)]
 struct Cache {
-    chunks: HashMap<u64, Arc<Vec<u8>>>,
     /// Last chunk index read, for sequential-access detection (prefetch trigger).
     last_end: Option<u64>,
     /// Length of the current forward-contiguous run of reads. Advanced in `read_exact_at`
@@ -156,20 +214,21 @@ impl CatalogFile {
         if self.cancelled() {
             return Err(cancelled_err());
         }
+        let seq_run = self.cache.lock().unwrap().seq_run;
         let missing: Vec<u64> = {
-            let cache = self.cache.lock().unwrap();
-            if !(first..=last).any(|c| !cache.chunks.contains_key(&c)) {
-                return Ok(()); // all present
+            let pc = page_cache().lock().unwrap();
+            if (first..=last).all(|c| pc.contains(&(self.cid, c))) {
+                return Ok(()); // all present in the shared cache
             }
             // Prefetch only once inside an established forward scan (browse). Search's
             // FTS-read → scattered-rowid-lookup alternation never builds the run up, so it
             // no longer triggers the read-ahead that pulled pages it never read.
-            let hi = if cache.seq_run >= PREFETCH_MIN_RUN {
+            let hi = if seq_run >= PREFETCH_MIN_RUN {
                 (last + PREFETCH_CHUNKS).min(self.last_chunk())
             } else {
                 last
             };
-            (first..=hi).filter(|c| !cache.chunks.contains_key(c)).collect()
+            (first..=hi).filter(|c| !pc.contains(&(self.cid, *c))).collect()
         };
 
         let rpc = self.rpc.clone();
@@ -217,10 +276,13 @@ impl CatalogFile {
         });
         let fetched = fetched.ok_or_else(cancelled_err)?;
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut pc = page_cache().lock().unwrap();
         for r in fetched {
             let (c, bytes) = r?;
-            cache.chunks.entry(c).or_insert_with(|| Arc::new(bytes));
+            let k = (self.cid, c);
+            if !pc.contains(&k) {
+                pc.put(k, Arc::new(bytes));
+            }
         }
         Ok(())
     }
@@ -254,12 +316,20 @@ impl DatabaseHandle for CatalogFile {
         }
         self.ensure_chunks(first, last)?;
 
-        let cache = self.cache.lock().unwrap();
-        for c in first..=last {
-            let chunk = cache
-                .chunks
-                .get(&c)
-                .ok_or_else(|| io::Error::other("chunk missing after fetch"))?;
+        // Pull the served pages out of the shared cache (marking them MRU), then release the
+        // global lock before the memcpy so a concurrent query isn't blocked on our copy.
+        let chunks: Vec<(u64, Arc<Vec<u8>>)> = {
+            let mut pc = page_cache().lock().unwrap();
+            (first..=last)
+                .map(|c| {
+                    pc.get(&(self.cid, c))
+                        .map(|a| (c, a))
+                        .ok_or_else(|| io::Error::other("chunk missing after fetch"))
+                })
+                .collect::<io::Result<_>>()?
+        };
+        for (c, chunk) in &chunks {
+            let c = *c;
             let chunk_start = c * CHUNK;
             let avail_end = chunk_start + chunk.len() as u64;
             let seg_start = offset.max(chunk_start);
@@ -272,7 +342,6 @@ impl DatabaseHandle for CatalogFile {
             let dst = (seg_start - offset) as usize;
             buf[dst..dst + (to - from)].copy_from_slice(&chunk[from..to]);
         }
-        drop(cache);
         self.cache.lock().unwrap().last_end = Some(last);
         Ok(())
     }
@@ -413,6 +482,15 @@ pub enum CatalogReq {
 pub async fn resolve_ipns_cid(rpc: &NodeRpc, name: &str) -> Result<Cid, String> {
     let record = rpc.routing_get(name).await.map_err(|e| e.to_string())?;
     crate::ipns::verify_b64(name, &record).map_err(|e| e.to_string())
+}
+
+/// Prewarm the shared page cache for a catalog: run one tiny probe search so the schema, the FTS
+/// dictionary's upper B-tree, and a first posting/row land in `PAGE_CACHE` before the user types.
+/// The first real keystroke then descends from warm nodes instead of paying the cold schema +
+/// FTS-root round-trips. Cheap (`LIMIT 1`, flat rowid). Best-effort — the caller ignores errors.
+pub async fn warm(rpc: NodeRpc, cid: Cid) -> Result<(), String> {
+    run_search_stream(rpc, cid, "the".to_string(), 1, None, |_| {}).await?;
+    Ok(())
 }
 
 /// Resolve + open the catalog over the VFS and answer a query. Runs on a blocking

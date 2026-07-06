@@ -394,6 +394,26 @@ fn catalog_cancel() {
     catalog::cancel_inflight();
 }
 
+/// Prewarm the catalog page cache (schema + FTS upper tree) so the first search after the box
+/// opens descends from warm pages instead of paying cold schema/FTS-root round-trips. Called
+/// fire-and-forget from the search page on mount; best-effort.
+#[tauri::command]
+async fn catalog_warm(
+    name: String,
+    cache: State<'_, Arc<IpnsCache>>,
+    state: State<'_, NodeState>,
+) -> Result<(), String> {
+    let cid = resolve_ipns_name(&name, &cache, &state.rpc).await?;
+    {
+        let rpc = state.rpc.clone();
+        let root = cid.to_string();
+        tauri::async_runtime::spawn(async move {
+            let _ = rpc.dial_providers(&root).await;
+        });
+    }
+    catalog::warm(state.rpc.clone(), cid).await
+}
+
 /// Resolve a module root CID to its exact bytes, 100% from CID blocks over the sidecar.
 #[tauri::command]
 async fn fetch_module(
@@ -861,6 +881,7 @@ pub fn run() {
             catalog_query,
             catalog_search_stream,
             catalog_cancel,
+            catalog_warm,
             fetch_module,
             start_stream,
             get_skeleton,

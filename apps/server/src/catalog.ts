@@ -73,13 +73,13 @@ export class Catalog {
         format, ingested_at DESC, id DESC, filename, title, duration, channels, root_cid);
       CREATE INDEX IF NOT EXISTS idx_browse_title ON modules(
         title COLLATE NOCASE, id, filename, format, duration, channels, root_cid);
+      -- prefix='2 3': dedicated 2- and 3-char prefix indexes so the client's `"ab"*` /
+      -- `"abc"*` prefix queries seek instead of scanning a wide dictionary range over the
+      -- Bitswap VFS. The search box gates on a 2-char minimum, so these cover the common case.
       CREATE VIRTUAL TABLE IF NOT EXISTS modules_fts USING fts5(
         title, filename, instruments, comment,
-        content='', tokenize='unicode61'
+        content='', tokenize='unicode61', prefix='2 3'
       );
-      -- Per-term document frequencies (view over the FTS index, no storage): lets
-      -- search() cheaply detect a low-selectivity term and skip global bm25 ranking.
-      CREATE VIRTUAL TABLE IF NOT EXISTS modules_vocab USING fts5vocab('modules_fts', 'row');
       -- Precomputed aggregates (refreshed at end of ingest) so count()/formatCounts()
       -- are O(1) lookups, not full-table scans, when queried over the Bitswap VFS.
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
