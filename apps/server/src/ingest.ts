@@ -36,6 +36,11 @@ export interface IngestOpts {
    *  key). Skips DAG build / metadata / kubo entirely — I/O-bound, no re-bake. Used
    *  once after the md5 column is added; then re-publishes the catalog. */
   backfillMd5?: boolean;
+  /** Reindex-only pass: rebuild `modules_fts` from the `modules` table (to apply an FTS
+   *  schema change like `prefix='2 3'`) and drop the unused fts5vocab table, then
+   *  republish. No corpus walk, no DAG build — the module blocks/pins/root_cids are
+   *  untouched, only the catalog's search index. Used after an FTS schema edit. */
+  reindexFts?: boolean;
   /** Publish the catalog DB to IPFS under the master-signed IPNS key at the end of
    *  ingest (R1). Default true; set false for dev slices. */
   publish?: boolean;
@@ -62,6 +67,7 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
   await rpc.id(); // fail fast if the master node is unreachable
 
   if (opts.backfillMd5) return backfillMd5(cat, rpc, opts);
+  if (opts.reindexFts) return reindexFtsMode(cat, rpc, opts);
 
   const t0 = Date.now();
   let processed = 0,
@@ -236,6 +242,27 @@ async function backfillMd5(cat: Catalog, rpc: KuboRpc, opts: IngestOpts): Promis
       await publishCatalog(rpc, opts);
     } catch (e) {
       console.error(`catalog publish failed (md5 backfilled locally; IPNS not re-announced): ${e}`);
+    }
+  }
+  return stats;
+}
+
+/** One-shot FTS reindex (see IngestOpts.reindexFts). Rebuilds `modules_fts` in place from
+ *  the `modules` table — applying an FTS schema change such as `prefix='2 3'` that
+ *  `CREATE ... IF NOT EXISTS` can't — drops the unused fts5vocab table, then republishes.
+ *  No corpus walk, no DAG build, no libopenmpt: the module blocks, pins and root_cids are
+ *  untouched; only the catalog's search index changes. Seconds, not the hours a re-bake takes. */
+async function reindexFtsMode(cat: Catalog, rpc: KuboRpc, opts: IngestOpts): Promise<IngestStats> {
+  const t0 = Date.now();
+  const total = cat.reindexFts();
+  cat.checkpoint(); // fold the WAL in before the snapshot
+  const stats: IngestStats = { processed: total, skipped: 0, failed: 0, flat: 0, rebuilt: 0, unchanged: 0, total, ms: Date.now() - t0 };
+  cat.close();
+  if (opts.publish !== false) {
+    try {
+      await publishCatalog(rpc, opts);
+    } catch (e) {
+      console.error(`catalog publish failed (FTS reindexed locally; IPNS not re-announced): ${e}`);
     }
   }
   return stats;
