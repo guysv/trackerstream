@@ -9,7 +9,7 @@
   import QueuePanel from "$lib/components/QueuePanel.svelte";
   import PeersPanel from "$lib/components/PeersPanel.svelte";
   import DetailPanel from "$lib/components/DetailPanel.svelte";
-  import { playNext, playPrev, player, nowPlaying, queue } from "$lib/player.svelte";
+  import { playNext, playPrev, player, nowPlaying, queue, refreshQueueRoots } from "$lib/player.svelte";
   import { peers, startPeerPolling } from "$lib/peers.svelte";
   import { initDeepLinks } from "$lib/deeplink";
   import { plIngestLink, plBump } from "$lib/playlists.svelte";
@@ -112,6 +112,10 @@
     // Hold a persistent master connection from startup (not lazily per-play), so the peers
     // pane reflects reality and uncached playback skips the re-dial.
     void keepaliveMaster(BOOTSTRAP_MULTIADDRS);
+    // Re-resolve the persisted queue's CIDs by md5 — a corpus rebake since it was saved
+    // would otherwise leave the restored "up next" list pointing at orphaned CIDs. Retries
+    // internally while the node/catalog warms; no-op for a fresh (this-session) queue.
+    void refreshQueueRoots();
     const stopPeers = startPeerPolling();
     window.addEventListener("keydown", globalKeys);
     return () => {
