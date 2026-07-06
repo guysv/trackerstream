@@ -7,7 +7,7 @@ import { ModPlayer } from "./audio/ModPlayer.svelte";
 import { Fence } from "./audio/fence";
 import { connectPeer, warmRoot, startStream, getSkeleton, getSample, setPlayhead } from "./p2p";
 import { dbg } from "./debug";
-import type { ModuleHit } from "./catalog";
+import { getModuleByMd5, type ModuleHit, type ModuleDetail } from "./catalog";
 
 export const player = new ModPlayer();
 
@@ -86,6 +86,59 @@ function saveQueue(): void {
   } catch {
     /* headless */
   }
+}
+
+// Lean projection: the queue stores ModuleHits, so a re-resolved ModuleDetail is trimmed
+// back to the hit shape (keeps localStorage small — no instruments/comment blobs).
+const toHit = (d: ModuleDetail): ModuleHit => ({
+  id: d.id,
+  md5: d.md5,
+  filename: d.filename,
+  format: d.format,
+  title: d.title,
+  duration: d.duration,
+  channels: d.channels,
+  rootCid: d.rootCid,
+});
+
+// A restored queue holds each track's rootCid from whenever it was queued; a corpus
+// rebake changes those CIDs, so replaying by the stored CID would fetch orphaned blocks
+// (exactly the bug playlists had). Re-resolve each item by its stable md5 to the current
+// catalog rootCid. Fresh items added this session already carry a current CID, so this
+// only rewrites the restored set — and only slots whose CID actually moved.
+//
+// Safety: matches by md5 against the LIVE queue at apply time (survives concurrent edits),
+// updates in place (never changes length/order, so queue.index stays valid), and NEVER
+// drops on a failed lookup — a lookup that rejects (node/catalog still warming) keeps the
+// stored item and schedules a retry; a genuinely-removed module (resolves to null) is left
+// as-is rather than silently vanishing from the user's queue.
+export async function refreshQueueRoots(attempt = 0): Promise<void> {
+  const targets = queue.items.filter((it) => it.md5);
+  if (!targets.length) return;
+  let transient = false;
+  const fresh = new Map<string, ModuleHit>();
+  await Promise.all(
+    targets.map(async (it) => {
+      try {
+        const d = (await getModuleByMd5(it.md5)) as ModuleDetail | null;
+        if (d?.rootCid) fresh.set(it.md5, toHit(d));
+      } catch {
+        transient = true; // node/catalog not ready yet — keep the stored item, retry below
+      }
+    }),
+  );
+  let changed = false;
+  for (let i = 0; i < queue.items.length; i++) {
+    const cur = queue.items[i];
+    const d = cur.md5 ? fresh.get(cur.md5) : undefined;
+    if (d && d.rootCid !== cur.rootCid) {
+      queue.items[i] = d;
+      changed = true;
+    }
+  }
+  if (changed) saveQueue();
+  // Converge as the node warms without needing a manual replay (bounded so we don't spin).
+  if (transient && attempt < 5) setTimeout(() => void refreshQueueRoots(attempt + 1), 3000);
 }
 
 // Gapless auto-advance: when a track ends, play the next queued one.
