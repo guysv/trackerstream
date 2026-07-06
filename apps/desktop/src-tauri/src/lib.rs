@@ -570,7 +570,7 @@ fn playlist_get(
 #[tauri::command]
 async fn playlist_create(
     title: String,
-    tracks: Vec<(i64, String, String)>,
+    tracks: Vec<(String, String, String)>,
     pl: State<'_, Arc<playlists::Playlists>>,
 ) -> Result<playlists::PlaylistMeta, String> {
     pl.create(title, tracks).await.map_err(|e| e.to_string())
@@ -580,7 +580,7 @@ async fn playlist_create(
 async fn playlist_update(
     name: String,
     title: String,
-    tracks: Vec<(i64, String, String)>,
+    tracks: Vec<(String, String, String)>,
     pl: State<'_, Arc<playlists::Playlists>>,
 ) -> Result<(), String> {
     pl.update(&name, title, tracks).await.map_err(|e| e.to_string())
@@ -634,15 +634,15 @@ fn playlist_sync_status(pl: State<'_, Arc<playlists::Playlists>>) -> Result<play
 /// published — private by construction.
 #[tauri::command]
 async fn playlist_like_toggle(
-    track: (i64, String, String),
+    track: (String, String, String),
     pl: State<'_, Arc<playlists::Playlists>>,
 ) -> Result<bool, String> {
     pl.like_toggle(track).await.map_err(|e| e.to_string())
 }
 
-/// The catalog ids currently liked — the set the heart buttons read (empty if none yet).
+/// The track md5s currently liked — the set the heart buttons read (empty if none yet).
 #[tauri::command]
-fn playlist_liked_ids(pl: State<'_, Arc<playlists::Playlists>>) -> Result<Vec<i64>, String> {
+fn playlist_liked_ids(pl: State<'_, Arc<playlists::Playlists>>) -> Result<Vec<String>, String> {
     pl.liked_ids().map_err(|e| e.to_string())
 }
 

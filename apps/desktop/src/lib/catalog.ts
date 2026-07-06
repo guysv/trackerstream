@@ -8,6 +8,9 @@ import { CATALOG_IPNS_KEY } from "@trackerstream/config";
 
 export interface ModuleHit {
   id: number;
+  /** Content md5 (lowercase hex) — the stable, cross-rebake key. The rowid `id` is
+   *  reassigned on every full re-ingest, so persist md5 (playlists, likes), never id. */
+  md5: string;
   filename: string;
   format: string;
   title: string;
@@ -81,6 +84,11 @@ export const listModules = (opts: {
 
 export const getModule = (id: number): Promise<ModuleDetail> =>
   query<ModuleDetail>({ op: "get", id });
+
+// Resolve a module by its stable content md5 — how playlists (which persist md5, not the
+// rebake-unstable rowid) turn a stored track into a playable CID at play time.
+export const getModuleByMd5 = (md5: string): Promise<ModuleDetail> =>
+  query<ModuleDetail>({ op: "get_by_md5", md5 });
 
 export const getFormats = (): Promise<{ formats: FormatCount[]; total: number }> =>
   query({ op: "formats" });

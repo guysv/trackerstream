@@ -27,6 +27,11 @@ const DOC_MAX: usize = 1 << 20;
 const TRACKS_MAX: usize = 20_000;
 const TITLE_MAX: usize = 300;
 const FIELD_MAX: usize = 512;
+/// A track key is a hex md5 (32 chars); cap generously to reject anything absurd while
+/// tolerating future/alternate content-hash encodings.
+const MD5_MAX: usize = 64;
+/// Current doc schema version. v2 keys tracks by content md5; v1 (rowid-keyed) is gone.
+const DOC_VERSION: u32 = 2;
 const LIFETIME: &str = "168h";
 /// Title of the private, per-client "Liked Tracks" playlist (Spotify-style). Its
 /// stable identity is the `liked` column, not this string (a user could rename it).
@@ -45,14 +50,16 @@ fn now_secs() -> i64 {
 
 // ---- document model ----
 
-/// One track reference: `[catalog id, module name, song title]` — denormalized so the
-/// playlist view renders with zero catalog lookups; the id resolves to a CID via the
-/// normal catalog path only at play time.
+/// One track reference: `[md5, module name, song title]` — denormalized so the playlist
+/// view renders with zero catalog lookups; the md5 resolves to a CID via the normal
+/// catalog path only at play time. The key is the module's content md5 (NOT the catalog
+/// rowid `id`, which is reassigned on every full re-ingest — playlists keyed by it broke
+/// on every rebake). md5 is content-stable, so it survives rebakes and re-bakes alike.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrackRef(pub i64, pub String, pub String);
+pub struct TrackRef(pub String, pub String, pub String);
 
-/// The compact wire document: `{"v":1,"t":"title","ts":[[id,"mod","title"],...]}`.
-/// Tombstone: `{"v":1,"del":true}`.
+/// The compact wire document: `{"v":2,"t":"title","ts":[["<md5>","mod","title"],...]}`.
+/// Tombstone: `{"v":2,"del":true}`. v2 = md5-keyed tracks (v1 was rowid-keyed, dropped).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaylistDoc {
     pub v: u32,
@@ -71,7 +78,7 @@ pub fn validate_doc(bytes: &[u8]) -> Result<PlaylistDoc> {
         bail!("doc size {} out of bounds", bytes.len());
     }
     let doc: PlaylistDoc = serde_json::from_slice(bytes)?;
-    if doc.v != 1 {
+    if doc.v != DOC_VERSION {
         bail!("unknown doc version {}", doc.v);
     }
     if doc.del {
@@ -84,6 +91,9 @@ pub fn validate_doc(bytes: &[u8]) -> Result<PlaylistDoc> {
         bail!("too many tracks ({})", doc.ts.len());
     }
     for t in &doc.ts {
+        if t.0.is_empty() || t.0.len() > MD5_MAX {
+            bail!("track md5 key out of bounds");
+        }
         if t.1.len() > FIELD_MAX || t.2.len() > FIELD_MAX {
             bail!("track field too long");
         }
@@ -128,7 +138,8 @@ pub struct PlaylistMeta {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackUi {
-    pub id: i64,
+    /// Content md5 — the stable key the row resolves to a CID with at play time.
+    pub md5: String,
     pub mod_name: String,
     pub title: String,
 }
@@ -422,7 +433,7 @@ impl Playlists {
 
     // -- CRUD (Tauri command backends) --
 
-    pub async fn create(&self, title: String, tracks: Vec<(i64, String, String)>) -> Result<PlaylistMeta> {
+    pub async fn create(&self, title: String, tracks: Vec<(String, String, String)>) -> Result<PlaylistMeta> {
         // A key (and therefore the IPNS name) exists from birth; nothing is published
         // until the user explicitly shares.
         // "playlist-<uuid>", NOT "playlist/<uuid>": the sidecar keystore maps key names
@@ -432,7 +443,7 @@ impl Playlists {
         let key_name = format!("playlist-{uid}");
         let name = self.rpc.key_gen(&key_name).await?;
         let doc = PlaylistDoc {
-            v: 1,
+            v: DOC_VERSION,
             t: title,
             del: false,
             ts: tracks.into_iter().map(|(a, b, c)| TrackRef(a, b, c)).collect(),
@@ -451,7 +462,7 @@ impl Playlists {
     }
 
     /// Edit an own playlist; if it was already shared, the edit republishes (seq+1).
-    pub async fn update(&self, name: &str, title: String, tracks: Vec<(i64, String, String)>) -> Result<()> {
+    pub async fn update(&self, name: &str, title: String, tracks: Vec<(String, String, String)>) -> Result<()> {
         let published: bool = {
             let db = self.db.lock().unwrap();
             db.query_row(
@@ -464,7 +475,7 @@ impl Playlists {
                 != 0
         };
         let doc = PlaylistDoc {
-            v: 1,
+            v: DOC_VERSION,
             t: title,
             del: false,
             ts: tracks.into_iter().map(|(a, b, c)| TrackRef(a, b, c)).collect(),
@@ -508,7 +519,7 @@ impl Playlists {
         }
         if is_mine && published {
             if let Some(key_name) = key_name {
-                let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] })?;
+                let tomb = serde_json::to_vec(&PlaylistDoc { v: DOC_VERSION, t: String::new(), del: true, ts: vec![] })?;
                 let next = self.next_seq(name, seq).await;
                 if let Err(e) = self.rpc.playlist_publish(&key_name, next, LIFETIME, tomb).await {
                     log::warn!(target: "playlist", "tombstone publish failed for {name}: {e}");
@@ -549,7 +560,7 @@ impl Playlists {
         if published {
             if let Some(key_name) = key_name {
                 let tomb =
-                    serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] })?;
+                    serde_json::to_vec(&PlaylistDoc { v: DOC_VERSION, t: String::new(), del: true, ts: vec![] })?;
                 let next = self.next_seq(name, seq).await;
                 match self.rpc.playlist_publish(&key_name, next, LIFETIME, tomb).await {
                     // Best-effort: even if the tombstone fails to send, we still go private
@@ -598,7 +609,7 @@ impl Playlists {
     /// liked playlist on first use. Returns the new state: `true` = now liked. Always
     /// private — the liked playlist can never be published (see `publish`/`delete` guards),
     /// so this only mutates local state and never touches the network.
-    pub async fn like_toggle(&self, track: (i64, String, String)) -> Result<bool> {
+    pub async fn like_toggle(&self, track: (String, String, String)) -> Result<bool> {
         let name = self.ensure_liked().await?;
         let (title, tracks, liked_now) = {
             let db = self.db.lock().unwrap();
@@ -608,8 +619,8 @@ impl Playlists {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             let doc: PlaylistDoc = serde_json::from_str(&doc_json)?;
-            let mut tracks: Vec<(i64, String, String)> =
-                doc.ts.iter().map(|t| (t.0, t.1.clone(), t.2.clone())).collect();
+            let mut tracks: Vec<(String, String, String)> =
+                doc.ts.iter().map(|t| (t.0.clone(), t.1.clone(), t.2.clone())).collect();
             let liked_now = match tracks.iter().position(|t| t.0 == track.0) {
                 Some(pos) => {
                     tracks.remove(pos);
@@ -626,16 +637,16 @@ impl Playlists {
         Ok(liked_now)
     }
 
-    /// The catalog ids currently in the liked playlist (empty if none yet) — the "is
+    /// The track md5s currently in the liked playlist (empty if none yet) — the "is
     /// this liked" set the UI's heart buttons read. Pure read, never creates the row.
-    pub fn liked_ids(&self) -> Result<Vec<i64>> {
+    pub fn liked_ids(&self) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
         let doc_json: Option<String> = db
             .query_row("SELECT doc_json FROM playlists WHERE liked=1 LIMIT 1", [], |r| r.get(0))
             .optional()?;
         let Some(doc_json) = doc_json else { return Ok(vec![]) };
         let doc: PlaylistDoc = serde_json::from_str(&doc_json)?;
-        Ok(doc.ts.iter().map(|t| t.0).collect())
+        Ok(doc.ts.iter().map(|t| t.0.clone()).collect())
     }
 
     // -- queries --
@@ -729,7 +740,7 @@ impl Playlists {
         let items = doc
             .ts
             .into_iter()
-            .map(|TrackRef(id, m, t)| TrackUi { id, mod_name: m, title: t })
+            .map(|TrackRef(md5, m, t)| TrackUi { md5, mod_name: m, title: t })
             .collect();
         Ok(Some(PlaylistDetail { meta, items }))
     }
@@ -1213,10 +1224,10 @@ mod tests {
 
     fn doc_bytes(title: &str) -> Vec<u8> {
         serde_json::to_vec(&PlaylistDoc {
-            v: 1,
+            v: DOC_VERSION,
             t: title.into(),
             del: false,
-            ts: vec![TrackRef(1, "a.it".into(), "Song A".into())],
+            ts: vec![TrackRef("d41d8cd98f00b204e9800998ecf8427e".into(), "a.it".into(), "Song A".into())],
         })
         .unwrap()
     }
@@ -1283,7 +1294,7 @@ mod tests {
         let kp = Keypair::generate_ed25519();
         let w = wire_for(&kp, &doc_bytes("alive"), 1);
         pl.ingest_wire(&w).unwrap();
-        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: DOC_VERSION, t: String::new(), del: true, ts: vec![] }).unwrap();
         let wt = wire_for(&kp, &tomb, 2);
         pl.ingest_wire(&wt).unwrap();
         assert!(pl.get(&w.name).unwrap().is_none());
@@ -1301,7 +1312,7 @@ mod tests {
         pl.ingest_wire(&w).unwrap();
         pl.set_held(&w.name, true).unwrap();
 
-        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: DOC_VERSION, t: String::new(), del: true, ts: vec![] }).unwrap();
         pl.ingest_wire(&wire_for(&kp, &tomb, 2)).unwrap();
 
         let got = pl.get(&w.name).unwrap().expect("held row must survive the tombstone");
@@ -1363,7 +1374,7 @@ mod tests {
         assert_eq!(pl.manifest().unwrap().len(), 2);
 
         // A tombstoned held row (record cleared, dormant) drops out of the disclosure set.
-        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: DOC_VERSION, t: String::new(), del: true, ts: vec![] }).unwrap();
         pl.ingest_wire(&wire_for(&k2, &tomb, 3)).unwrap();
         let m = pl.manifest().unwrap();
         assert_eq!(m.len(), 1);
@@ -1378,10 +1389,13 @@ mod tests {
     fn liked_playlist_is_private_and_identified() {
         let pl = mem();
         let doc = PlaylistDoc {
-            v: 1,
+            v: DOC_VERSION,
             t: LIKED_TITLE.into(),
             del: false,
-            ts: vec![TrackRef(1, "a.it".into(), "A".into()), TrackRef(2, "b.it".into(), "B".into())],
+            ts: vec![
+                TrackRef("a".repeat(32), "a.it".into(), "A".into()),
+                TrackRef("b".repeat(32), "b.it".into(), "B".into()),
+            ],
         };
         let bytes = serde_json::to_vec(&doc).unwrap();
         {
@@ -1394,7 +1408,7 @@ mod tests {
             .unwrap();
         }
         assert_eq!(pl.liked_name().unwrap().as_deref(), Some("likedname"));
-        assert_eq!(pl.liked_ids().unwrap(), vec![1, 2]);
+        assert_eq!(pl.liked_ids().unwrap(), vec!["a".repeat(32), "b".repeat(32)]);
         // Private by default — an unpublished liked playlist is never disclosed (until
         // the user explicitly shares it, at which point it's a normal published own row).
         assert!(pl.manifest().unwrap().is_empty());
@@ -1477,13 +1491,13 @@ mod tests {
     #[test]
     fn budget_evicts_foreign_lru_but_never_mine() {
         let mut pl = mem();
-        pl.budget = 130; // fits one test doc (~112 B) but not two
+        pl.budget = 200; // fits one test doc (~150 B, md5-keyed) but not two
         let big = |title: &str| {
             serde_json::to_vec(&PlaylistDoc {
-                v: 1,
+                v: DOC_VERSION,
                 t: title.into(),
                 del: false,
-                ts: vec![TrackRef(1, "x".repeat(40), "y".repeat(40))],
+                ts: vec![TrackRef("c".repeat(32), "x".repeat(40), "y".repeat(40))],
             })
             .unwrap()
         };
@@ -1515,8 +1529,13 @@ mod tests {
     // (boxo-signed record, raw-sha256 doc CID) must ingest under this Rust verifier —
     // the playlist counterpart of ipns.rs's Go-record fixture. Captured from a live
     // tsnode (`playlist/publish?key=playlist-fixture&seq=3&lifetime=868000h`, EOL 2125).
-    // Regenerate the same way against a local node if the wire format ever changes.
+    //
+    // IGNORED: this fixture's doc is the legacy v1 (rowid-keyed) format, now rejected by
+    // validate_doc. The record signs sha256(doc), so the doc can't be swapped without the
+    // node re-signing — regenerate against a live tsnode emitting v2 (md5-keyed) docs and
+    // drop the #[ignore]. (The v2 doc payload will read `{"v":2,...,"ts":[["<md5>",...]]}`.)
     #[test]
+    #[ignore = "regenerate the Go-signed fixture with a v2 (md5-keyed) doc"]
     fn ingests_a_wire_entry_produced_by_the_go_node() {
         let w = PlaylistWire {
             name: "12D3KooWGCr5x1M4TMzzEyWZ3dgC4jZiSRo1hS4KG99bCR4yjN4V".into(),
@@ -1568,7 +1587,7 @@ mod tests {
 
         // copy_link preconditions: unknown and tombstoned rows refuse.
         assert!(dst2.copy_link("12D3KooWNoSuchName").is_err());
-        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: DOC_VERSION, t: String::new(), del: true, ts: vec![] }).unwrap();
         src.set_held(&w.name, true).unwrap();
         src.ingest_wire(&wire_for(&kp, &tomb, 5)).unwrap();
         assert!(src.copy_link(&w.name).is_err(), "tombstoned row must not produce a link");
@@ -1605,7 +1624,7 @@ mod tests {
         let rpc = NodeRpc::new(&std::env::var("TS_TEST_RPC").expect("set TS_TEST_RPC"));
         let pl = Playlists::open(None, rpc).unwrap();
         let meta = pl
-            .create("live test".into(), vec![(42, "aurora.it".into(), "Hymn".into())])
+            .create("live test".into(), vec![("f".repeat(32), "aurora.it".into(), "Hymn".into())])
             .await
             .expect("create");
         println!("create -> {}", serde_json::to_string(&meta).unwrap());
@@ -1681,7 +1700,7 @@ mod tests {
         assert!(pl.get(&w.name).unwrap().is_some(), "pinned row must survive eviction");
 
         // Author tombstones it mid-play: kept dormant (like library), not deleted.
-        let tomb = serde_json::to_vec(&PlaylistDoc { v: 1, t: String::new(), del: true, ts: vec![] }).unwrap();
+        let tomb = serde_json::to_vec(&PlaylistDoc { v: DOC_VERSION, t: String::new(), del: true, ts: vec![] }).unwrap();
         pl.ingest_wire(&wire_for(&kp, &tomb, 2)).unwrap();
         let got = pl.get(&w.name).unwrap().expect("pinned row must survive the tombstone");
         assert!(got.meta.dormant && got.meta.tombstoned);
@@ -1721,9 +1740,11 @@ mod tests {
     fn validate_doc_rejects_garbage() {
         assert!(validate_doc(b"").is_err());
         assert!(validate_doc(b"not json").is_err());
-        assert!(validate_doc(br#"{"v":2,"t":"x"}"#).is_err());
-        let long = format!(r#"{{"v":1,"t":"{}"}}"#, "x".repeat(400));
-        assert!(validate_doc(long.as_bytes()).is_err());
-        assert!(validate_doc(br#"{"v":1,"del":true}"#).unwrap().del);
+        assert!(validate_doc(br#"{"v":99,"t":"x"}"#).is_err()); // unknown version
+        let long = format!(r#"{{"v":2,"t":"{}"}}"#, "x".repeat(400));
+        assert!(validate_doc(long.as_bytes()).is_err()); // title too long
+        // A track whose md5 key is empty is rejected (must resolve against the catalog).
+        assert!(validate_doc(br#"{"v":2,"t":"x","ts":[["","a.it","A"]]}"#).is_err());
+        assert!(validate_doc(br#"{"v":2,"del":true}"#).unwrap().del);
     }
 }

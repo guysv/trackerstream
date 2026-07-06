@@ -30,6 +30,7 @@
   let selectedId = $state<number | null>(null);
   $effect(() => {
     ui.inspectorTrackId = selectedId;
+    ui.inspectorTrackMd5 = null; // this route inspects by rowid; drop any playlist md5
   });
 
   // Warm the catalog page cache (schema + FTS upper tree) before the first keystroke, so the

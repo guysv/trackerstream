@@ -165,7 +165,7 @@
       {:else if ui.right === "peers"}
         <PeersPanel />
       {:else}
-        <DetailPanel id={ui.inspectorTrackId} />
+        <DetailPanel id={ui.inspectorTrackId} md5={ui.inspectorTrackMd5} />
       {/if}
     </aside>
   </main>

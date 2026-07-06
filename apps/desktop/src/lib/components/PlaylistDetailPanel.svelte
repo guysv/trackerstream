@@ -336,11 +336,11 @@
     {/if}
 
     <div class="tlist">
-      {#each detail.items as t, i (t.id + "-" + i)}
+      {#each detail.items as t, i (t.md5 + "-" + i)}
         <div
           class="trow"
-          class:sel={ui.inspectorTrackId === t.id}
-          onclick={() => { ui.inspectorTrackId = t.id; ui.right = "detail"; }}
+          class:sel={ui.inspectorTrackMd5 === t.md5}
+          onclick={() => { ui.inspectorTrackMd5 = t.md5; ui.inspectorTrackId = null; ui.right = "detail"; }}
           ondblclick={() => detail && playPlaylist(detail, i)}
           role="button"
           tabindex="-1"

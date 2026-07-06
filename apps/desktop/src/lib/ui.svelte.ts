@@ -7,6 +7,9 @@
 export const ui = $state<{
   right: "detail" | "queue" | "peers";
   inspectorTrackId: number | null;
+  /** Playlist rows inspect by stable md5 (they carry no rowid); search/browse rows use
+   * inspectorTrackId. At most one is set — DetailPanel prefers id, falls back to md5. */
+  inspectorTrackMd5: string | null;
   showHelp: boolean;
   searchEl: HTMLInputElement | undefined;
   /** Header status text, set by the active route (result count / loading / offline). */
@@ -14,6 +17,7 @@ export const ui = $state<{
 }>({
   right: "detail",
   inspectorTrackId: null,
+  inspectorTrackMd5: null,
   showHelp: false,
   searchEl: undefined,
   status: "",
