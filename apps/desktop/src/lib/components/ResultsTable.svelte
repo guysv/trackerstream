@@ -11,6 +11,8 @@
     scrollTop = $bindable(0),
     onplay,
     onselect,
+    onendreached,
+    busy = false,
     footer,
   }: {
     rows: ModuleHit[];
@@ -19,6 +21,12 @@
     scrollTop?: number;
     onplay: (h: ModuleHit) => void;
     onselect?: () => void;
+    /** Fired when the bottom-most loaded row enters the render window — the route loads the
+     * next chunk (infinite scroll). Called repeatedly near the bottom; the route guards re-entry. */
+    onendreached?: () => void;
+    /** A fetch is in flight. Passed so the end-reached check re-runs when it clears — that's what
+     * lets a tall viewport keep pulling chunks until it's filled (rows.length alone wouldn't retrigger). */
+    busy?: boolean;
     /** Optional content rendered inside the scroll area, below the last row — used by
      * search to flow the "discover playlists" section under the track results. */
     footer?: Snippet;
@@ -41,6 +49,14 @@
   const start = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - 6));
   const count = $derived(Math.ceil(viewH / ROW_H) + 12);
   const visible = $derived(rows.slice(start, start + count));
+
+  // Ask the route for more only once the bottom-most loaded row enters the render window
+  // (viewport + a few rows) — i.e. gate fetching on the last row being ~visible, not on a
+  // fixed look-ahead. Re-runs on scroll (via `start`) and as rows stream in (via `rows.length`),
+  // so it fills the viewport then stops; the route guards re-entry and end-of-results.
+  $effect(() => {
+    if (onendreached && !busy && rows.length > 0 && start + count >= rows.length) onendreached();
+  });
 
   function move(delta: number) {
     const idx = rows.findIndex((r) => r.id === selectedId);

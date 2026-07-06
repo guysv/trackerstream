@@ -358,6 +358,42 @@ async fn catalog_query(
     catalog::run_query(state.rpc.clone(), cid, req).await
 }
 
+/// Streaming search: resolves the catalog and emits each hit on `on_row` as SQLite steps to it
+/// (its pages arrive over the VFS), so the UI renders results progressively instead of after the
+/// whole page. Returns the total row count when the stream finishes. Shares the cancel/dial-
+/// providers plumbing with `catalog_query`.
+#[tauri::command]
+async fn catalog_search_stream(
+    name: String,
+    q: String,
+    limit: Option<i64>,
+    after: Option<i64>,
+    on_row: Channel<serde_json::Value>,
+    cache: State<'_, Arc<IpnsCache>>,
+    state: State<'_, NodeState>,
+) -> Result<usize, String> {
+    let cid = resolve_ipns_name(&name, &cache, &state.rpc).await?;
+    {
+        let rpc = state.rpc.clone();
+        let root = cid.to_string();
+        tauri::async_runtime::spawn(async move {
+            let _ = rpc.dial_providers(&root).await;
+        });
+    }
+    catalog::run_search_stream(state.rpc.clone(), cid, q, limit.unwrap_or(60), after, move |row| {
+        let _ = on_row.send(row);
+    })
+    .await
+}
+
+/// Cancel any in-flight catalog query — its VFS reads abort at the next page boundary and the
+/// in-flight Bitswap cats are dropped (tsnode aborts them). Called by the search box when a new
+/// query supersedes the last (or the box is cleared) so a stale search stops pulling pages.
+#[tauri::command]
+fn catalog_cancel() {
+    catalog::cancel_inflight();
+}
+
 /// Resolve a module root CID to its exact bytes, 100% from CID blocks over the sidecar.
 #[tauri::command]
 async fn fetch_module(
@@ -823,6 +859,8 @@ pub fn run() {
             keepalive_master,
             warm_root,
             catalog_query,
+            catalog_search_stream,
+            catalog_cancel,
             fetch_module,
             start_stream,
             get_skeleton,

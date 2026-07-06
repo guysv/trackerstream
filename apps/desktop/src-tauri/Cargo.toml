@@ -22,6 +22,9 @@ tauri-build = { version = "2", features = [] }
 # Duration). Not in the shipping binary. (The client-seam integration test in tests/ uses the
 # main deps — reqwest/serde/tokio/serde_json — directly.)
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Test-only: the catalog search benchmark constructs a `cid::Cid` to drive `catalog::run_query`
+# directly. Same version as the main dep, so it reuses the already-compiled crate.
+cid = { version = "0.11" }
 
 [dependencies]
 tauri = { version = "2", features = [] }
