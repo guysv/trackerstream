@@ -33,21 +33,14 @@ const CHUNK: u64 = 16 * 1024;
 /// round-trip's wall-clock, not N. Kept to a single batch to bound over-fetch on short
 /// scans (a wider window pulls pages the query never reads).
 const PREFETCH_CHUNKS: u64 = 15;
+/// Minimum forward-contiguous run before read-ahead engages. A covering-index browse scans
+/// pages in order and quickly builds a long run; a keyword search interleaves FTS posting reads
+/// with scattered rowid lookups, so its run never gets here — which stops prefetch from pulling
+/// ~3× the pages a search actually reads (measured: jungle 11.3 MB → 3.5 MB at limit 200).
+const PREFETCH_MIN_RUN: u64 = 4;
 /// Max concurrent leaf fetches per prefetch batch (Bitswap wants to the master).
 const FETCH_CONCURRENCY: usize = 16;
 const VFS_NAME: &str = "ipfs-catalog";
-/// Absolute ceiling on a term's document frequency for bm25 ranking; on small catalogs
-/// the relative (fraction-of-total) guard in `is_selective` dominates. See that fn.
-///
-/// Tuned to the Bitswap-VFS page cost, NOT just relevance: `ORDER BY bm25` scores every
-/// matching row, and each scored posting is a catalog page fetched over the network. Measured
-/// on the 170k catalog, bm25 pages grow ~1:1 with match count while the rowid-order fallback is
-/// flat at ~200 pages regardless. So above this many matches bm25 stops being worth its fetch
-/// cost — a term matching ~400 already reads ~520 pages (~8.5 MB); broader ones (jungle 1.8k,
-/// techno 5.8k) read thousands. Keeping this low bounds any single search's fetch (and thus the
-/// per-query provide set) — that's the "never bulk-download the DB for a query" guarantee. Was
-/// 4000, which let common words pull 30–70 MB per search.
-const RANK_DOC_LIMIT: i64 = 400;
 
 // ---------------------------------------------------------------------------------
 // The VFS: serves SQLite page reads from a CID over Bitswap.
@@ -64,6 +57,12 @@ struct OpenCtx {
     rpc: NodeRpc,
     rt: Handle,
     cid: Cid,
+    /// `CANCEL_EPOCH` at query start; the VFS aborts once the global epoch moves past it.
+    epoch: u64,
+}
+
+fn cancelled_err() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "catalog query superseded")
 }
 
 thread_local! {
@@ -74,11 +73,40 @@ thread_local! {
 /// ≪ the whole DB (the "lazy" claim). Relaxed; monotonic until a test resets it.
 pub(crate) static FETCHED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Bytes pulled over the catalog VFS so far this process (see `FETCHED_BYTES`). Exposed
+/// so the search-fetch benchmark (`tests/catalog_search_bench.rs`) can measure how much a
+/// fresh client pulls per query: reset, run one `run_query`, read this.
+pub fn fetched_bytes() -> u64 {
+    FETCHED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero the VFS fetched-bytes counter (benchmark/test hook — call before each measured query).
+pub fn reset_fetched_bytes() {
+    FETCHED_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Monotonic cancel epoch. An open `CatalogFile` captures the value it started at and aborts
+/// its next VFS page fetch once this has advanced — so a superseded search STOPS pulling pages
+/// over Bitswap instead of running to completion. (The frontend's stale-result guard hides the
+/// result; only this stops the bytes.) Bumped by `cancel_inflight`, checked in the VFS reads.
+static CANCEL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Cancel every catalog query currently in flight — each aborts at its next page fetch (within
+/// one Bitswap round-trip). Driven by the `catalog_cancel` command when a new search (or a
+/// cleared box) supersedes the last. A query that starts AFTER this call is unaffected.
+pub fn cancel_inflight() {
+    CANCEL_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[derive(Default)]
 struct Cache {
     chunks: HashMap<u64, Arc<Vec<u8>>>,
     /// Last chunk index read, for sequential-access detection (prefetch trigger).
     last_end: Option<u64>,
+    /// Length of the current forward-contiguous run of reads. Advanced in `read_exact_at`
+    /// (which runs on every read, cache hit or miss), reset on any jump/backward seek. Gates
+    /// prefetch so only an established scan triggers read-ahead — see `PREFETCH_MIN_RUN`.
+    seq_run: u64,
 }
 
 /// One open catalog DB, bound to a resolved root CID.
@@ -87,6 +115,7 @@ struct CatalogFile {
     rt: Handle,
     cid: Cid,
     size: u64,
+    epoch: u64,
     lock: LockKind,
     cache: Mutex<Cache>,
 }
@@ -96,9 +125,17 @@ impl CatalogFile {
         if self.size == 0 { 0 } else { (self.size - 1) / CHUNK }
     }
 
+    /// This query has been superseded (a newer search / a clear bumped `CANCEL_EPOCH`).
+    fn cancelled(&self) -> bool {
+        CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != self.epoch
+    }
+
     /// Fetch `[start, end)` of the file via a ranged UnixFS cat (walks only the leaves
     /// overlapping the range). Blocks the current (spawn_blocking) thread on the runtime.
     fn fetch_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        if self.cancelled() {
+            return Err(cancelled_err());
+        }
         let rpc = self.rpc.clone();
         let cid = self.cid;
         let bytes = self
@@ -116,13 +153,18 @@ impl CatalogFile {
     /// only helps sequential scans — covering-index browse, schema load — since a B-tree
     /// point/FTS lookup chains one dependent page read at a time.)
     fn ensure_chunks(&self, first: u64, last: u64) -> io::Result<()> {
+        if self.cancelled() {
+            return Err(cancelled_err());
+        }
         let missing: Vec<u64> = {
             let cache = self.cache.lock().unwrap();
             if !(first..=last).any(|c| !cache.chunks.contains_key(&c)) {
                 return Ok(()); // all present
             }
-            let sequential = cache.last_end.is_some_and(|le| first <= le + 1);
-            let hi = if sequential {
+            // Prefetch only once inside an established forward scan (browse). Search's
+            // FTS-read → scattered-rowid-lookup alternation never builds the run up, so it
+            // no longer triggers the read-ahead that pulled pages it never read.
+            let hi = if cache.seq_run >= PREFETCH_MIN_RUN {
                 (last + PREFETCH_CHUNKS).min(self.last_chunk())
             } else {
                 last
@@ -133,11 +175,21 @@ impl CatalogFile {
         let rpc = self.rpc.clone();
         let cid = self.cid;
         let size = self.size;
-        let fetched: Vec<io::Result<(u64, Vec<u8>)>> = self.rt.block_on(async move {
+        let epoch = self.epoch;
+        // Race the fetch batch against the cancel epoch. If a newer search supersedes this one
+        // mid-flight, the `cancel` arm wins and `fetch` is DROPPED — which drops the in-flight
+        // `rpc.cat` reqwest futures, closing their sidecar connections; tsnode's handleCat sees
+        // `r.Context()` cancel and aborts the Bitswap fetch for pages we no longer want. The
+        // per-chunk epoch check bounds waste for chunks not yet dialed. (Poll, not a Notify, to
+        // sidestep the notify-before-await race — 20 ms latency is nothing next to a page RTT.)
+        let fetched: Option<Vec<io::Result<(u64, Vec<u8>)>>> = self.rt.block_on(async move {
             use futures::StreamExt;
-            futures::stream::iter(missing.into_iter().map(|c| {
+            let fetch = futures::stream::iter(missing.into_iter().map(|c| {
                 let rpc = rpc.clone();
                 async move {
+                    if CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                        return Err(cancelled_err());
+                    }
                     let start = c * CHUNK;
                     let end = ((c + 1) * CHUNK).min(size);
                     let bytes = rpc
@@ -149,9 +201,21 @@ impl CatalogFile {
                 }
             }))
             .buffer_unordered(FETCH_CONCURRENCY)
-            .collect()
-            .await
+            .collect::<Vec<_>>();
+            tokio::pin!(fetch);
+            let cancel = async move {
+                while CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::pin!(cancel);
+            tokio::select! {
+                biased;
+                _ = &mut cancel => None,
+                v = &mut fetch => Some(v),
+            }
         });
+        let fetched = fetched.ok_or_else(cancelled_err)?;
 
         let mut cache = self.cache.lock().unwrap();
         for r in fetched {
@@ -179,6 +243,15 @@ impl DatabaseHandle for CatalogFile {
         }
         let first = offset / CHUNK;
         let last = (end - 1) / CHUNK;
+        {
+            // Advance the forward-run counter on a contiguous step (or re-read of the last
+            // chunk), reset on any jump/backward seek — before ensure_chunks reads it to gate
+            // prefetch. Done here (not in ensure_chunks) because prefetched reads hit the cache
+            // and short-circuit ensure_chunks, but must still count toward the run.
+            let mut cache = self.cache.lock().unwrap();
+            let advancing = cache.last_end.is_some_and(|le| first == le || first == le + 1);
+            cache.seq_run = if advancing { cache.seq_run.saturating_add(1) } else { 0 };
+        }
         self.ensure_chunks(first, last)?;
 
         let cache = self.cache.lock().unwrap();
@@ -250,6 +323,7 @@ impl Vfs for IpfsVfs {
             rt: ctx.rt.clone(),
             cid: ctx.cid,
             size: u64::MAX,
+            epoch: ctx.epoch,
             lock: LockKind::None,
             cache: Mutex::new(Cache::default()),
         };
@@ -267,6 +341,7 @@ impl Vfs for IpfsVfs {
             rt: ctx.rt,
             cid: ctx.cid,
             size: page_size * page_count,
+            epoch: ctx.epoch,
             lock: LockKind::None,
             cache: Mutex::new(Cache::default()),
         })
@@ -313,7 +388,14 @@ fn ensure_registered() {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum CatalogReq {
-    Search { q: String, #[serde(default)] limit: Option<i64> },
+    Search {
+        q: String,
+        #[serde(default)] limit: Option<i64>,
+        /// Keyset cursor for pagination: return only matches with rowid > `after` (the id of
+        /// the last row the client already has). Omit for the first page. Cheaper than OFFSET
+        /// over the Bitswap VFS — it skips straight to the next span instead of re-scanning.
+        #[serde(default)] after: Option<i64>,
+    },
     List {
         #[serde(default)] format: Option<String>,
         #[serde(default)] sort: Option<String>,
@@ -324,6 +406,15 @@ pub enum CatalogReq {
     Formats {},
 }
 
+/// Resolve an IPNS name (e.g. `CATALOG_IPNS_KEY`) to its current CID via the node's
+/// `routing/get`, verifying the signed record locally (the node is an untrusted cache).
+/// Thin helper for the search benchmark to hit the prod-published catalog; the app's own
+/// path (`resolve_ipns_name` in lib.rs) additionally layers an on-disk verified cache.
+pub async fn resolve_ipns_cid(rpc: &NodeRpc, name: &str) -> Result<Cid, String> {
+    let record = rpc.routing_get(name).await.map_err(|e| e.to_string())?;
+    crate::ipns::verify_b64(name, &record).map_err(|e| e.to_string())
+}
+
 /// Resolve + open the catalog over the VFS and answer a query. Runs on a blocking
 /// thread (rusqlite is sync; the VFS block_on's per page read). Returns JSON matching
 /// the frontend response shapes so the Svelte call sites are unchanged.
@@ -331,7 +422,9 @@ pub async fn run_query(rpc: NodeRpc, cid: Cid, req: CatalogReq) -> Result<Value,
     let rt = Handle::current();
     tokio::task::spawn_blocking(move || {
         ensure_registered();
-        OPEN_CTX.with(|c| *c.borrow_mut() = Some(OpenCtx { rpc, rt, cid }));
+        // Snapshot the cancel epoch NOW; a later search bumps it and this query's VFS reads abort.
+        let epoch = CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+        OPEN_CTX.with(|c| *c.borrow_mut() = Some(OpenCtx { rpc, rt, cid, epoch }));
         let result = (|| {
             let conn = Connection::open_with_flags_and_vfs(
                 cid.to_string(),
@@ -356,7 +449,7 @@ pub async fn run_query(rpc: NodeRpc, cid: Cid, req: CatalogReq) -> Result<Value,
 
 fn dispatch(conn: &Connection, req: &CatalogReq) -> rusqlite::Result<Value> {
     match req {
-        CatalogReq::Search { q, limit } => search(conn, q, limit.unwrap_or(50)),
+        CatalogReq::Search { q, limit, after } => search(conn, q, limit.unwrap_or(50), *after),
         CatalogReq::List { format, sort, limit, offset } => {
             list(conn, format.as_deref(), sort.as_deref(), limit.unwrap_or(100), offset.unwrap_or(0))
         }
@@ -386,7 +479,7 @@ fn collect(stmt: &mut rusqlite::Statement, params: &[&dyn rusqlite::ToSql]) -> r
     rows.collect()
 }
 
-fn search(conn: &Connection, query: &str, limit: i64) -> rusqlite::Result<Value> {
+fn search(conn: &Connection, query: &str, limit: i64, after: Option<i64>) -> rusqlite::Result<Value> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(json!({ "results": [] }));
@@ -397,43 +490,119 @@ fn search(conn: &Connection, query: &str, limit: i64) -> rusqlite::Result<Value>
     } else {
         q.split_whitespace().map(|t| format!("\"{t}\"*")).collect::<Vec<_>>().join(" ")
     };
-    // bm25 guard: rank only when the match set is small; a broad query takes the first
-    // LIMIT matches in rowid order (avoids scoring the whole index — see is_selective).
-    let order = if explicit || is_selective(conn, &matchstr) { "ORDER BY bm25(modules_fts)" } else { "" };
-    let sql = format!(
-        "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
-         WHERE modules_fts MATCH ?1 {order} LIMIT ?2"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let results = collect(&mut stmt, &[&matchstr as &dyn rusqlite::ToSql, &limit])?;
+    // No relevance ranking: take the first LIMIT matches in FTS rowid (≈ ingest) order, like
+    // ModArchive's own search. `ORDER BY bm25` had to score EVERY matching row before LIMIT, and
+    // each scored posting is a page fetched over the Bitswap VFS — so a mid-frequency term
+    // ("mario": ~34 MB / 2000+ pages / 90 s cold) cost far more than a broad one. Flat rowid
+    // order touches ~280 pages (~4.5 MB) regardless of term frequency. (If top-result relevance
+    // matters later, rank a bounded rowid-order window — never the whole match set.)
+    let _ = explicit; // (kept for matchstr prefix-expansion; no longer gates ordering)
+    // Keyset pagination: results are ascending FTS rowid, so the next page is simply the
+    // matches with rowid > the last id the client holds. Skips straight past what's already
+    // shown instead of OFFSET re-scanning it over the VFS.
+    let results = if let Some(a) = after {
+        let sql = format!(
+            "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
+             WHERE modules_fts MATCH ?1 AND f.rowid > ?2 LIMIT ?3"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        collect(&mut stmt, &[&matchstr as &dyn rusqlite::ToSql, &a, &limit])?
+    } else {
+        let sql = format!(
+            "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
+             WHERE modules_fts MATCH ?1 LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        collect(&mut stmt, &[&matchstr as &dyn rusqlite::ToSql, &limit])?
+    };
     Ok(json!({ "results": results }))
 }
 
-/// Decide whether to apply global bm25 ranking. `ORDER BY bm25` forces SQLite to score
-/// EVERY matching row before LIMIT — fine when the match set is small, ruinous for a
-/// broad query (lab: a near-stopword = 19k pages; measured on prod: a broad search = 130
-/// cold pages / ~28 s). We probe the REAL match count of the full MATCH expression
-/// (prefix-expanded, multi-term ANDed) but stop at the threshold — so the probe reads at
-/// most ~`limit` postings in rowid order, never the whole index. Over the threshold ⇒
-/// drop ranking and take the first LIMIT matches in rowid order. Threshold is relative to
-/// catalog size (with an absolute ceiling) so it holds as the corpus grows ~100×.
-/// (Earlier tried `fts5vocab` for per-term doc counts — it has no range seek and scans
-/// the entire vocab, i.e. the whole FTS index over Bitswap. This bounded COUNT avoids that.)
-fn is_selective(conn: &Connection, matchstr: &str) -> bool {
-    let total: i64 = conn
-        .query_row("SELECT value FROM meta WHERE key='total'", [], |r| r.get::<_, String>(0))
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let limit = if total > 0 { RANK_DOC_LIMIT.min((total / 10).max(200)) } else { RANK_DOC_LIMIT };
-    let n: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM modules_fts WHERE modules_fts MATCH ?1 LIMIT ?2)",
-            rusqlite::params![matchstr, limit + 1],
-            |r| r.get(0),
+/// Streaming search: same result set as `search`, but calls `on_row` for each hit the instant
+/// SQLite steps to it — each step pulls only that row's pages over the VFS — so the UI can render
+/// results as they arrive instead of after the whole page lands. Opens its own connection (same
+/// setup as `run_query`) and returns the number of rows emitted. Aborts early (returning what it
+/// sent) if a newer query bumps the cancel epoch mid-stream.
+pub async fn run_search_stream(
+    rpc: NodeRpc,
+    cid: Cid,
+    q: String,
+    limit: i64,
+    after: Option<i64>,
+    on_row: impl Fn(Value) + Send + 'static,
+) -> Result<usize, String> {
+    let rt = Handle::current();
+    tokio::task::spawn_blocking(move || {
+        ensure_registered();
+        let epoch = CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+        OPEN_CTX.with(|c| *c.borrow_mut() = Some(OpenCtx { rpc, rt, cid, epoch }));
+        let result = (|| -> Result<usize, String> {
+            let conn = Connection::open_with_flags_and_vfs(
+                cid.to_string(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+                VFS_NAME,
+            )
+            .map_err(|e| format!("open catalog {cid}: {e}"))?;
+            conn.pragma_update(None, "query_only", true).ok();
+            conn.pragma_update(None, "cache_size", -65536i64).ok();
+            search_stream(&conn, &q, limit, after, epoch, &on_row).map_err(|e| e.to_string())
+        })();
+        OPEN_CTX.with(|c| *c.borrow_mut() = None);
+        result
+    })
+    .await
+    .map_err(|e| format!("catalog stream task: {e}"))?
+}
+
+/// Row-at-a-time variant of `search`'s query. Steps the statement, handing each hit to `on_row`;
+/// checks the cancel epoch between rows so a superseded stream stops fetching pages promptly.
+fn search_stream(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    after: Option<i64>,
+    epoch: u64,
+    on_row: &(dyn Fn(Value) + Send),
+) -> rusqlite::Result<usize> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(0);
+    }
+    let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
+    let matchstr = if explicit {
+        q.to_string()
+    } else {
+        q.split_whitespace().map(|t| format!("\"{t}\"*")).collect::<Vec<_>>().join(" ")
+    };
+    let cursor = after.unwrap_or(0);
+    let sql = if after.is_some() {
+        format!(
+            "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
+             WHERE modules_fts MATCH ?1 AND f.rowid > ?2 LIMIT ?3"
         )
-        .unwrap_or(0);
-    n <= limit
+    } else {
+        format!(
+            "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
+             WHERE modules_fts MATCH ?1 LIMIT ?2"
+        )
+    };
+    let params: Vec<&dyn rusqlite::ToSql> = if after.is_some() {
+        vec![&matchstr, &cursor, &limit]
+    } else {
+        vec![&matchstr, &limit]
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params.as_slice())?;
+    let mut n = 0usize;
+    while let Some(r) = rows.next()? {
+        // A newer search bumped the epoch → stop; no point pulling pages for a stale query.
+        if CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+            break;
+        }
+        on_row(hit_row(r)?);
+        n += 1;
+    }
+    Ok(n)
 }
 
 fn list(

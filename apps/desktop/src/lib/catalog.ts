@@ -3,7 +3,7 @@
 // Bitswap-backed SQLite VFS (only the pages a query touches are fetched), so the
 // catalog needs no HTTP control plane. Module *bytes* never come from here either;
 // results carry a root CID the data plane resolves P2P.
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 import { CATALOG_IPNS_KEY } from "@trackerstream/config";
 
 export interface ModuleHit {
@@ -37,8 +37,28 @@ function query<T>(req: Record<string, unknown>): Promise<T> {
   return invoke<T>("catalog_query", { name: CATALOG_IPNS_KEY, req });
 }
 
-export const search = (q: string, limit = 60): Promise<ModuleHit[]> =>
-  query<{ results: ModuleHit[] }>({ op: "search", q, limit }).then((r) => r.results);
+// `after` is a keyset cursor: the id of the last hit already shown. Pass it to fetch the
+// next page (matches with a higher rowid); omit for the first page.
+export const search = (q: string, limit = 60, after?: number): Promise<ModuleHit[]> =>
+  query<{ results: ModuleHit[] }>({ op: "search", q, limit, after }).then((r) => r.results);
+
+// Streaming search: `onRow` fires for each hit the instant its pages arrive over the VFS, so the
+// UI paints results progressively instead of after the whole page. Resolves to the total row
+// count when the stream completes. Same keyset `after` cursor as `search`.
+export function searchStream(
+  q: string,
+  limit: number,
+  after: number | undefined,
+  onRow: (h: ModuleHit) => void,
+): Promise<number> {
+  const ch = new Channel<ModuleHit>();
+  ch.onmessage = onRow;
+  return invoke<number>("catalog_search_stream", { name: CATALOG_IPNS_KEY, q, limit, after, onRow: ch });
+}
+
+// Abort any in-flight catalog query (the last search): its VFS page reads stop and the
+// in-flight Bitswap cats are dropped so tsnode stops fetching pages we no longer want.
+export const cancelSearch = (): Promise<void> => invoke("catalog_cancel");
 
 export const listModules = (opts: {
   format?: string;

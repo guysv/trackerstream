@@ -2,7 +2,7 @@
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import ResultsTable from "$lib/components/ResultsTable.svelte";
-  import { search, type ModuleHit } from "$lib/catalog";
+  import { searchStream, cancelSearch, type ModuleHit } from "$lib/catalog";
   import { plSearch, type PlaylistMeta } from "$lib/playlists.svelte";
   import { playList } from "$lib/player.svelte";
   import { openContextMenu } from "$lib/contextmenu.svelte";
@@ -13,6 +13,13 @@
 
   let rows = $state<ModuleHit[]>([]);
   let plrows = $state<PlaylistMeta[]>([]);
+
+  // Infinite scroll: fetch tracks a chunk at a time. ResultsTable calls loadMore() only once
+  // the bottom-most loaded row enters its render window, so we never pull rows the user hasn't
+  // scrolled to — the initial fetch fills roughly one viewport, the rest arrives on demand.
+  const PAGE = 40;
+  let done = $state(false); // the current query has no more track pages
+  let fetching = $state(false); // a search or loadMore is in flight (gates re-entry + loadMore)
 
   // Library = what you own or back; discover = the seen tier gossip surfaced. Split so
   // discover playlists sit in their own section under tracks, not mixed with your library.
@@ -36,28 +43,79 @@
   $effect(() => {
     const query = q;
     clearTimeout(timer);
+    // Supersede the last op: invalidate its result (reqSeq) AND abort its in-flight fetch so
+    // tsnode stops pulling pages for a search we've typed past (or cleared).
+    reqSeq++;
+    void cancelSearch();
+    // New query supersedes any pagination state from the previous one.
+    done = false;
     if (!query) {
       rows = [];
       plrows = [];
+      fetching = false;
       ui.status = "";
       return;
     }
+    // Hold off loadMore across the debounce + initial stream (cleared in the timeout's finally).
+    fetching = true;
     ui.status = "searching…";
     timer = setTimeout(async () => {
       // Same stale-result guard as browse: keep only the latest in-flight query.
       const myReq = ++reqSeq;
-      try {
-        const [tr, pl] = await Promise.all([search(query, 200), plSearch(query)]);
+      // Stream hits in as their pages arrive. Keep the previous results on screen until the
+      // first new hit lands (no empty flash), then replace; append the rest.
+      let firstRow = true;
+      const onRow = (hit: ModuleHit) => {
         if (myReq !== reqSeq) return;
-        rows = tr;
+        if (firstRow) {
+          rows = [hit];
+          selectedId = hit.id;
+          firstRow = false;
+        } else {
+          rows.push(hit);
+        }
+        ui.status = `${rows.length}${rows.length >= PAGE ? "+" : ""} track${rows.length === 1 ? "" : "s"}…`;
+      };
+      try {
+        const [count, pl] = await Promise.all([searchStream(query, PAGE, undefined, onRow), plSearch(query)]);
+        if (myReq !== reqSeq) return;
+        if (count === 0) {
+          rows = []; // query matched nothing → clear the stale rows we kept on screen
+          selectedId = null;
+        }
         plrows = pl;
-        if (!rows.some((x) => x.id === selectedId)) selectedId = rows[0]?.id ?? null;
-        ui.status = `${tr.length} track${tr.length === 1 ? "" : "s"} · ${pl.length} playlist${pl.length === 1 ? "" : "s"}`;
+        done = count < PAGE; // a short first page means there's no more
+        ui.status = `${count}${done ? "" : "+"} track${count === 1 ? "" : "s"} · ${pl.length} playlist${pl.length === 1 ? "" : "s"}`;
       } catch {
         if (myReq === reqSeq) ui.status = "search offline";
+      } finally {
+        if (myReq === reqSeq) fetching = false;
       }
-    }, 180);
+    }, 250);
   });
+
+  // Fetch the next page and append it, using the last row's id as the keyset cursor. Called
+  // by ResultsTable as the viewport nears the end; guarded so scroll spam can't double-load,
+  // and dropped if the query changed mid-fetch (reqSeq).
+  async function loadMore() {
+    if (fetching || done || rows.length === 0) return;
+    fetching = true;
+    const myReq = reqSeq;
+    const cursor = rows[rows.length - 1].id;
+    try {
+      // Stream-append the next chunk; each hit shows the moment its pages arrive.
+      const count = await searchStream(q, PAGE, cursor, (hit) => {
+        if (myReq === reqSeq) rows.push(hit);
+      });
+      if (myReq !== reqSeq) return; // superseded by a newer query
+      if (count < PAGE) done = true;
+      ui.status = `${rows.length}${done ? "" : "+"} tracks · ${plrows.length} playlist${plrows.length === 1 ? "" : "s"}`;
+    } catch {
+      /* transient — leave `done` false so a later scroll retries */
+    } finally {
+      if (myReq === reqSeq) fetching = false;
+    }
+  }
 </script>
 
 {#snippet plrow(p: PlaylistMeta)}
@@ -96,6 +154,8 @@
       bind:selectedId
       onplay={play}
       onselect={() => (ui.right = "detail")}
+      onendreached={loadMore}
+      busy={fetching}
       footer={discover}
     />
   </div>
