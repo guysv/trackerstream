@@ -5,10 +5,12 @@
 //! wall-clock. This is the harness behind the "'jungle' pulls ~23 MB" observation and the
 //! regression guard that search stays on the flat rowid path (no bm25 scan; see `catalog.rs`).
 //!
-//! Bytes/pages are the headline metric: they come from `FETCHED_BYTES`, which counts what
-//! each query's SQLite plan touched over the VFS, independent of the client blockstore
-//! cache — so they're the same for a truly-fresh client as for this reused one. Wall-clock
-//! warms across terms (the client caches blocks), so read ms as a lower bound, not cold TTFB.
+//! Bytes/pages are the headline metric: they come from `FETCHED_BYTES`, which counts what each
+//! query's SQLite plan actually fetched over the VFS. The in-process page cache (`PAGE_CACHE`) is
+//! shared across queries, so each loop calls `clear_page_cache()` first to measure true cold
+//! per-term cost — otherwise terms after the first would show the (real, but different) warm cost
+//! of reusing the schema + FTS top-of-tree. Wall-clock also warms across terms (the client caches
+//! blocks), so read ms as a lower bound, not cold TTFB.
 //!
 //! Gated on two env vars; skips (passes) if either is absent, so plain `cargo test` stays green:
 //!   TS_NODE_BIN=/path/to/tsnode        (go -C node build -o /tmp/tsnode ./cmd/tsnode)
@@ -21,7 +23,8 @@
 
 use cid::Cid;
 use desktop_lib::catalog::{
-    cancel_inflight, fetched_bytes, reset_fetched_bytes, resolve_ipns_cid, run_query, CatalogReq,
+    cancel_inflight, clear_page_cache, fetched_bytes, reset_fetched_bytes, resolve_ipns_cid,
+    run_query, CatalogReq,
 };
 use desktop_lib::rpc::NodeRpc;
 use std::path::{Path, PathBuf};
@@ -123,6 +126,7 @@ async fn catalog_search_fetch_bench() {
 
     let mut total_pulled = 0u64;
     for term in terms() {
+        clear_page_cache(); // cold per term: don't let the shared cache warm across terms
         reset_fetched_bytes();
         let t0 = Instant::now();
         let res = run_query(cli_rpc.clone(), root, CatalogReq::Search { q: term.clone(), limit: Some(60), after: None })
@@ -222,6 +226,7 @@ async fn catalog_search_prod_bench() {
         eprintln!("{}", "-".repeat(66));
         for term in &terms {
             let (mut child, rpc, cid, resolve_ms) = fresh_prod_client(&bin, &boot).await;
+            clear_page_cache(); // in-process cache is shared across terms even with a fresh client
             reset_fetched_bytes();
             let t0 = Instant::now();
             let res = run_query(rpc.clone(), cid, CatalogReq::Search { q: term.clone(), limit: Some(60), after: None })
@@ -242,6 +247,7 @@ async fn catalog_search_prod_bench() {
         eprintln!("{:<16} {:>8} {:>10} {:>8} {:>7}", "term", "results", "pulled", "pages", "ms");
         eprintln!("{}", "-".repeat(56));
         for term in &terms {
+            clear_page_cache(); // cold per term (one client, but the page cache would carry over)
             reset_fetched_bytes();
             let t0 = Instant::now();
             let res = run_query(rpc.clone(), cid, CatalogReq::Search { q: term.clone(), limit: Some(60), after: None })
@@ -270,6 +276,7 @@ async fn catalog_cancel_prod() {
     }
     let boot = master_bootstrap();
     let (mut child, rpc, cid, _) = fresh_prod_client(&bin, &boot).await;
+    clear_page_cache(); // start cold: a warm cache could serve the query before we can cancel it
     reset_fetched_bytes();
 
     // Broad term, big limit → a long fetch we can interrupt part-way.

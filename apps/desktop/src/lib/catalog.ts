@@ -60,6 +60,11 @@ export function searchStream(
 // in-flight Bitswap cats are dropped so tsnode stops fetching pages we no longer want.
 export const cancelSearch = (): Promise<void> => invoke("catalog_cancel");
 
+// Prewarm the catalog page cache (schema + FTS upper tree) so the first keystroke's search
+// descends from warm pages instead of paying the cold schema/FTS-root fetches. Fire-and-forget
+// on search-page mount; best-effort (a failure just means the first search pays the cold cost).
+export const warmCatalog = (): Promise<void> => invoke("catalog_warm", { name: CATALOG_IPNS_KEY });
+
 export const listModules = (opts: {
   format?: string;
   sort?: "latest" | "random" | "title";

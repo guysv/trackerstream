@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import ResultsTable from "$lib/components/ResultsTable.svelte";
-  import { searchStream, cancelSearch, type ModuleHit } from "$lib/catalog";
+  import { searchStream, cancelSearch, warmCatalog, type ModuleHit } from "$lib/catalog";
   import { plSearch, type PlaylistMeta } from "$lib/playlists.svelte";
   import { playList } from "$lib/player.svelte";
   import { openContextMenu } from "$lib/contextmenu.svelte";
@@ -31,6 +32,12 @@
     ui.inspectorTrackId = selectedId;
   });
 
+  // Warm the catalog page cache (schema + FTS upper tree) before the first keystroke, so the
+  // opening search descends from warm pages instead of paying the cold schema/FTS-root fetches.
+  onMount(() => {
+    void warmCatalog();
+  });
+
   function play(h: ModuleHit) {
     playList(
       rows,
@@ -49,11 +56,14 @@
     void cancelSearch();
     // New query supersedes any pagination state from the previous one.
     done = false;
-    if (!query) {
+    // Skip 1-char queries: a single-char prefix (`"a"*`) matches almost everything and scans a
+    // huge slice of the FTS dictionary for a useless result. The `prefix='2 3'` index makes 2–3
+    // char prefixes cheap, so start searching at 2.
+    if (query.length < 2) {
       rows = [];
       plrows = [];
       fetching = false;
-      ui.status = "";
+      ui.status = query.length === 1 ? "keep typing…" : "";
       return;
     }
     // Hold off loadMore across the debounce + initial stream (cleared in the timeout's finally).
