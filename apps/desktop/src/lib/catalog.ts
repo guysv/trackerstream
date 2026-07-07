@@ -47,21 +47,25 @@ function query<T>(req: Record<string, unknown>): Promise<T> {
 
 // `after` is a keyset cursor: the id of the last hit already shown. Pass it to fetch the
 // next page (matches with a higher rowid); omit for the first page.
-export const search = (q: string, limit = 60, after?: number): Promise<ModuleHit[]> =>
-  query<{ results: ModuleHit[] }>({ op: "search", q, limit, after }).then((r) => r.results);
+// `namesOnly` restricts the match to title/filename (the names_fts index) instead of the full
+// index that also matches instrument + comment text — the search box's "names only" toggle.
+export const search = (q: string, limit = 60, after?: number, namesOnly = false): Promise<ModuleHit[]> =>
+  query<{ results: ModuleHit[] }>({ op: "search", q, limit, after, names: namesOnly }).then((r) => r.results);
 
 // Streaming search: `onRow` fires for each hit the instant its pages arrive over the VFS, so the
 // UI paints results progressively instead of after the whole page. Resolves to the total row
-// count when the stream completes. Same keyset `after` cursor as `search`.
+// count when the stream completes. Same keyset `after` cursor as `search`. `namesOnly` matches the
+// title/filename-only index (the "names only" toggle) rather than instruments/comments too.
 export function searchStream(
   q: string,
   limit: number,
   after: number | undefined,
   onRow: (h: ModuleHit) => void,
+  namesOnly = false,
 ): Promise<number> {
   const ch = new Channel<ModuleHit>();
   ch.onmessage = onRow;
-  return invoke<number>("catalog_search_stream", { name: CATALOG_NAME, q, limit, after, onRow: ch });
+  return invoke<number>("catalog_search_stream", { name: CATALOG_NAME, q, limit, after, names: namesOnly, onRow: ch });
 }
 
 // Abort any in-flight catalog query (the last search): its VFS page reads stop and the

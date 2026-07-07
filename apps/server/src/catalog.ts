@@ -87,6 +87,18 @@ export class Catalog {
         title, filename, instruments, comment,
         content='', tokenize='unicode61', prefix='2 3', detail='none', columnsize=0
       );
+      -- Names-only index for the "restrict to title/filename" search toggle. modules_fts
+      -- matches instruments+comment too (great for discovery, noisy when you know the exact
+      -- module you want); this one is just the two name columns, so the client MATCHes it
+      -- instead when the toggle is on. Cheapest way to get name-scoped search: modules_fts is
+      -- detail='none'/columnsize=0, which forecloses column-scoped MATCH (title:foo) — a
+      -- second small table over the two SHORT columns is far less weight than switching the
+      -- main index to detail='column' (+48 MB) would be. Same rowid (modules.id), so hits
+      -- JOIN to modules identically. Populated by insert()/reindexFts() alongside modules_fts.
+      CREATE VIRTUAL TABLE IF NOT EXISTS names_fts USING fts5(
+        title, filename,
+        content='', tokenize='unicode61', prefix='2 3', detail='none', columnsize=0
+      );
       -- Precomputed aggregates (refreshed at end of ingest) so count()/formatCounts()
       -- are O(1) lookups, not full-table scans, when queried over the Bitswap VFS.
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -131,6 +143,9 @@ export class Catalog {
       this.db
         .prepare("INSERT INTO modules_fts(rowid, title, filename, instruments, comment) VALUES (?,?,?,?,?)")
         .run(id, m.title, m.filename, m.instruments, m.comment);
+      this.db
+        .prepare("INSERT INTO names_fts(rowid, title, filename) VALUES (?,?,?)")
+        .run(id, m.title, m.filename);
     }
   }
 
@@ -222,6 +237,20 @@ export class Catalog {
     this.db.exec(`
       INSERT INTO modules_fts(rowid, title, filename, instruments, comment)
       SELECT id, title, filename, instruments, comment FROM modules;
+    `);
+    // Rebuild the names-only index in the same pass, so a plain FTS reindex/republish
+    // (not a full corpus re-bake) is enough to light up the title/filename search toggle
+    // on an existing catalog that predates names_fts.
+    this.db.exec("DROP TABLE IF EXISTS names_fts");
+    this.db.exec(`
+      CREATE VIRTUAL TABLE names_fts USING fts5(
+        title, filename,
+        content='', tokenize='unicode61', prefix='2 3', detail='none', columnsize=0
+      );
+    `);
+    this.db.exec(`
+      INSERT INTO names_fts(rowid, title, filename)
+      SELECT id, title, filename FROM modules;
     `);
     return this.scanCount();
   }

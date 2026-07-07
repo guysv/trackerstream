@@ -368,6 +368,7 @@ async fn catalog_search_stream(
     q: String,
     limit: Option<i64>,
     after: Option<i64>,
+    names: Option<bool>,
     on_row: Channel<serde_json::Value>,
     cache: State<'_, Arc<IpnsCache>>,
     state: State<'_, NodeState>,
@@ -380,7 +381,7 @@ async fn catalog_search_stream(
             let _ = rpc.dial_providers(&root).await;
         });
     }
-    catalog::run_search_stream(state.rpc.clone(), cid, q, limit.unwrap_or(60), after, move |row| {
+    catalog::run_search_stream(state.rpc.clone(), cid, q, limit.unwrap_or(60), after, names.unwrap_or(false), move |row| {
         let _ = on_row.send(row);
     })
     .await
