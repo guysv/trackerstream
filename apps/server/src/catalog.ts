@@ -76,9 +76,16 @@ export class Catalog {
       -- prefix='2 3': dedicated 2- and 3-char prefix indexes so the client's 2-3 char
       -- prefix queries ("ab"* / "abc"*) seek instead of scanning a wide dictionary range
       -- over the Bitswap VFS. The search box gates on a 2-char minimum, so these cover it.
+      -- detail='none': search takes flat-rowid matches (no bm25, no phrase/NEAR, no column
+      -- filters — none of which the client uses), so FTS5's per-token POSITION lists are dead
+      -- weight. Dropping them shrinks modules_fts_data (measured: served DB 381 -> 263 MB) and
+      -- ~halves the FTS-walk round-trips over the Bitswap VFS, with IDENTICAL result sets (lab-
+      -- verified parity incl. instrument/comment terms). columnsize=0 drops the bm25 docsize
+      -- table we no longer read. Trade-off: forecloses column-scoped MATCH (instruments:foo)
+      -- if a future feature wants it — switch to detail='column' (keeps filters, +48 MB) then.
       CREATE VIRTUAL TABLE IF NOT EXISTS modules_fts USING fts5(
         title, filename, instruments, comment,
-        content='', tokenize='unicode61', prefix='2 3'
+        content='', tokenize='unicode61', prefix='2 3', detail='none', columnsize=0
       );
       -- Precomputed aggregates (refreshed at end of ingest) so count()/formatCounts()
       -- are O(1) lookups, not full-table scans, when queried over the Bitswap VFS.
@@ -209,7 +216,7 @@ export class Catalog {
     this.db.exec(`
       CREATE VIRTUAL TABLE modules_fts USING fts5(
         title, filename, instruments, comment,
-        content='', tokenize='unicode61', prefix='2 3'
+        content='', tokenize='unicode61', prefix='2 3', detail='none', columnsize=0
       );
     `);
     this.db.exec(`
