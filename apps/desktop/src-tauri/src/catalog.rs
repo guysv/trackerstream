@@ -73,6 +73,16 @@ thread_local! {
 /// ≪ the whole DB (the "lazy" claim). Relaxed; monotonic until a test resets it.
 pub(crate) static FETCHED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Number of *serialized* network fetch rounds (the latency driver over Bitswap). Each
+/// blocking `ensure_chunks`/`fetch_range` that actually hits the network bumps this once —
+/// a wave's chunks fetch concurrently, but the query can't proceed until the wave returns,
+/// so wave-count ≈ dependent round-trips ≈ cold-latency / RTT. (A B-tree descent = one wave
+/// per level; the scattered FTS→row gather = ~one wave per hit — the metric that exposes it.)
+pub(crate) static FETCH_WAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Total individual ranged-cat calls (fan-out). `waves` counts blocking rounds; this counts
+/// the leaves requested across all rounds — together they separate round-trips from bytes.
+pub(crate) static CAT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Bytes pulled over the catalog VFS so far this process (see `FETCHED_BYTES`). Exposed
 /// so the search-fetch benchmark (`tests/catalog_search_bench.rs`) can measure how much a
 /// fresh client pulls per query: reset, run one `run_query`, read this.
@@ -83,6 +93,22 @@ pub fn fetched_bytes() -> u64 {
 /// Zero the VFS fetched-bytes counter (benchmark/test hook — call before each measured query).
 pub fn reset_fetched_bytes() {
     FETCHED_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Serialized fetch rounds over the VFS this process (see `FETCH_WAVES`) — the latency proxy.
+pub fn fetch_waves() -> u64 {
+    FETCH_WAVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Total ranged-cat calls (leaves requested) this process (see `CAT_CALLS`).
+pub fn cat_calls() -> u64 {
+    CAT_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero the wave + cat-call counters (benchmark/test hook — call before each measured op).
+pub fn reset_fetch_counters() {
+    FETCH_WAVES.store(0, std::sync::atomic::Ordering::Relaxed);
+    CAT_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Monotonic cancel epoch. An open `CatalogFile` captures the value it started at and aborts
@@ -150,11 +176,27 @@ fn page_cache() -> &'static Mutex<PageCache> {
     })
 }
 
+/// Process-global (CID → file size) cache. The DB size is derived from the SQLite header
+/// (`page_size * page_count`), immutable per CID — so the FIRST `open` for a CID probes the
+/// header over Bitswap and every later `open` reuses it. Without this, the concurrent gather
+/// (A1) would pay one header round-trip PER connection it opens, adding a wave per hit and
+/// erasing the parallelism win. Also trims a round-trip off every ordinary per-query open.
+fn size_cache() -> &'static Mutex<HashMap<Cid, u64>> {
+    static SIZES: OnceLock<Mutex<HashMap<Cid, u64>>> = OnceLock::new();
+    SIZES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Drop every cached page (test hook). The fetch-byte benchmark calls this before each measured
 /// term so it reports true fresh-client cost — otherwise the shared cache would (correctly) show
 /// a re-queried client pulling far less than a cold one.
 pub fn clear_page_cache() {
     page_cache().lock().unwrap().map.clear();
+}
+
+/// Drop the cached (CID → size) entries (test hook) so the next open re-probes the header —
+/// lets the A1 bench measure a truly cold first query rather than reusing an earlier probe.
+pub fn clear_size_cache() {
+    size_cache().lock().unwrap().clear();
 }
 
 #[derive(Default)]
@@ -201,6 +243,8 @@ impl CatalogFile {
             .block_on(async move { rpc.cat(&cid.to_string(), start, end - start).await })
             .map_err(|e| io::Error::other(format!("cat {cid} [{start}..{end}): {e}")))?;
         FETCHED_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        FETCH_WAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        CAT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(bytes)
     }
 
@@ -230,6 +274,13 @@ impl CatalogFile {
             };
             (first..=hi).filter(|c| !pc.contains(&(self.cid, *c))).collect()
         };
+
+        // One dependent round-trip: the query can't advance until this batch returns, so it
+        // counts as a single wave regardless of how many leaves it fetches concurrently.
+        if !missing.is_empty() {
+            FETCH_WAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            CAT_CALLS.fetch_add(missing.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let rpc = self.rpc.clone();
         let cid = self.cid;
@@ -385,31 +436,41 @@ impl Vfs for IpfsVfs {
         let ctx = OPEN_CTX
             .with(|c| c.borrow().clone())
             .ok_or_else(|| io::Error::other("catalog VFS opened with no query context"))?;
-        // Probe the SQLite header for the exact file size (page_size * page_count) so
-        // xFileSize doesn't have to fetch the whole DAG.
-        let probe = CatalogFile {
-            rpc: ctx.rpc.clone(),
-            rt: ctx.rt.clone(),
-            cid: ctx.cid,
-            size: u64::MAX,
-            epoch: ctx.epoch,
-            lock: LockKind::None,
-            cache: Mutex::new(Cache::default()),
+        // Reuse the cached size for this CID if a prior open already probed the header — so the
+        // concurrent gather's many opens (and every repeat query) skip the header round-trip.
+        let cached = size_cache().lock().unwrap().get(&ctx.cid).copied();
+        let size = if let Some(sz) = cached {
+            sz
+        } else {
+            // Probe the SQLite header for the exact file size (page_size * page_count) so
+            // xFileSize doesn't have to fetch the whole DAG.
+            let probe = CatalogFile {
+                rpc: ctx.rpc.clone(),
+                rt: ctx.rt.clone(),
+                cid: ctx.cid,
+                size: u64::MAX,
+                epoch: ctx.epoch,
+                lock: LockKind::None,
+                cache: Mutex::new(Cache::default()),
+            };
+            let hdr = probe.fetch_range(0, 100)?;
+            if hdr.len() < 100 || &hdr[0..16] != b"SQLite format 3\0" {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "not a sqlite db"));
+            }
+            let page_size = match u16::from_be_bytes([hdr[16], hdr[17]]) {
+                1 => 65536u64,
+                v => v as u64,
+            };
+            let page_count = u32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]) as u64;
+            let sz = page_size * page_count;
+            size_cache().lock().unwrap().insert(ctx.cid, sz);
+            sz
         };
-        let hdr = probe.fetch_range(0, 100)?;
-        if hdr.len() < 100 || &hdr[0..16] != b"SQLite format 3\0" {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a sqlite db"));
-        }
-        let page_size = match u16::from_be_bytes([hdr[16], hdr[17]]) {
-            1 => 65536u64,
-            v => v as u64,
-        };
-        let page_count = u32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]) as u64;
         Ok(CatalogFile {
             rpc: ctx.rpc,
             rt: ctx.rt,
             cid: ctx.cid,
-            size: page_size * page_count,
+            size,
             epoch: ctx.epoch,
             lock: LockKind::None,
             cache: Mutex::new(Cache::default()),
@@ -526,6 +587,152 @@ pub async fn run_query(rpc: NodeRpc, cid: Cid, req: CatalogReq) -> Result<Value,
     })
     .await
     .map_err(|e| format!("catalog query task: {e}"))?
+}
+
+/// Bench/analysis hook: run the FTS MATCH ONLY (no JOIN to `modules`) and return how many
+/// rowids it produced. Its VFS waves isolate the FTS-walk cost; `full_search_waves − this`
+/// is the scattered per-hit gather — exactly the part a concurrent gather (A1) would collapse
+/// from N serial page-fetches to ~ceil(N/concurrency) parallel ones. Not a product path.
+pub async fn run_fts_only(rpc: NodeRpc, cid: Cid, q: String, limit: i64) -> Result<usize, String> {
+    let rt = Handle::current();
+    tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        ensure_registered();
+        let epoch = CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+        OPEN_CTX.with(|c| *c.borrow_mut() = Some(OpenCtx { rpc, rt, cid, epoch }));
+        let out = (|| -> Result<usize, String> {
+            let conn = Connection::open_with_flags_and_vfs(
+                cid.to_string(), OpenFlags::SQLITE_OPEN_READ_ONLY, VFS_NAME,
+            ).map_err(|e| format!("open catalog {cid}: {e}"))?;
+            conn.pragma_update(None, "query_only", true).ok();
+            conn.pragma_update(None, "cache_size", -65536i64).ok();
+            let q = q.trim();
+            let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
+            let matchstr = if explicit {
+                q.to_string()
+            } else {
+                q.split_whitespace().map(|t| format!("\"{t}\"*")).collect::<Vec<_>>().join(" ")
+            };
+            let mut stmt = conn
+                .prepare("SELECT rowid FROM modules_fts WHERE modules_fts MATCH ?1 LIMIT ?2")
+                .map_err(|e| e.to_string())?;
+            let n = stmt
+                .query_map(rusqlite::params![matchstr, limit], |r| r.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?
+                .count();
+            Ok(n)
+        })();
+        OPEN_CTX.with(|c| *c.borrow_mut() = None);
+        out
+    })
+    .await
+    .map_err(|e| format!("fts-only task: {e}"))?
+}
+
+/// A1 phase 1: matched rowids via FTS ONLY (no JOIN), ascending FTS order. Same match
+/// expansion as `search`. The FTS walk is inherently serial (dependent posting reads); this
+/// isolates it so phase 2 can parallelize the part that scatters — the per-hit gather.
+async fn fts_rowids(
+    rpc: NodeRpc, cid: Cid, q: String, limit: i64, after: Option<i64>,
+) -> Result<Vec<i64>, String> {
+    let rt = Handle::current();
+    tokio::task::spawn_blocking(move || -> Result<Vec<i64>, String> {
+        ensure_registered();
+        let epoch = CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+        OPEN_CTX.with(|c| *c.borrow_mut() = Some(OpenCtx { rpc, rt, cid, epoch }));
+        let out = (|| -> Result<Vec<i64>, String> {
+            let conn = Connection::open_with_flags_and_vfs(
+                cid.to_string(), OpenFlags::SQLITE_OPEN_READ_ONLY, VFS_NAME,
+            ).map_err(|e| format!("open {cid}: {e}"))?;
+            conn.pragma_update(None, "query_only", true).ok();
+            conn.pragma_update(None, "cache_size", -65536i64).ok();
+            let q = q.trim();
+            if q.is_empty() { return Ok(vec![]); }
+            let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
+            let matchstr = if explicit {
+                q.to_string()
+            } else {
+                q.split_whitespace().map(|t| format!("\"{t}\"*")).collect::<Vec<_>>().join(" ")
+            };
+            let mut ids = Vec::new();
+            if let Some(a) = after {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid FROM modules_fts WHERE modules_fts MATCH ?1 AND rowid > ?2 LIMIT ?3",
+                ).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map(rusqlite::params![matchstr, a, limit], |r| r.get::<_, i64>(0))
+                    .map_err(|e| e.to_string())?;
+                for r in rows { ids.push(r.map_err(|e| e.to_string())?); }
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT rowid FROM modules_fts WHERE modules_fts MATCH ?1 LIMIT ?2",
+                ).map_err(|e| e.to_string())?;
+                let rows = stmt.query_map(rusqlite::params![matchstr, limit], |r| r.get::<_, i64>(0))
+                    .map_err(|e| e.to_string())?;
+                for r in rows { ids.push(r.map_err(|e| e.to_string())?); }
+            }
+            Ok(ids)
+        })();
+        OPEN_CTX.with(|c| *c.borrow_mut() = None);
+        out
+    }).await.map_err(|e| format!("fts_rowids task: {e}"))?
+}
+
+/// A1 phase 2 worker: one hit-column row by id on its own connection. Many of these run
+/// concurrently on spawn_blocking threads; the SIZE_CACHE keeps each open probe-free, so the
+/// only Bitswap cost is the row's own B-tree descent — and those descents overlap.
+async fn get_hit_row(rpc: NodeRpc, cid: Cid, id: i64) -> Option<Value> {
+    let rt = Handle::current();
+    tokio::task::spawn_blocking(move || -> Option<Value> {
+        ensure_registered();
+        let epoch = CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+        OPEN_CTX.with(|c| *c.borrow_mut() = Some(OpenCtx { rpc, rt, cid, epoch }));
+        let out = (|| {
+            let conn = Connection::open_with_flags_and_vfs(
+                cid.to_string(), OpenFlags::SQLITE_OPEN_READ_ONLY, VFS_NAME,
+            ).ok()?;
+            conn.pragma_update(None, "query_only", true).ok();
+            let cols = HIT_COLS.replace("m.", "");
+            let sql = format!("SELECT {cols} FROM modules WHERE id = ?1");
+            conn.query_row(&sql, [id], hit_row).optional().ok().flatten()
+        })();
+        OPEN_CTX.with(|c| *c.borrow_mut() = None);
+        out
+    }).await.ok().flatten()
+}
+
+/// A1: two-phase concurrent search. Phase 1 gets the matching rowids via FTS only; phase 2
+/// fetches each hit row CONCURRENTLY (`buffer_unordered`), collapsing the scattered gather —
+/// which dominates cold search latency (one serialized page-fetch chain per hit) — into
+/// ~ceil(N/FETCH_CONCURRENCY) overlapping waves. Returns `{results:[...]}` in ascending FTS
+/// rowid order (the concurrent gather completes out of order, so we re-sort). Same result set
+/// as `search`; only the fetch scheduling differs.
+pub async fn run_search_parallel(
+    rpc: NodeRpc, cid: Cid, q: String, limit: i64, after: Option<i64>,
+) -> Result<Value, String> {
+    let ids = fts_rowids(rpc.clone(), cid, q, limit, after).await?;
+    use futures::StreamExt;
+    let mut rows: Vec<(i64, Value)> = Vec::with_capacity(ids.len());
+    let mut it = ids.into_iter();
+    // Prewarm: fetch the FIRST hit alone so the `modules` B-tree root + upper interior pages
+    // land in the shared page cache before the fan-out. Otherwise the concurrent gets all
+    // descend from cold and thundering-herd re-fetch those shared pages (measured: +40 waves,
+    // +0.6 MB, and it erased the parallelism win). With the tree warm, the concurrent gets only
+    // pull their own distinct leaves.
+    if let Some(first) = it.next() {
+        if let Some(v) = get_hit_row(rpc.clone(), cid, first).await {
+            rows.push((first, v));
+        }
+    }
+    let rest: Vec<(i64, Value)> = futures::stream::iter(it.map(|id| {
+        let rpc = rpc.clone();
+        async move { get_hit_row(rpc, cid, id).await.map(|v| (id, v)) }
+    }))
+    .buffer_unordered(FETCH_CONCURRENCY)
+    .filter_map(|x| async move { x })
+    .collect()
+    .await;
+    rows.extend(rest);
+    rows.sort_by_key(|(id, _)| *id);
+    Ok(json!({ "results": rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>() }))
 }
 
 fn dispatch(conn: &Connection, req: &CatalogReq) -> rusqlite::Result<Value> {
