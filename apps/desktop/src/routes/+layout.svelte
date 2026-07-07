@@ -46,16 +46,40 @@
     }
   });
 
+  // "names only" search mode: restrict matching to title/filename (vs. also matching the
+  // instrument + comment text — great for discovery, noisy when fetching a known module).
+  // Carried in the URL alongside ?q so it persists across reload/back-forward and the search
+  // route re-runs when it flips. Both the typing path and the toggle preserve the other's param.
+  const namesOnly = $derived($page.url.searchParams.get("names") === "1");
+
+  function searchUrl(q: string, names: boolean): string {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (names) params.set("names", "1");
+    const qs = params.toString();
+    return qs ? "/search?" + qs : "/search";
+  }
+
   function onSearchInput() {
     const q = qInput.trim();
     const onSearch = $page.url.pathname === "/search";
     if (onSearch && q === ($page.url.searchParams.get("q") ?? "").trim()) return;
     // First transition from another route pushes one history entry into /search;
     // subsequent keystrokes replace it so history isn't polluted keystroke-by-keystroke.
-    void goto(q ? "/search?q=" + encodeURIComponent(q) : "/search", {
+    void goto(searchUrl(q, namesOnly), {
       keepFocus: true,
       noScroll: true,
       replaceState: onSearch,
+    });
+  }
+
+  function toggleNames() {
+    // Flip the mode, keep the current box text, and keep focus in the box so the "/"-then-type
+    // flow isn't interrupted. Replace history when already on /search (like a keystroke).
+    void goto(searchUrl(qInput.trim(), !namesOnly), {
+      keepFocus: true,
+      noScroll: true,
+      replaceState: $page.url.pathname === "/search",
     });
   }
 
@@ -135,9 +159,21 @@
       bind:value={qInput}
       oninput={onSearchInput}
       class="search"
-      placeholder="search title / file / instruments / comments / playlists    (press /)"
+      placeholder={namesOnly
+        ? "search title / file    (names only · press /)"
+        : "search title / file / instruments / comments / playlists    (press /)"}
       spellcheck="false"
     />
+    <button
+      class="rtoggle names"
+      class:on={namesOnly}
+      onclick={toggleNames}
+      title={namesOnly
+        ? "names only: matching title / filename. Click to also match instruments + comments."
+        : "matching title / file / instruments / comments. Click to restrict to names only."}
+    >
+      names only
+    </button>
     <span class="status">{ui.status}</span>
     <div class="rtoggles">
       <button

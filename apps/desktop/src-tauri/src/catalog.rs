@@ -684,6 +684,10 @@ pub enum CatalogReq {
         /// the last row the client already has). Omit for the first page. Cheaper than OFFSET
         /// over the Bitswap VFS — it skips straight to the next span instead of re-scanning.
         #[serde(default)] after: Option<i64>,
+        /// Restrict the match to title/filename only (the `names_fts` index) instead of the
+        /// full modules_fts (which also matches instruments + comment). The search box's
+        /// "names only" toggle sets this — discovery search off, known-module lookup on.
+        #[serde(default)] names: bool,
     },
     List {
         #[serde(default)] format: Option<String>,
@@ -712,7 +716,7 @@ pub async fn resolve_ipns_cid(rpc: &NodeRpc, name: &str) -> Result<Cid, String> 
 /// The first real keystroke then descends from warm nodes instead of paying the cold schema +
 /// FTS-root round-trips. Cheap (`LIMIT 1`, flat rowid). Best-effort — the caller ignores errors.
 pub async fn warm(rpc: NodeRpc, cid: Cid) -> Result<(), String> {
-    run_search_stream(rpc, cid, "the".to_string(), 1, None, |_| {}).await?;
+    run_search_stream(rpc, cid, "the".to_string(), 1, None, false, |_| {}).await?;
     Ok(())
 }
 
@@ -896,7 +900,7 @@ pub async fn run_search_parallel(
 
 fn dispatch(conn: &Connection, req: &CatalogReq) -> rusqlite::Result<Value> {
     match req {
-        CatalogReq::Search { q, limit, after } => search(conn, q, limit.unwrap_or(50), *after),
+        CatalogReq::Search { q, limit, after, names } => search(conn, q, limit.unwrap_or(50), *after, *names),
         CatalogReq::List { format, sort, limit, offset } => {
             list(conn, format.as_deref(), sort.as_deref(), limit.unwrap_or(100), offset.unwrap_or(0))
         }
@@ -930,11 +934,19 @@ fn collect(stmt: &mut rusqlite::Statement, params: &[&dyn rusqlite::ToSql]) -> r
     rows.collect()
 }
 
-fn search(conn: &Connection, query: &str, limit: i64, after: Option<i64>) -> rusqlite::Result<Value> {
+/// The FTS table a search matches against: the full index (title/filename/instruments/comment)
+/// or the names-only index (title/filename), per the "names only" toggle. Both carry the same
+/// rowid (`modules.id`), so the JOIN to `modules` and keyset pagination are identical either way.
+fn fts_table(names_only: bool) -> &'static str {
+    if names_only { "names_fts" } else { "modules_fts" }
+}
+
+fn search(conn: &Connection, query: &str, limit: i64, after: Option<i64>, names_only: bool) -> rusqlite::Result<Value> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(json!({ "results": [] }));
     }
+    let fts = fts_table(names_only);
     let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
     let matchstr = if explicit {
         q.to_string()
@@ -953,15 +965,15 @@ fn search(conn: &Connection, query: &str, limit: i64, after: Option<i64>) -> rus
     // shown instead of OFFSET re-scanning it over the VFS.
     let results = if let Some(a) = after {
         let sql = format!(
-            "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
-             WHERE modules_fts MATCH ?1 AND f.rowid > ?2 LIMIT ?3"
+            "SELECT {HIT_COLS} FROM {fts} f JOIN modules m ON m.id = f.rowid \
+             WHERE {fts} MATCH ?1 AND f.rowid > ?2 LIMIT ?3"
         );
         let mut stmt = conn.prepare(&sql)?;
         collect(&mut stmt, &[&matchstr as &dyn rusqlite::ToSql, &a, &limit])?
     } else {
         let sql = format!(
-            "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
-             WHERE modules_fts MATCH ?1 LIMIT ?2"
+            "SELECT {HIT_COLS} FROM {fts} f JOIN modules m ON m.id = f.rowid \
+             WHERE {fts} MATCH ?1 LIMIT ?2"
         );
         let mut stmt = conn.prepare(&sql)?;
         collect(&mut stmt, &[&matchstr as &dyn rusqlite::ToSql, &limit])?
@@ -980,6 +992,7 @@ pub async fn run_search_stream(
     q: String,
     limit: i64,
     after: Option<i64>,
+    names_only: bool,
     on_row: impl Fn(Value) + Send + 'static,
 ) -> Result<usize, String> {
     let rt = Handle::current();
@@ -996,7 +1009,7 @@ pub async fn run_search_stream(
             .map_err(|e| format!("open catalog {cid}: {e}"))?;
             conn.pragma_update(None, "query_only", true).ok();
             conn.pragma_update(None, "cache_size", -65536i64).ok();
-            search_stream(&conn, &q, limit, after, epoch, &on_row).map_err(|e| e.to_string())
+            search_stream(&conn, &q, limit, after, names_only, epoch, &on_row).map_err(|e| e.to_string())
         })();
         OPEN_CTX.with(|c| *c.borrow_mut() = None);
         result
@@ -1012,6 +1025,7 @@ fn search_stream(
     query: &str,
     limit: i64,
     after: Option<i64>,
+    names_only: bool,
     epoch: u64,
     on_row: &(dyn Fn(Value) + Send),
 ) -> rusqlite::Result<usize> {
@@ -1019,6 +1033,7 @@ fn search_stream(
     if q.is_empty() {
         return Ok(0);
     }
+    let fts = fts_table(names_only);
     let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
     let matchstr = if explicit {
         q.to_string()
@@ -1028,13 +1043,13 @@ fn search_stream(
     let cursor = after.unwrap_or(0);
     let sql = if after.is_some() {
         format!(
-            "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
-             WHERE modules_fts MATCH ?1 AND f.rowid > ?2 LIMIT ?3"
+            "SELECT {HIT_COLS} FROM {fts} f JOIN modules m ON m.id = f.rowid \
+             WHERE {fts} MATCH ?1 AND f.rowid > ?2 LIMIT ?3"
         )
     } else {
         format!(
-            "SELECT {HIT_COLS} FROM modules_fts f JOIN modules m ON m.id = f.rowid \
-             WHERE modules_fts MATCH ?1 LIMIT ?2"
+            "SELECT {HIT_COLS} FROM {fts} f JOIN modules m ON m.id = f.rowid \
+             WHERE {fts} MATCH ?1 LIMIT ?2"
         )
     };
     let params: Vec<&dyn rusqlite::ToSql> = if after.is_some() {

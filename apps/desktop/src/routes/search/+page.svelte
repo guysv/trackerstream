@@ -11,6 +11,10 @@
   import { ui } from "$lib/ui.svelte";
 
   const q = $derived(($page.url.searchParams.get("q") ?? "").trim());
+  // "names only" toggle (set in the header): restrict the match to title/filename via the
+  // names_fts index instead of also matching instrument + comment text. Carried in the URL like
+  // `q`, so it survives reload/back-forward and toggling it re-runs the search effect below.
+  const namesOnly = $derived($page.url.searchParams.get("names") === "1");
 
   let rows = $state<ModuleHit[]>([]);
   let plrows = $state<PlaylistMeta[]>([]);
@@ -50,6 +54,8 @@
   let reqSeq = 0;
   $effect(() => {
     const query = q;
+    // Capture the toggle as a dependency so flipping it re-runs the search with the same query.
+    const names = namesOnly;
     clearTimeout(timer);
     // Supersede the last op: invalidate its result (reqSeq) AND abort its in-flight fetch so
     // tsnode stops pulling pages for a search we've typed past (or cleared).
@@ -88,7 +94,7 @@
         ui.status = `${rows.length}${rows.length >= PAGE ? "+" : ""} track${rows.length === 1 ? "" : "s"}…`;
       };
       try {
-        const [count, pl] = await Promise.all([searchStream(query, PAGE, undefined, onRow), plSearch(query)]);
+        const [count, pl] = await Promise.all([searchStream(query, PAGE, undefined, onRow, names), plSearch(query)]);
         if (myReq !== reqSeq) return;
         if (count === 0) {
           rows = []; // query matched nothing → clear the stale rows we kept on screen
@@ -117,7 +123,7 @@
       // Stream-append the next chunk; each hit shows the moment its pages arrive.
       const count = await searchStream(q, PAGE, cursor, (hit) => {
         if (myReq === reqSeq) rows.push(hit);
-      });
+      }, namesOnly);
       if (myReq !== reqSeq) return; // superseded by a newer query
       if (count < PAGE) done = true;
       ui.status = `${rows.length}${done ? "" : "+"} tracks · ${plrows.length} playlist${plrows.length === 1 ? "" : "s"}`;
