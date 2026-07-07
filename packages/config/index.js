@@ -66,3 +66,10 @@ export const STUN_ENDPOINT = `${MASTER_HOST}:${STUN_PORT}`;
 // it MUST be the base58 (`b58mh`) form, matching what the ingest stores it under.
 // Empty -> the client catalog-over-IPNS path stays dormant (HTTP /catalog still works).
 export const CATALOG_IPNS_KEY = "12D3KooWDb53qFZvANj5kDCr3riMhT2HJG32i5xqFKhvBtzh7wPC";
+
+// IPNS name the master publishes the PER-PAGE-ZSTD (TSZCAT) catalog under (`key gen catalog-z`,
+// ingest with ZSTD_CATALOG=1 prints the PeerId). A client that has the zstd VFS decoder resolves
+// THIS first and falls back to CATALOG_IPNS_KEY (raw SQLite) if empty/unresolvable — so the
+// rollout is a soft migration (no client breaks; the raw catalog is always published in parallel).
+// Empty -> clients use the raw catalog only.
+export const CATALOG_Z_IPNS_KEY = "";

@@ -3,7 +3,8 @@
 // kubo node (shared chunks stored once) -> libopenmpt metadata -> SQLite/FTS5
 // catalog row carrying the root CID. Incremental + re-runnable (skips by source).
 import { createHash } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { constants as zlibConstants, zstdCompressSync } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
 import { buildDagV2, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
 import { CATALOG_IPNS_KEY } from "@trackerstream/config";
@@ -314,11 +315,88 @@ async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
     } else if (CATALOG_IPNS_KEY !== peerId) {
       console.error(`  !! config CATALOG_IPNS_KEY (${CATALOG_IPNS_KEY}) != master key (${peerId}); clients will resolve the wrong name`);
     }
+    // Optional dual-publish: also emit the per-page-zstd (TSZCAT) catalog under the `catalog-z`
+    // key for clients that prefer it (~2.2x fewer page bytes over the Bitswap VFS; lab 1.71x on a
+    // full session). Env-gated (ZSTD_CATALOG=1) so routine ingests stay unaffected until rollout.
+    // Uses the SAME snapshot (still on disk here) — the raw catalog above is always published, so
+    // this never risks the live path; a zstd failure just logs.
+    if (/^(1|true|yes)$/i.test(process.env.ZSTD_CATALOG ?? "")) {
+      try {
+        await publishZstdCatalog(rpc, snapshot);
+      } catch (e) {
+        console.error(`catalog(zstd) publish failed (raw catalog is live): ${e}`);
+      }
+    }
   } finally {
     try {
       unlinkSync(snapshot);
     } catch {
       /* snapshot already gone -> fine */
+    }
+  }
+}
+
+const CATALOG_Z_KEY_NAME = "catalog-z"; // keystore key for the per-page-zstd catalog record
+const TSZCAT_PAGE = 16384; // must equal the SQLite page_size (each page = one zstd block)
+const TSZCAT_LEVEL = 19; // one-time offline compression; client decode is fast at any level
+
+/** Build + publish the TSZCAT per-page-zstd catalog from a consistent snapshot. Each 16 KB SQLite
+ *  page is zstd-compressed into its OWN raw block (batched `block/put-many`); a binary manifest
+ *  ([magic][page_size][page_count][page_count × 36-byte CIDv1]) lists them and is the published
+ *  root under `catalog-z`. The client fetches the manifest once then `block/get`s + decompresses
+ *  each page it reads — so lazy paging is preserved while the wire carries ~2.2x fewer page bytes.
+ *  Page blocks are pinned (in parallel batches) so repo GC can't drop them. */
+async function publishZstdCatalog(rpc: KuboRpc, snapshot: string): Promise<void> {
+  const raw = readFileSync(snapshot);
+  if (raw.length % TSZCAT_PAGE !== 0) throw new Error(`snapshot not page-aligned: ${raw.length}`);
+  const n = raw.length / TSZCAT_PAGE;
+  const cids = [];
+  const BATCH = 512;
+  for (let i = 0; i < n; i += BATCH) {
+    const entries = [];
+    for (let p = i; p < Math.min(i + BATCH, n); p++) {
+      const comp = zstdCompressSync(raw.subarray(p * TSZCAT_PAGE, (p + 1) * TSZCAT_PAGE), {
+        params: { [zlibConstants.ZSTD_c_compressionLevel]: TSZCAT_LEVEL },
+      });
+      entries.push({ bytes: comp, codec: 0x55 }); // raw block
+    }
+    cids.push(...(await rpc.blockPutMany(entries)));
+  }
+  if (cids.length !== n) throw new Error(`page cid count ${cids.length} != ${n}`);
+  const man = Buffer.alloc(16 + 36 * n);
+  Buffer.from("TSZCAT1\n", "latin1").copy(man, 0);
+  man.writeUInt32LE(TSZCAT_PAGE, 8);
+  man.writeUInt32LE(n, 12);
+  cids.forEach((cid, i) => {
+    const b = cid.bytes;
+    if (b.length !== 36) throw new Error(`page cid ${i} is ${b.length}B, expected 36 (CIDv1 raw sha2-256)`);
+    Buffer.from(b).copy(man, 16 + i * 36);
+  });
+  const manPath = `${snapshot}.tszcat`;
+  writeFileSync(manPath, man);
+  try {
+    const manCid = await rpc.addFile(manPath, {
+      chunker: CATALOG_CHUNKER, rawLeaves: false, cidVersion: 1, pin: true,
+    });
+    // Pin the page blocks (they're referenced by the manifest BYTES, not as DAG links, so the
+    // manifest's recursive pin doesn't cover them) — in parallel batches to bound RPC round-trips.
+    for (let i = 0; i < cids.length; i += 64) {
+      await Promise.all(cids.slice(i, i + 64).map((c) => rpc.pinAdd(c, false)));
+    }
+    const peerId = await rpc.keyGen(CATALOG_Z_KEY_NAME);
+    await rpc.namePublish(manCid, { key: CATALOG_Z_KEY_NAME, lifetime: CATALOG_LIFETIME });
+    console.log(
+      `catalog(zstd) published: cid=${manCid} ipns=${peerId} ` +
+        `(${n} pages, manifest ${(man.length / 1e6).toFixed(2)} MB)`,
+    );
+    if (peerId !== process.env.CATALOG_Z_IPNS_KEY_EXPECT) {
+      console.log(`  -> set CATALOG_Z_IPNS_KEY="${peerId}" in packages/config and ship a client build`);
+    }
+  } finally {
+    try {
+      unlinkSync(manPath);
+    } catch {
+      /* already gone -> fine */
     }
   }
 }

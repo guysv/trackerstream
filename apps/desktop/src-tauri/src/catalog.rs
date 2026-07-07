@@ -186,6 +186,24 @@ fn size_cache() -> &'static Mutex<HashMap<Cid, u64>> {
     SIZES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// ---------------------------------------------------------------------------------
+// TSZCAT — per-page-zstd catalog manifest. The root CID is NOT a raw SQLite file but a
+// small manifest listing one block CID per (zstd-compressed) 16 KB SQLite page. The client
+// fetches the manifest once, then `block/get`s + decompresses each page it needs — so the
+// wire carries ~2.2x fewer bytes while lazy paging is fully preserved (each page is still an
+// independent content-addressed fetch). Layout: [magic 8][page_size u32 LE][page_count u32 LE]
+// [page_count × 36-byte CIDv1(raw, sha2-256)]. A raw-SQLite root (legacy) is detected by its
+// "SQLite format 3\0" magic and served the original way — so one client reads both formats.
+const TSZCAT_MAGIC: &[u8; 8] = b"TSZCAT1\n";
+const CID_LEN: usize = 36; // CIDv1 raw sha2-256: 0x01 0x55 0x12 0x20 + 32-byte digest
+
+/// Parsed manifest: the logical page size and the per-page block CIDs, keyed by root CID so a
+/// re-open of the same catalog reuses it (immutable — content addressed).
+fn manifest_cache() -> &'static Mutex<HashMap<Cid, Arc<(u64, Vec<Cid>)>>> {
+    static M: OnceLock<Mutex<HashMap<Cid, Arc<(u64, Vec<Cid>)>>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Drop every cached page (test hook). The fetch-byte benchmark calls this before each measured
 /// term so it reports true fresh-client cost — otherwise the shared cache would (correctly) show
 /// a re-queried client pulling far less than a cold one.
@@ -197,6 +215,7 @@ pub fn clear_page_cache() {
 /// lets the A1 bench measure a truly cold first query rather than reusing an earlier probe.
 pub fn clear_size_cache() {
     size_cache().lock().unwrap().clear();
+    manifest_cache().lock().unwrap().clear();
 }
 
 #[derive(Default)]
@@ -218,6 +237,9 @@ struct CatalogFile {
     epoch: u64,
     lock: LockKind,
     cache: Mutex<Cache>,
+    /// `Some` iff this is a TSZCAT per-page-zstd catalog: `(page_size, page_block_cids)`.
+    /// Then reads go via `read_zstd` (block/get + decompress per page) instead of ranged cat.
+    manifest: Option<Arc<(u64, Vec<Cid>)>>,
 }
 
 impl CatalogFile {
@@ -337,6 +359,127 @@ impl CatalogFile {
         }
         Ok(())
     }
+
+    // ----- TSZCAT (per-page-zstd) read path ---------------------------------------
+    /// Ensure logical pages `[first, last]` are decompressed into the shared page cache (keyed by
+    /// each page's own block CID). Missing pages' COMPRESSED blocks are `block/get`'d concurrently
+    /// and zstd-decompressed; a forward scan prefetches ahead like `ensure_chunks`. `FETCHED_BYTES`
+    /// counts the compressed wire bytes — the win. Racing the cancel epoch, same as `ensure_chunks`.
+    fn ensure_pages(&self, first: u64, last: u64) -> io::Result<()> {
+        if self.cancelled() {
+            return Err(cancelled_err());
+        }
+        let (page_size, pages) = {
+            let m = self.manifest.as_ref().expect("ensure_pages on a raw catalog");
+            (m.0, m.1.clone())
+        };
+        let last_page = (pages.len() as u64).saturating_sub(1);
+        let seq_run = self.cache.lock().unwrap().seq_run;
+        let missing: Vec<u64> = {
+            let pc = page_cache().lock().unwrap();
+            if (first..=last).all(|p| pc.contains(&(pages[p as usize], 0))) {
+                return Ok(());
+            }
+            let hi = if seq_run >= PREFETCH_MIN_RUN {
+                (last + PREFETCH_CHUNKS).min(last_page)
+            } else {
+                last
+            };
+            (first..=hi).filter(|p| !pc.contains(&(pages[*p as usize], 0))).collect()
+        };
+        let rpc = self.rpc.clone();
+        let epoch = self.epoch;
+        let want: Vec<(u64, Cid)> = missing.iter().map(|&p| (p, pages[p as usize])).collect();
+        let fetched: Option<Vec<io::Result<(u64, Vec<u8>)>>> = self.rt.block_on(async move {
+            use futures::StreamExt;
+            let fetch = futures::stream::iter(want.into_iter().map(|(p, pcid)| {
+                let rpc = rpc.clone();
+                async move {
+                    if CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                        return Err(cancelled_err());
+                    }
+                    let comp = rpc.block_get(&pcid.to_string()).await
+                        .map_err(|e| io::Error::other(format!("block/get page {p} of {pcid}: {e}")))?;
+                    FETCHED_BYTES.fetch_add(comp.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let page = zstd::bulk::decompress(&comp, page_size as usize)
+                        .map_err(|e| io::Error::other(format!("zstd decompress page {p}: {e}")))?;
+                    Ok((p, page))
+                }
+            }))
+            .buffer_unordered(FETCH_CONCURRENCY)
+            .collect::<Vec<_>>();
+            tokio::pin!(fetch);
+            let cancel = async move {
+                while CANCEL_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::pin!(cancel);
+            tokio::select! {
+                biased;
+                _ = &mut cancel => None,
+                v = &mut fetch => Some(v),
+            }
+        });
+        let fetched = fetched.ok_or_else(cancelled_err)?;
+        if !missing.is_empty() {
+            FETCH_WAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            CAT_CALLS.fetch_add(missing.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut pc = page_cache().lock().unwrap();
+        for r in fetched {
+            let (p, page) = r?;
+            let k = (pages[p as usize], 0u64);
+            if !pc.contains(&k) {
+                pc.put(k, Arc::new(page));
+            }
+        }
+        Ok(())
+    }
+
+    /// Serve a read from a TSZCAT catalog: the logical byte range maps to whole 16 KB pages, each
+    /// decompressed and cached by its block CID. Mirrors the raw `read_exact_at` assembly.
+    fn read_zstd(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        let end = offset + buf.len() as u64;
+        if end > self.size {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "read past EOF"));
+        }
+        let page_size = self.manifest.as_ref().unwrap().0;
+        let first = offset / page_size;
+        let last = (end - 1) / page_size;
+        {
+            let mut cache = self.cache.lock().unwrap();
+            let advancing = cache.last_end.is_some_and(|le| first == le || first == le + 1);
+            cache.seq_run = if advancing { cache.seq_run.saturating_add(1) } else { 0 };
+        }
+        self.ensure_pages(first, last)?;
+        let pages = self.manifest.as_ref().unwrap().1.clone();
+        let served: Vec<(u64, Arc<Vec<u8>>)> = {
+            let mut pc = page_cache().lock().unwrap();
+            (first..=last)
+                .map(|p| {
+                    pc.get(&(pages[p as usize], 0))
+                        .map(|a| (p, a))
+                        .ok_or_else(|| io::Error::other("page missing after fetch"))
+                })
+                .collect::<io::Result<_>>()?
+        };
+        for (p, page) in &served {
+            let pstart = p * page_size;
+            let avail_end = pstart + page.len() as u64;
+            let seg_start = offset.max(pstart);
+            let seg_end = end.min(avail_end);
+            if seg_end <= seg_start {
+                continue;
+            }
+            let from = (seg_start - pstart) as usize;
+            let to = (seg_end - pstart) as usize;
+            let dst = (seg_start - offset) as usize;
+            buf[dst..dst + (to - from)].copy_from_slice(&page[from..to]);
+        }
+        self.cache.lock().unwrap().last_end = Some(last);
+        Ok(())
+    }
 }
 
 impl DatabaseHandle for CatalogFile {
@@ -349,6 +492,9 @@ impl DatabaseHandle for CatalogFile {
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         if buf.is_empty() {
             return Ok(());
+        }
+        if self.manifest.is_some() {
+            return self.read_zstd(buf, offset);
         }
         let end = offset + buf.len() as u64;
         if end > self.size {
@@ -436,45 +582,58 @@ impl Vfs for IpfsVfs {
         let ctx = OPEN_CTX
             .with(|c| c.borrow().clone())
             .ok_or_else(|| io::Error::other("catalog VFS opened with no query context"))?;
-        // Reuse the cached size for this CID if a prior open already probed the header — so the
-        // concurrent gather's many opens (and every repeat query) skip the header round-trip.
-        let cached = size_cache().lock().unwrap().get(&ctx.cid).copied();
-        let size = if let Some(sz) = cached {
-            sz
-        } else {
-            // Probe the SQLite header for the exact file size (page_size * page_count) so
-            // xFileSize doesn't have to fetch the whole DAG.
-            let probe = CatalogFile {
-                rpc: ctx.rpc.clone(),
-                rt: ctx.rt.clone(),
-                cid: ctx.cid,
-                size: u64::MAX,
-                epoch: ctx.epoch,
-                lock: LockKind::None,
-                cache: Mutex::new(Cache::default()),
-            };
-            let hdr = probe.fetch_range(0, 100)?;
-            if hdr.len() < 100 || &hdr[0..16] != b"SQLite format 3\0" {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "not a sqlite db"));
-            }
-            let page_size = match u16::from_be_bytes([hdr[16], hdr[17]]) {
-                1 => 65536u64,
-                v => v as u64,
-            };
-            let page_count = u32::from_be_bytes([hdr[28], hdr[29], hdr[30], hdr[31]]) as u64;
-            let sz = page_size * page_count;
-            size_cache().lock().unwrap().insert(ctx.cid, sz);
-            sz
-        };
-        Ok(CatalogFile {
-            rpc: ctx.rpc,
-            rt: ctx.rt,
+        let mk = |size: u64, manifest: Option<Arc<(u64, Vec<Cid>)>>| CatalogFile {
+            rpc: ctx.rpc.clone(),
+            rt: ctx.rt.clone(),
             cid: ctx.cid,
             size,
             epoch: ctx.epoch,
             lock: LockKind::None,
             cache: Mutex::new(Cache::default()),
-        })
+            manifest,
+        };
+        // Fast paths: a prior open already resolved this CID's format (manifest or raw size).
+        if let Some(m) = manifest_cache().lock().unwrap().get(&ctx.cid).cloned() {
+            return Ok(mk(m.0 * m.1.len() as u64, Some(m)));
+        }
+        if let Some(sz) = size_cache().lock().unwrap().get(&ctx.cid).copied() {
+            return Ok(mk(sz, None));
+        }
+        // Cold: probe the first bytes to tell a TSZCAT per-page-zstd manifest from a raw SQLite
+        // image, so xFileSize et al. don't fetch the whole DAG.
+        let probe = mk(u64::MAX, None);
+        let head = probe.fetch_range(0, 100)?;
+        if head.len() >= 16 && &head[0..8] == TSZCAT_MAGIC {
+            let page_size = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as u64;
+            let page_count = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as u64;
+            let man_len = 16 + CID_LEN as u64 * page_count;
+            let man = probe.fetch_range(0, man_len)?;
+            if (man.len() as u64) < man_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated TSZCAT manifest"));
+            }
+            let mut pages = Vec::with_capacity(page_count as usize);
+            for i in 0..page_count as usize {
+                let off = 16 + i * CID_LEN;
+                let cid = Cid::try_from(&man[off..off + CID_LEN]).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad page cid {i}: {e}"))
+                })?;
+                pages.push(cid);
+            }
+            let m = Arc::new((page_size, pages));
+            manifest_cache().lock().unwrap().insert(ctx.cid, m.clone());
+            return Ok(mk(page_size * page_count, Some(m)));
+        }
+        if head.len() < 100 || &head[0..16] != b"SQLite format 3\0" {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a sqlite db or TSZCAT manifest"));
+        }
+        let page_size = match u16::from_be_bytes([head[16], head[17]]) {
+            1 => 65536u64,
+            v => v as u64,
+        };
+        let page_count = u32::from_be_bytes([head[28], head[29], head[30], head[31]]) as u64;
+        let sz = page_size * page_count;
+        size_cache().lock().unwrap().insert(ctx.cid, sz);
+        Ok(mk(sz, None))
     }
 
     fn delete(&self, _db: &str) -> io::Result<()> {
