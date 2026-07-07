@@ -1,7 +1,11 @@
 # TSZCAT — per-page-zstd catalog (traffic reduction over the Bitswap VFS)
 
-**Status:** built + lab-validated on `attempt/catalog-4x-seed-2`; **not yet flipped on prod.**
-The raw SQLite catalog is untouched and remains the default. See [[catalog-packing-lab]].
+**Status:** LIVE on prod (2026-07-07 hard cut — no clients in the wild). The `catalog` IPNS key
+now resolves to a TSZCAT manifest; the raw SQLite catalog was replaced. Live CID
+`bafybeihf364mqgbent3ewy3akitoyuswqyaxr5zcrgvjkq6ovje4x4twqa`. Rollback anchor (raw detail=none,
+still pinned) `bafybeigweozn6frfdd4nkymzbkoe2aur3odat5n3dq2xev6p5p7uipqlv4`. WAN-measured
+steady-state **2.2–2.35×** page-traffic reduction (first query pays the 0.61 MB manifest once),
+waves unchanged, all searches return correct results. See CATALOG_ZSTD.md#deployed below.
 
 ## What it is
 
@@ -11,7 +15,7 @@ fetches **whole blocks**, so plain zstd of the file saves nothing on the wire �
 still lives inside a full 16 KB leaf. TSZCAT fixes that: **each 16 KB page is zstd-compressed into
 its own block**, and a small manifest lists the page block CIDs.
 
-**Format** (the published root under `catalog-z`):
+**Format** (the published catalog root):
 ```
 [8]  magic "TSZCAT1\n"
 [4]  page_size  u32 LE   (16384)
@@ -34,31 +38,37 @@ formats.** Lazy paging, prefetch, page cache, cancel — all preserved.
 
 ## Components
 
-- **Producer** — `publishZstdCatalog` in `apps/server/src/ingest.ts`, dual-published from
-  `publishCatalog` when **`ZSTD_CATALOG=1`** (env-gated; dormant otherwise). zstd each page →
-  `block/put-many` (batched) → manifest → `addFile` → **pin page blocks** → `namePublish` under
-  keystore key `catalog-z`. The raw catalog is ALWAYS published too, so this never risks the live
-  path (a zstd failure just logs).
-- **Config** — `CATALOG_Z_IPNS_KEY` in `packages/config/index.js` (empty = dormant).
-- **Client preference** — `apps/desktop/src/lib/catalog.ts` resolves `CATALOG_Z_IPNS_KEY ||
-  CATALOG_IPNS_KEY`. Empty → raw; set → zstd.
+- **Producer** — `publishZstdCatalog(rpc, snapshot, keyName)` in `apps/server/src/ingest.ts`.
+  `publishCatalog` branches on **`ZSTD_CATALOG=1`**: publish the zstd manifest under the main
+  `CATALOG_KEY_NAME` (the hard cut), else the raw SQLite. zstd each page → `block/put-many`
+  (batched) → manifest → `addFile` → **pin page blocks** → `namePublish`.
+- **Client** — `apps/desktop/src-tauri/src/catalog.rs` VFS auto-detects raw vs TSZCAT by the root
+  magic, so no client key change is needed. `CATALOG_Z_IPNS_KEY` (config) + the frontend `||`
+  fallback are vestigial after the hard cut (empty key → main key → zstd); harmless, left in place.
 
-## Rollout — soft migration (NO client breaks)
+## Deployed — HARD CUT (2026-07-07)
 
-The raw catalog under `catalog` keeps being published in parallel, so old clients never break and
-rollback is instant.
+No clients in the wild, so we published TSZCAT under the MAIN `catalog` key (not a second key) and
+dropped the raw publish. `publishCatalog` branches on `ZSTD_CATALOG=1`: zstd manifest under
+`CATALOG_KEY_NAME`, else raw. The `CATALOG_Z_IPNS_KEY` config + frontend `|| ` fallback are now
+vestigial (empty key → main key → the client's VFS auto-detects TSZCAT); harmless, left in place.
 
-1. **Master, one-time:** run one ingest with `ZSTD_CATALOG=1` (as root, server.env). It generates
-   the `catalog-z` key (idempotent `keyGen`), publishes the manifest, and **logs the PeerId**.
-2. Paste that PeerId into `CATALOG_Z_IPNS_KEY` in `packages/config/index.js`.
-3. Set `ZSTD_CATALOG=1` permanently in `/etc/trackerstream/server.env` so every ingest
-   dual-publishes (raw + zstd).
-4. **Ship a client build** (this branch): it has the VFS decoder and prefers `catalog-z`. New
-   clients get ~1.7–2.2× less catalog traffic; clients on the old build keep using `catalog` (raw).
-5. (Later, optional) once adoption is high, stop the raw publish. Keeping both is cheap insurance.
+What was done on prod:
+1. Deployed `apps/server/src/ingest.ts` to `/opt/trackerstream` (catalog.ts detail=none already live).
+2. `ZSTD_CATALOG=1` added to `/etc/trackerstream/server.env` so routine (timer) ingests keep
+   publishing zstd instead of reverting to raw.
+3. `REINDEX_FTS=1 ZSTD_CATALOG=1` ingest (as root) → republished `catalog` as the TSZCAT manifest;
+   IPNS verified → manifest, magic `TSZCAT1`, timer re-armed.
 
-**Rollback:** clear `CATALOG_Z_IPNS_KEY` (clients fall back to raw) or unset `ZSTD_CATALOG`. The
-raw catalog is always live.
+**Rollback:** re-run `REINDEX_FTS=1` WITHOUT `ZSTD_CATALOG` (remove it from server.env) → republishes
+the raw detail=none catalog under `catalog`. The rollback-anchor raw CID is still pinned; DB backup
+`catalog.db.bak-pre-detailnone-*`, prod ingest.ts backup `/tmp/ingest.ts.bak-prezstd`.
+
+## Follow-ups
+
+- **Cold ms rose** vs raw (block/get-per-page has more per-call overhead than a ranged `cat` DAG
+  walk; waves are unchanged so it's not extra round-trips). Traffic-only change and latency is
+  `detail=none`'s domain, but worth a `block/get-many` batch RPC on tsnode + client to close it.
 
 ## Caveats / follow-ups
 

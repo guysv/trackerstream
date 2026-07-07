@@ -291,40 +291,35 @@ async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
   src.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
   src.close();
   try {
-    const cid = await rpc.addFile(snapshot, {
-      chunker: CATALOG_CHUNKER,
-      rawLeaves: false, // dag-pb leaves — rust-unixfs can't walk raw leaves (see above)
-      cidVersion: 1,
-      pin: true,
-    });
-    const peerId = await rpc.keyGen(CATALOG_KEY_NAME); // idempotent; base58 PeerId
-    await rpc.namePublish(cid, { key: CATALOG_KEY_NAME, lifetime: CATALOG_LIFETIME });
-    // namePublish already signed + stored + distributed the record (DHT PutValue +
-    // gossipsub, allow-offline) — the publish is done HERE. The routingGet below is only a
-    // read-back verify, so a transient RPC flake there must NOT be reported as a publish
-    // failure (it previously threw `fetch failed` after the record had already landed).
-    console.log(`catalog published: cid=${cid} ipns=${peerId}`);
-    try {
-      const record = await rpc.routingGet(peerId);
-      if (!record) console.error(`  !! publish verify: routingGet(${peerId}) returned no record (may still be propagating)`);
-    } catch (e) {
-      console.error(`  publish verify skipped (transient, record already signed+stored): ${e}`);
-    }
-    if (!CATALOG_IPNS_KEY) {
-      console.log(`  -> set CATALOG_IPNS_KEY="${peerId}" in packages/config and ship a client build`);
-    } else if (CATALOG_IPNS_KEY !== peerId) {
-      console.error(`  !! config CATALOG_IPNS_KEY (${CATALOG_IPNS_KEY}) != master key (${peerId}); clients will resolve the wrong name`);
-    }
-    // Optional dual-publish: also emit the per-page-zstd (TSZCAT) catalog under the `catalog-z`
-    // key for clients that prefer it (~2.2x fewer page bytes over the Bitswap VFS; lab 1.71x on a
-    // full session). Env-gated (ZSTD_CATALOG=1) so routine ingests stay unaffected until rollout.
-    // Uses the SAME snapshot (still on disk here) — the raw catalog above is always published, so
-    // this never risks the live path; a zstd failure just logs.
     if (/^(1|true|yes)$/i.test(process.env.ZSTD_CATALOG ?? "")) {
+      // HARD CUT: the per-page-zstd (TSZCAT) manifest IS the published catalog, under the main
+      // `catalog` key — ~2.2x fewer page bytes over the Bitswap VFS. The client VFS auto-detects
+      // raw-SQLite vs TSZCAT by the root magic, so no key/config change is needed to read it.
+      await publishZstdCatalog(rpc, snapshot, CATALOG_KEY_NAME);
+    } else {
+      const cid = await rpc.addFile(snapshot, {
+        chunker: CATALOG_CHUNKER,
+        rawLeaves: false, // dag-pb leaves — rust-unixfs can't walk raw leaves (see above)
+        cidVersion: 1,
+        pin: true,
+      });
+      const peerId = await rpc.keyGen(CATALOG_KEY_NAME); // idempotent; base58 PeerId
+      await rpc.namePublish(cid, { key: CATALOG_KEY_NAME, lifetime: CATALOG_LIFETIME });
+      // namePublish already signed + stored + distributed the record (DHT PutValue +
+      // gossipsub, allow-offline) — the publish is done HERE. The routingGet below is only a
+      // read-back verify, so a transient RPC flake there must NOT be reported as a publish
+      // failure (it previously threw `fetch failed` after the record had already landed).
+      console.log(`catalog published: cid=${cid} ipns=${peerId}`);
       try {
-        await publishZstdCatalog(rpc, snapshot);
+        const record = await rpc.routingGet(peerId);
+        if (!record) console.error(`  !! publish verify: routingGet(${peerId}) returned no record (may still be propagating)`);
       } catch (e) {
-        console.error(`catalog(zstd) publish failed (raw catalog is live): ${e}`);
+        console.error(`  publish verify skipped (transient, record already signed+stored): ${e}`);
+      }
+      if (!CATALOG_IPNS_KEY) {
+        console.log(`  -> set CATALOG_IPNS_KEY="${peerId}" in packages/config and ship a client build`);
+      } else if (CATALOG_IPNS_KEY !== peerId) {
+        console.error(`  !! config CATALOG_IPNS_KEY (${CATALOG_IPNS_KEY}) != master key (${peerId}); clients will resolve the wrong name`);
       }
     }
   } finally {
@@ -336,17 +331,16 @@ async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
   }
 }
 
-const CATALOG_Z_KEY_NAME = "catalog-z"; // keystore key for the per-page-zstd catalog record
 const TSZCAT_PAGE = 16384; // must equal the SQLite page_size (each page = one zstd block)
 const TSZCAT_LEVEL = 19; // one-time offline compression; client decode is fast at any level
 
-/** Build + publish the TSZCAT per-page-zstd catalog from a consistent snapshot. Each 16 KB SQLite
- *  page is zstd-compressed into its OWN raw block (batched `block/put-many`); a binary manifest
- *  ([magic][page_size][page_count][page_count × 36-byte CIDv1]) lists them and is the published
- *  root under `catalog-z`. The client fetches the manifest once then `block/get`s + decompresses
- *  each page it reads — so lazy paging is preserved while the wire carries ~2.2x fewer page bytes.
- *  Page blocks are pinned (in parallel batches) so repo GC can't drop them. */
-async function publishZstdCatalog(rpc: KuboRpc, snapshot: string): Promise<void> {
+/** Build + publish the TSZCAT per-page-zstd catalog from a consistent snapshot, under `keyName`.
+ *  Each 16 KB SQLite page is zstd-compressed into its OWN raw block (batched `block/put-many`); a
+ *  binary manifest ([magic][page_size][page_count][page_count × 36-byte CIDv1]) lists them and is
+ *  the published root. The client fetches the manifest once then `block/get`s + decompresses each
+ *  page it reads — so lazy paging is preserved while the wire carries ~2.2x fewer page bytes. Page
+ *  blocks are pinned (in parallel batches) so repo GC can't drop them. */
+async function publishZstdCatalog(rpc: KuboRpc, snapshot: string, keyName: string): Promise<void> {
   const raw = readFileSync(snapshot);
   if (raw.length % TSZCAT_PAGE !== 0) throw new Error(`snapshot not page-aligned: ${raw.length}`);
   const n = raw.length / TSZCAT_PAGE;
@@ -383,14 +377,14 @@ async function publishZstdCatalog(rpc: KuboRpc, snapshot: string): Promise<void>
     for (let i = 0; i < cids.length; i += 64) {
       await Promise.all(cids.slice(i, i + 64).map((c) => rpc.pinAdd(c, false)));
     }
-    const peerId = await rpc.keyGen(CATALOG_Z_KEY_NAME);
-    await rpc.namePublish(manCid, { key: CATALOG_Z_KEY_NAME, lifetime: CATALOG_LIFETIME });
+    const peerId = await rpc.keyGen(keyName);
+    await rpc.namePublish(manCid, { key: keyName, lifetime: CATALOG_LIFETIME });
     console.log(
       `catalog(zstd) published: cid=${manCid} ipns=${peerId} ` +
         `(${n} pages, manifest ${(man.length / 1e6).toFixed(2)} MB)`,
     );
-    if (peerId !== process.env.CATALOG_Z_IPNS_KEY_EXPECT) {
-      console.log(`  -> set CATALOG_Z_IPNS_KEY="${peerId}" in packages/config and ship a client build`);
+    if (keyName === CATALOG_KEY_NAME && CATALOG_IPNS_KEY && CATALOG_IPNS_KEY !== peerId) {
+      console.error(`  !! config CATALOG_IPNS_KEY (${CATALOG_IPNS_KEY}) != master key (${peerId})`);
     }
   } finally {
     try {
