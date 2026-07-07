@@ -4,7 +4,12 @@
 // catalog needs no HTTP control plane. Module *bytes* never come from here either;
 // results carry a root CID the data plane resolves P2P.
 import { invoke, Channel } from "@tauri-apps/api/core";
-import { CATALOG_IPNS_KEY } from "@trackerstream/config";
+import { CATALOG_IPNS_KEY, CATALOG_Z_IPNS_KEY } from "@trackerstream/config";
+
+// Prefer the per-page-zstd catalog (TSZCAT) when the master publishes one, else the raw SQLite.
+// This build's VFS auto-detects the format from the resolved root, so a single `name` works for
+// both — the choice is purely which IPNS record we resolve. Empty CATALOG_Z_IPNS_KEY -> raw.
+const CATALOG_NAME = CATALOG_Z_IPNS_KEY || CATALOG_IPNS_KEY;
 
 export interface ModuleHit {
   id: number;
@@ -37,7 +42,7 @@ export interface FormatCount {
 // to the current DB CID (local cache -> tracker -> peer-pull) and runs the query over
 // the Bitswap VFS, returning the same JSON shapes the old HTTP /catalog API did.
 function query<T>(req: Record<string, unknown>): Promise<T> {
-  return invoke<T>("catalog_query", { name: CATALOG_IPNS_KEY, req });
+  return invoke<T>("catalog_query", { name: CATALOG_NAME, req });
 }
 
 // `after` is a keyset cursor: the id of the last hit already shown. Pass it to fetch the
@@ -56,7 +61,7 @@ export function searchStream(
 ): Promise<number> {
   const ch = new Channel<ModuleHit>();
   ch.onmessage = onRow;
-  return invoke<number>("catalog_search_stream", { name: CATALOG_IPNS_KEY, q, limit, after, onRow: ch });
+  return invoke<number>("catalog_search_stream", { name: CATALOG_NAME, q, limit, after, onRow: ch });
 }
 
 // Abort any in-flight catalog query (the last search): its VFS page reads stop and the
@@ -66,7 +71,7 @@ export const cancelSearch = (): Promise<void> => invoke("catalog_cancel");
 // Prewarm the catalog page cache (schema + FTS upper tree) so the first keystroke's search
 // descends from warm pages instead of paying the cold schema/FTS-root fetches. Fire-and-forget
 // on search-page mount; best-effort (a failure just means the first search pays the cold cost).
-export const warmCatalog = (): Promise<void> => invoke("catalog_warm", { name: CATALOG_IPNS_KEY });
+export const warmCatalog = (): Promise<void> => invoke("catalog_warm", { name: CATALOG_NAME });
 
 export const listModules = (opts: {
   format?: string;

@@ -71,4 +71,6 @@ rand = "0.9"
 # two unify to a single sqlite (lab spike `scratchpad/lab/vfs_spike` proved the link).
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 sqlite-vfs = "0.2.0"
+# Decompresses per-page-zstd catalogs (the TSZCAT manifest format) over the Bitswap VFS.
+zstd = "0.13"
 
