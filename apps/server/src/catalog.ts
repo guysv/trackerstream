@@ -20,6 +20,7 @@ export interface ModuleRow {
   instruments: string; // instrument + sample names, space-joined
   comment: string;
   md5: string; // lowercase-hex md5 of the raw module file (TMA/ModArchive join key)
+  genreId?: number | null; // TMA genre id (via md5 join); null when the corpus file isn't genred
 }
 
 export class Catalog {
@@ -59,20 +60,22 @@ export class Catalog {
         instruments TEXT,
         comment TEXT,
         md5 TEXT,
+        genreid INTEGER,
         ingested_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_modules_format ON modules(format);
       CREATE INDEX IF NOT EXISTS idx_modules_root ON modules(root_cid);
-      -- Covering indexes for the three browse orders (list()): every browse column
-      -- lives in the index so a listing is index-only — no table scan. Lab: collapses
-      -- browse from ~18k pages (73 MB) to ~16 pages (64 KB) over Bitswap. id is the
-      -- rowid (implicitly present) but is listed to satisfy the ORDER BY tiebreaker.
+      -- Covering index for the default (latest) browse: every HIT_COLS column lives in the
+      -- index so a listing is index-only — no table scan. id is the rowid (implicitly present)
+      -- but is listed to satisfy the ORDER BY tiebreaker. NOTE: idx_browse_latest deliberately
+      -- OMITS md5 (unlike format/title/genre below): the latest browse returns the newest rows,
+      -- whose rowids are contiguous, so even the non-covering md5 fetch hits a few adjacent table
+      -- pages (good locality) — not worth the md5 weight on the largest, most-used index. The
+      -- format/title/genre browses return rows scattered across the whole rowid space, where a
+      -- per-row table fetch is ~1 page each (~12 MB for 300 rows), so those DO carry md5 and are
+      -- built via ensureCoveringIndex() below (self-heals older md5-less indexes into covering ones).
       CREATE INDEX IF NOT EXISTS idx_browse_latest ON modules(
         ingested_at DESC, id DESC, filename, format, title, duration, channels, root_cid);
-      CREATE INDEX IF NOT EXISTS idx_browse_format ON modules(
-        format, ingested_at DESC, id DESC, filename, title, duration, channels, root_cid);
-      CREATE INDEX IF NOT EXISTS idx_browse_title ON modules(
-        title COLLATE NOCASE, id, filename, format, duration, channels, root_cid);
       -- prefix='2 3': dedicated 2- and 3-char prefix indexes so the client's 2-3 char
       -- prefix queries ("ab"* / "abc"*) seek instead of scanning a wide dictionary range
       -- over the Bitswap VFS. The search box gates on a 2-char minimum, so these cover it.
@@ -102,6 +105,12 @@ export class Catalog {
       -- Precomputed aggregates (refreshed at end of ingest) so count()/formatCounts()
       -- are O(1) lookups, not full-table scans, when queried over the Bitswap VFS.
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      -- Genre label lookup (TMA genre id -> text). 77 rows, populated during a genre
+      -- backfill/ingest from the api-dumps/tma-genres map. Small enough for the client to
+      -- read whole; refreshMeta() also folds it into meta.genre_counts (id+label+count) so
+      -- the home genre directory is a single meta read, not a modules⋈genres scan over Bitswap.
+      -- (Does NOT reference modules.genreid, so it's safe here even on a pre-genre DB.)
+      CREATE TABLE IF NOT EXISTS genres (genreid INTEGER PRIMARY KEY, genre TEXT NOT NULL);
     `);
     // Migration for catalogs created before the md5 column existed: CREATE TABLE
     // IF NOT EXISTS never alters an existing table, so add the column explicitly.
@@ -112,19 +121,65 @@ export class Catalog {
     if (!cols.some((c) => c.name === "md5")) {
       this.db.exec("ALTER TABLE modules ADD COLUMN md5 TEXT");
     }
+    // Same story for genreid on catalogs created before the genre column existed. Add it
+    // before creating idx_browse_genre below (that index references the column, so it can't
+    // live in the CREATE block above — that runs before this ALTER on an old DB). Populate
+    // old rows with a BACKFILL_GENRE ingest pass (pure md5-join UPDATE, no re-bake).
+    if (!cols.some((c) => c.name === "genreid")) {
+      this.db.exec("ALTER TABLE modules ADD COLUMN genreid INTEGER");
+    }
     // Index the join key: md5 lookups (e.g. genre enrichment) hit the index, not a
     // full scan — critical when the DB is queried page-by-page over the Bitswap VFS.
     // Not UNIQUE: the corpus can hold the same file under multiple sources.
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_modules_md5 ON modules(md5);");
+    // Covering browse indexes for the SCATTERED orders (format / title / genre). Each carries
+    // every HIT_COLS column — crucially md5 — so a filtered/sorted listing is index-only over
+    // Bitswap. Without md5 the index is non-covering (HIT_COLS SELECTs md5), forcing a table-page
+    // fetch per row; these orders return rows scattered across the whole rowid space, so that's
+    // ~1 page per row (~12 MB for a 300-row browse). ensureCoveringIndex() self-heals any earlier
+    // md5-less version of the index (drops + rebuilds). genre is built here (after the ALTER) so
+    // its genreid column exists; it's PARTIAL (WHERE genreid IS NOT NULL) since only ~17% of the
+    // corpus is genred. `list` filters WHERE genreid=? (implies IS NOT NULL → SQLite still picks
+    // it as a COVERING INDEX, verified via EXPLAIN QUERY PLAN).
+    this.ensureCoveringIndex(
+      "idx_browse_format",
+      `CREATE INDEX IF NOT EXISTS idx_browse_format ON modules(
+        format, ingested_at DESC, id DESC, md5, filename, title, duration, channels, root_cid);`,
+    );
+    this.ensureCoveringIndex(
+      "idx_browse_title",
+      `CREATE INDEX IF NOT EXISTS idx_browse_title ON modules(
+        title COLLATE NOCASE, id, md5, filename, format, duration, channels, root_cid);`,
+    );
+    this.ensureCoveringIndex(
+      "idx_browse_genre",
+      `CREATE INDEX IF NOT EXISTS idx_browse_genre ON modules(
+        genreid, ingested_at DESC, id DESC, md5, filename, format, title, duration, channels, root_cid)
+        WHERE genreid IS NOT NULL;`,
+    );
     this.insertStmt = this.db.prepare(`
       INSERT INTO modules
         (source, filename, format, title, duration, channels, num_samples,
          num_instruments, num_subsongs, root_cid, num_blocks, size_bytes,
-         instruments, comment, md5, ingested_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         instruments, comment, md5, genreid, ingested_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(source) DO NOTHING
     `);
     this.hasSourceStmt = this.db.prepare("SELECT 1 FROM modules WHERE source = ? LIMIT 1");
+  }
+
+  /** Create a covering browse index, self-healing an earlier md5-less version. `CREATE INDEX
+   *  IF NOT EXISTS` can't widen an existing index, so if the stored index SQL lacks `md5` (an
+   *  older build predating the covering fix — which made browse non-covering, a table fetch per
+   *  row) we DROP it first, then run `createSql` to rebuild it covering. Idempotent: once the
+   *  live index already carries md5, the drop is skipped and the CREATE is a no-op. `name` is a
+   *  fixed internal literal (not user input). Runs only during ingest opens, not client reads. */
+  private ensureCoveringIndex(name: string, createSql: string): void {
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name = ?")
+      .get(name) as { sql: string } | undefined;
+    if (row && !/\bmd5\b/.test(row.sql)) this.db.exec(`DROP INDEX ${name}`);
+    this.db.exec(createSql);
   }
 
   has(source: string): boolean {
@@ -136,7 +191,7 @@ export class Catalog {
     const res = this.insertStmt.run(
       m.source, m.filename, m.format, m.title, m.duration, m.channels,
       m.numSamples, m.numInstruments, m.numSubsongs, m.rootCid, m.numBlocks,
-      m.sizeBytes, m.instruments, m.comment, m.md5, now,
+      m.sizeBytes, m.instruments, m.comment, m.md5, m.genreId ?? null, now,
     );
     if (res.changes > 0) {
       const id = res.lastInsertRowid as number;
@@ -186,6 +241,44 @@ export class Catalog {
     return res.changes > 0;
   }
 
+  /** Upsert the genre label table (TMA genre id -> text). Idempotent; a re-sweep that
+   *  renames a genre updates the text in place. Wrapped in one transaction (77 rows). */
+  upsertGenres(labels: Map<number, string>): void {
+    const up = this.db.prepare(
+      "INSERT INTO genres(genreid, genre) VALUES (?, ?) ON CONFLICT(genreid) DO UPDATE SET genre = excluded.genre",
+    );
+    this.db.exec("BEGIN");
+    try {
+      for (const [id, text] of labels) up.run(id, text);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /** Stamp genreid onto modules by md5 join — the BACKFILL_GENRE pass. Upserts the label
+   *  table first, then UPDATEs every row whose md5 is in the map. Pure SQL, no corpus walk
+   *  (md5 is already on every row), so it's cheaper than the md5 backfill. All corpus copies
+   *  of a file (same md5 under multiple sources) get stamped. `clearFirst` resets genreid to
+   *  NULL before applying, for exact parity with a fresh TMA sweep (drops genres no longer in
+   *  the map); off by default so an interrupted/partial map only adds. Returns rows stamped. */
+  applyGenres(byMd5: Map<string, number>, labels: Map<number, string>, clearFirst = false): number {
+    this.upsertGenres(labels);
+    const upd = this.db.prepare("UPDATE modules SET genreid = ? WHERE md5 = ?");
+    this.db.exec("BEGIN");
+    try {
+      if (clearFirst) this.db.exec("UPDATE modules SET genreid = NULL");
+      let matched = 0;
+      for (const [md5, id] of byMd5) matched += upd.run(id, md5).changes as number;
+      this.db.exec("COMMIT");
+      return matched;
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
   // Catalog search/browse/detail are no longer served here (R1): the published DB is
   // queried by clients over the Bitswap SQLite VFS. The server only writes the catalog
   // (insert/updateRoot), reports count(), and bakes the aggregates the client reads.
@@ -194,6 +287,20 @@ export class Catalog {
     return this.db
       .prepare("SELECT format, COUNT(*) AS count FROM modules GROUP BY format ORDER BY count DESC")
       .all() as unknown as { format: string; count: number }[];
+  }
+
+  /** Per-genre counts over the ACTUAL corpus (not TMA's totals) joined to labels, most
+   *  populous first — folded into meta.genre_counts for the client's home genre directory. */
+  private scanGenreCounts(): { genreid: number; genre: string; count: number }[] {
+    return this.db
+      .prepare(
+        `SELECT m.genreid AS genreid, g.genre AS genre, COUNT(*) AS count
+           FROM modules m JOIN genres g ON g.genreid = m.genreid
+          WHERE m.genreid IS NOT NULL
+          GROUP BY m.genreid
+          ORDER BY count DESC`,
+      )
+      .all() as unknown as { genreid: number; genre: string; count: number }[];
   }
 
   count(): number {
@@ -217,6 +324,7 @@ export class Catalog {
     const up = this.db.prepare("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");
     up.run("total", String(total));
     up.run("format_counts", JSON.stringify(counts));
+    up.run("genre_counts", JSON.stringify(this.scanGenreCounts()));
   }
 
   /** Rebuild the FTS index in place from the `modules` table, and drop the now-unused

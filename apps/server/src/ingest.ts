@@ -20,6 +20,7 @@ import { forEachModule } from "./corpus.ts";
 const CATALOG_CHUNKER = "size-16384";
 const CATALOG_KEY_NAME = "catalog"; // kubo keystore name for the catalog signing key
 const CATALOG_LIFETIME = "48h"; // IPNS record validity window the client enforces as EOL
+const DEFAULT_GENRE_MAP = "api-dumps/tma-genres.json"; // tma-genre-extract.py output (md5 -> genre)
 
 export interface IngestOpts {
   root: string;
@@ -42,6 +43,15 @@ export interface IngestOpts {
    *  republish. No corpus walk, no DAG build — the module blocks/pins/root_cids are
    *  untouched, only the catalog's search index. Used after an FTS schema edit. */
   reindexFts?: boolean;
+  /** Backfill-only pass: stamp genreid onto already-cataloged rows by md5-joining the
+   *  api-dumps/tma-genres map (`genreMap`). Pure SQL — no corpus walk, no DAG build, no
+   *  re-bake (md5 is already on every row) — then refreshes meta.genre_counts and
+   *  republishes. Used once after the genreid column is added (needs md5 backfilled first). */
+  backfillGenre?: boolean;
+  /** Path to the md5->genre JSON (tma-genre-extract.py output). Used by BACKFILL_GENRE and,
+   *  when present, to stamp genreid inline during a normal/rebuild ingest. Defaults to
+   *  api-dumps/tma-genres.json; absent file => genre is simply skipped. */
+  genreMap?: string;
   /** Publish the catalog DB to IPFS under the master-signed IPNS key at the end of
    *  ingest (R1). Default true; set false for dev slices. */
   publish?: boolean;
@@ -69,6 +79,13 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
 
   if (opts.backfillMd5) return backfillMd5(cat, rpc, opts);
   if (opts.reindexFts) return reindexFtsMode(cat, rpc, opts);
+  if (opts.backfillGenre) return backfillGenre(cat, rpc, opts);
+
+  // Best-effort genre enrichment for the normal/rebuild path: if the md5->genre map is
+  // present, populate the label table and stamp genreid on each newly-inserted row inline
+  // (existing rows are covered by a separate BACKFILL_GENRE pass). Absent map => no genre.
+  const genres = loadGenreMap(opts.genreMap);
+  if (genres) cat.upsertGenres(genres.labels);
 
   const t0 = Date.now();
   let processed = 0,
@@ -164,6 +181,7 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
         return;
       }
 
+      const md5 = createHash("md5").update(bytes).digest("hex");
       cat.insert({
         source: m.source,
         filename: m.name,
@@ -179,7 +197,8 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
         sizeBytes: bytes.length,
         instruments: meta.instruments,
         comment: meta.comment,
-        md5: createHash("md5").update(bytes).digest("hex"),
+        md5,
+        genreId: genres?.byMd5.get(md5) ?? null,
       });
       processed++;
       if (isFlat) flat++;
@@ -264,6 +283,71 @@ async function reindexFtsMode(cat: Catalog, rpc: KuboRpc, opts: IngestOpts): Pro
       await publishCatalog(rpc, opts);
     } catch (e) {
       console.error(`catalog publish failed (FTS reindexed locally; IPNS not re-announced): ${e}`);
+    }
+  }
+  return stats;
+}
+
+/** Decode the handful of XML/HTML entities the TMA genre labels carry un-decoded
+ *  ("Drum &amp; Bass" -> "Drum & Bass"). Applied once at load, so meta.genre_counts and the
+ *  genres table hold clean display text. */
+function unescapeHtml(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0*39;/g, "'");
+}
+
+/** Load the md5->genre JSON (tma-genre-extract.py output) into {byMd5, labels}. Returns
+ *  null if the file is absent, so a normal ingest run without the dumps just skips genre
+ *  enrichment instead of failing. genreid 0 is the "ungenred" sentinel and is dropped. */
+function loadGenreMap(path?: string): { byMd5: Map<string, number>; labels: Map<number, string> } | null {
+  const p = path ?? DEFAULT_GENRE_MAP;
+  let raw: string;
+  try {
+    raw = readFileSync(p, "utf8");
+  } catch {
+    return null;
+  }
+  const obj = JSON.parse(raw) as Record<string, { genreid: number; genre: string }>;
+  const byMd5 = new Map<string, number>();
+  const labels = new Map<number, string>();
+  for (const [md5, rec] of Object.entries(obj)) {
+    if (!rec.genreid) continue;
+    byMd5.set(md5.toLowerCase(), rec.genreid);
+    if (!labels.has(rec.genreid)) labels.set(rec.genreid, unescapeHtml(rec.genre));
+  }
+  return { byMd5, labels };
+}
+
+/** One-shot genre backfill (see IngestOpts.backfillGenre). Stamps genreid onto existing rows
+ *  by md5-joining the genre map — pure SQL, no corpus walk / DAG build / kubo put (md5 is
+ *  already on every row), so it's even cheaper than the md5 backfill. Refreshes meta.genre_counts
+ *  (the client's home directory) and republishes. Re-runnable; needs md5 already backfilled. */
+async function backfillGenre(cat: Catalog, rpc: KuboRpc, opts: IngestOpts): Promise<IngestStats> {
+  const t0 = Date.now();
+  const genres = loadGenreMap(opts.genreMap);
+  if (!genres) {
+    cat.close();
+    throw new Error(
+      `BACKFILL_GENRE: genre map not found at ${opts.genreMap ?? DEFAULT_GENRE_MAP} ` +
+        `(run scripts/tma-genre-extract.py, or set GENRE_MAP)`,
+    );
+  }
+  const matched = cat.applyGenres(genres.byMd5, genres.labels);
+  cat.refreshMeta(); // fold genre_counts (+ total/format) into meta for the client directory
+  cat.checkpoint(); // fold the WAL in before the snapshot
+  const total = cat.count();
+  console.log(`  genre backfill: ${matched} rows stamped across ${genres.labels.size} genres`);
+  const stats: IngestStats = { processed: matched, skipped: 0, failed: 0, flat: 0, rebuilt: 0, unchanged: 0, total, ms: Date.now() - t0 };
+  cat.close();
+  if (opts.publish !== false) {
+    try {
+      await publishCatalog(rpc, opts);
+    } catch (e) {
+      console.error(`catalog publish failed (genre backfilled locally; IPNS not re-announced): ${e}`);
     }
   }
   return stats;

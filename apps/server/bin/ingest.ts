@@ -6,6 +6,9 @@
 //                  seek tables; repoints the catalog + re-pins, unpins old roots)
 //   BACKFILL_MD5=1 ... (fill the md5 column for already-cataloged rows: unzip+md5
 //                  only, no re-bake; re-publishes the catalog at the end)
+//   BACKFILL_GENRE=1 [GENRE_MAP=api-dumps/tma-genres.json] ... (stamp genreid onto rows by
+//                  md5-joining the TMA genre map; pure SQL, no corpus walk; refreshes
+//                  genre_counts + republishes. Needs md5 backfilled first)
 //   REINDEX_FTS=1 ... (rebuild modules_fts from the modules table to apply an FTS schema
 //                  change, e.g. prefix='2 3'; drops the unused vocab table; republishes.
 //                  No corpus walk / DAG build — catalog-only, seconds not hours)
@@ -20,12 +23,14 @@ const limit = +(process.env.LIMIT ?? 0);
 const formats = process.env.FORMATS?.split(",");
 const rebuild = /^(1|true|yes)$/i.test(process.env.REBUILD ?? "");
 const backfillMd5 = /^(1|true|yes)$/i.test(process.env.BACKFILL_MD5 ?? "");
+const backfillGenre = /^(1|true|yes)$/i.test(process.env.BACKFILL_GENRE ?? "");
+const genreMap = process.env.GENRE_MAP; // md5->genre JSON; defaults inside ingest
 const reindexFts = /^(1|true|yes)$/i.test(process.env.REINDEX_FTS ?? "");
 // Publish the catalog to IPNS at the end (R1). On by default; PUBLISH=0 for dev slices.
 const publish = !/^(0|false|no)$/i.test(process.env.PUBLISH ?? "");
 
 console.log(
-  `ingest: corpus=${root} db=${dbPath} kubo=${kuboApi} limit=${limit || "∞"}${rebuild ? " REBUILD" : ""}${backfillMd5 ? " BACKFILL_MD5" : ""}${reindexFts ? " REINDEX_FTS" : ""}${publish ? "" : " NO-PUBLISH"}`,
+  `ingest: corpus=${root} db=${dbPath} kubo=${kuboApi} limit=${limit || "∞"}${rebuild ? " REBUILD" : ""}${backfillMd5 ? " BACKFILL_MD5" : ""}${backfillGenre ? " BACKFILL_GENRE" : ""}${reindexFts ? " REINDEX_FTS" : ""}${publish ? "" : " NO-PUBLISH"}`,
 );
 const stats = await runIngest({
   root,
@@ -35,6 +40,8 @@ const stats = await runIngest({
   formats,
   rebuild,
   backfillMd5,
+  backfillGenre,
+  genreMap,
   reindexFts,
   publish,
   onProgress: (s) =>
