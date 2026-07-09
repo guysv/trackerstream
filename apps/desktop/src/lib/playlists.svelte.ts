@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getModuleByMd5, type ModuleHit } from "$lib/catalog";
+import { cachedHit, rememberHit, rememberHits } from "$lib/cidCache";
 import { playList, queue, setOnQueueSourceChange } from "$lib/player.svelte";
 
 export interface PlaylistMeta {
@@ -172,12 +173,20 @@ setOnQueueSourceChange(() => void invoke("playlist_pin", { name: null }).catch((
 // like the results table: a >200-track playlist plays its first 200.
 const RESOLVE_CAP = 200;
 
+// A playlist item carries no CID, only md5 + display strings. Online we resolve the current
+// hit through the catalog (which also refreshes the cache); when the catalog is unreachable
+// we fall back to the last-known-good hit this md5 resolved to (cidCache.ts) — its CID drives
+// playback and its metadata (format/duration/title) drives the offline display.
+async function resolveItem(i: PlaylistItem): Promise<ModuleHit | null> {
+  const d = await getModuleByMd5(i.md5).catch(() => null); // populates the cache on success
+  if (d?.rootCid) return d;
+  return cachedHit(i.md5) ?? null; // catalog unreachable / row gone — use the last hit that worked
+}
+
 export async function playPlaylist(detail: PlaylistDetail, index = 0): Promise<void> {
   const slice = detail.items.slice(0, RESOLVE_CAP);
   const wantedMd5 = detail.items[Math.min(index, slice.length - 1)]?.md5;
-  const hits = (
-    await Promise.all(slice.map((i) => getModuleByMd5(i.md5).catch(() => null)))
-  ).filter(Boolean) as ModuleHit[];
+  const hits = (await Promise.all(slice.map(resolveItem))).filter(Boolean) as ModuleHit[];
   if (!hits.length) throw new Error("no playable tracks in playlist");
   const at = Math.max(0, hits.findIndex((h) => h.md5 === wantedMd5));
   playList(hits, at); // fires the source-change hook first, releasing any prior pin
@@ -193,6 +202,7 @@ export async function addTrackTo(name: string, h: ModuleHit): Promise<void> {
   if (!d) return;
   const tuples = itemTuples(d.items);
   if (!tuples.some((t) => t[0] === h.md5)) tuples.push(hitTuple(h));
+  rememberHit(h); // this track is now offline-playable + displayable from this hit
   await plUpdate(name, d.title, tuples);
   // If this is the private Liked Tracks playlist, flip the ♥ optimistically (reassign
   // the reactive set) instead of waiting on the 10s refreshLiked() poll — mirrors toggleLike().
@@ -201,6 +211,7 @@ export async function addTrackTo(name: string, h: ModuleHit): Promise<void> {
 }
 
 export async function saveQueueAsPlaylist(title: string): Promise<void> {
+  rememberHits(queue.items); // the queued hits carry live CIDs — keep them playable offline
   await plCreate(title, queue.items.map(hitTuple));
   plBump();
 }
