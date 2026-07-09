@@ -691,6 +691,9 @@ pub enum CatalogReq {
     },
     List {
         #[serde(default)] format: Option<String>,
+        /// Browse a single genre (TMA genreid). Served index-only by the partial
+        /// idx_browse_genre; takes precedence over `format` (one facet at a time).
+        #[serde(default)] genre: Option<i64>,
         #[serde(default)] sort: Option<String>,
         #[serde(default)] limit: Option<i64>,
         #[serde(default)] offset: Option<i64>,
@@ -700,6 +703,9 @@ pub enum CatalogReq {
     /// unlike the rowid `id`). Answers with the same `ModuleDetail` shape as `Get`.
     GetByMd5 { md5: String },
     Formats {},
+    /// Per-genre counts for the home genre directory — reads the precomputed
+    /// meta.genre_counts (one page), mirror of `Formats`.
+    Genres {},
 }
 
 /// Resolve an IPNS name (e.g. `CATALOG_IPNS_KEY`) to its current CID via the node's
@@ -901,12 +907,13 @@ pub async fn run_search_parallel(
 fn dispatch(conn: &Connection, req: &CatalogReq) -> rusqlite::Result<Value> {
     match req {
         CatalogReq::Search { q, limit, after, names } => search(conn, q, limit.unwrap_or(50), *after, *names),
-        CatalogReq::List { format, sort, limit, offset } => {
-            list(conn, format.as_deref(), sort.as_deref(), limit.unwrap_or(100), offset.unwrap_or(0))
+        CatalogReq::List { format, genre, sort, limit, offset } => {
+            list(conn, format.as_deref(), *genre, sort.as_deref(), limit.unwrap_or(100), offset.unwrap_or(0))
         }
         CatalogReq::Get { id } => get(conn, *id),
         CatalogReq::GetByMd5 { md5 } => get_by_md5(conn, md5),
         CatalogReq::Formats {} => formats(conn),
+        CatalogReq::Genres {} => genres(conn),
     }
 }
 
@@ -1074,6 +1081,7 @@ fn search_stream(
 fn list(
     conn: &Connection,
     format: Option<&str>,
+    genre: Option<i64>,
     sort: Option<&str>,
     limit: i64,
     offset: i64,
@@ -1085,13 +1093,24 @@ fn list(
         Some("title") => "title COLLATE NOCASE",
         _ => "ingested_at DESC, id DESC",
     };
-    let where_clause = if format.is_some() { "WHERE format = ?" } else { "" };
+    // One facet at a time keeps every browse index-only (idx_browse_genre / idx_browse_format).
+    // genre wins if both are set; `genreid = ?` implies IS NOT NULL, so the *partial*
+    // idx_browse_genre still covers it (verified via EXPLAIN QUERY PLAN).
+    let where_clause = if genre.is_some() {
+        "WHERE genreid = ?"
+    } else if format.is_some() {
+        "WHERE format = ?"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT {} FROM modules {where_clause} ORDER BY {order} LIMIT ? OFFSET ?",
         HIT_COLS.replace("m.", "")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let results = if let Some(fmt) = format {
+    let results = if let Some(g) = genre {
+        collect(&mut stmt, &[&g as &dyn rusqlite::ToSql, &limit, &offset])?
+    } else if let Some(fmt) = format {
         collect(&mut stmt, &[&fmt as &dyn rusqlite::ToSql, &limit, &offset])?
     } else {
         collect(&mut stmt, &[&limit as &dyn rusqlite::ToSql, &offset])?
@@ -1161,4 +1180,17 @@ fn formats(conn: &Connection) -> rusqlite::Result<Value> {
         .collect::<rusqlite::Result<_>>()?;
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM modules", [], |r| r.get(0))?;
     Ok(json!({ "formats": formats, "total": total }))
+}
+
+/// Per-genre counts for the home genre directory. Reads the precomputed meta.genre_counts
+/// (`[{genreid,genre,count}]`, most-populous first) — a single page over the VFS, mirror of
+/// `formats`. Empty list on a DB predating genre (no meta key) rather than a modules⋈genres scan.
+fn genres(conn: &Connection) -> rusqlite::Result<Value> {
+    let counts: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'genre_counts'", [], |r| r.get(0))
+        .optional()?;
+    let arr: Value = counts
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_else(|| json!([]));
+    Ok(json!({ "genres": arr }))
 }

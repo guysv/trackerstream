@@ -38,6 +38,12 @@ export interface FormatCount {
   count: number;
 }
 
+export interface GenreCount {
+  genreid: number;
+  genre: string;
+  count: number;
+}
+
 // One Tauri command answers every catalog query: it resolves the catalog IPNS name
 // to the current DB CID (local cache -> tracker -> peer-pull) and runs the query over
 // the Bitswap VFS, returning the same JSON shapes the old HTTP /catalog API did.
@@ -77,8 +83,12 @@ export const cancelSearch = (): Promise<void> => invoke("catalog_cancel");
 // on search-page mount; best-effort (a failure just means the first search pays the cold cost).
 export const warmCatalog = (): Promise<void> => invoke("catalog_warm", { name: CATALOG_NAME });
 
+// `genre` (a genreid from getGenres) browses a single genre — index-only via the partial
+// idx_browse_genre. One facet at a time: if both genre and format are passed the server
+// prefers genre. Omit both to browse the whole corpus.
 export const listModules = (opts: {
   format?: string;
+  genre?: number;
   sort?: "latest" | "random" | "title";
   limit?: number;
   offset?: number;
@@ -86,6 +96,7 @@ export const listModules = (opts: {
   query<{ results: ModuleHit[] }>({
     op: "list",
     format: opts.format,
+    genre: opts.genre,
     sort: opts.sort ?? "latest",
     limit: opts.limit ?? 100,
     offset: opts.offset ?? 0,
@@ -101,3 +112,8 @@ export const getModuleByMd5 = (md5: string): Promise<ModuleDetail> =>
 
 export const getFormats = (): Promise<{ formats: FormatCount[]; total: number }> =>
   query({ op: "formats" });
+
+// The home genre directory: precomputed per-genre counts (meta.genre_counts), most-populous
+// first — one page over the VFS, mirror of getFormats. Empty on a catalog predating genre.
+export const getGenres = (): Promise<{ genres: GenreCount[] }> =>
+  query({ op: "genres" });
