@@ -5,6 +5,7 @@
 // results carry a root CID the data plane resolves P2P.
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { CATALOG_IPNS_KEY, CATALOG_Z_IPNS_KEY } from "@trackerstream/config";
+import { rememberHit, rememberHits } from "$lib/cidCache";
 
 // Prefer the per-page-zstd catalog (TSZCAT) when the master publishes one, else the raw SQLite.
 // This build's VFS auto-detects the format from the resolved root, so a single `name` works for
@@ -56,7 +57,10 @@ function query<T>(req: Record<string, unknown>): Promise<T> {
 // `namesOnly` restricts the match to title/filename (the names_fts index) instead of the full
 // index that also matches instrument + comment text — the search box's "names only" toggle.
 export const search = (q: string, limit = 60, after?: number, namesOnly = false): Promise<ModuleHit[]> =>
-  query<{ results: ModuleHit[] }>({ op: "search", q, limit, after, names: namesOnly }).then((r) => r.results);
+  query<{ results: ModuleHit[] }>({ op: "search", q, limit, after, names: namesOnly }).then((r) => {
+    rememberHits(r.results); // warm the offline md5->CID cache from anything the user browses
+    return r.results;
+  });
 
 // Streaming search: `onRow` fires for each hit the instant its pages arrive over the VFS, so the
 // UI paints results progressively instead of after the whole page. Resolves to the total row
@@ -70,7 +74,10 @@ export function searchStream(
   namesOnly = false,
 ): Promise<number> {
   const ch = new Channel<ModuleHit>();
-  ch.onmessage = onRow;
+  ch.onmessage = (h) => {
+    rememberHit(h); // warm the offline cache with each streamed hit's CID + metadata
+    onRow(h);
+  };
   return invoke<number>("catalog_search_stream", { name: CATALOG_NAME, q, limit, after, names: namesOnly, onRow: ch });
 }
 
@@ -100,15 +107,26 @@ export const listModules = (opts: {
     sort: opts.sort ?? "latest",
     limit: opts.limit ?? 100,
     offset: opts.offset ?? 0,
-  }).then((r) => r.results);
+  }).then((r) => {
+    rememberHits(r.results);
+    return r.results;
+  });
 
 export const getModule = (id: number): Promise<ModuleDetail> =>
-  query<ModuleDetail>({ op: "get", id });
+  query<ModuleDetail>({ op: "get", id }).then((d) => {
+    rememberHit(d);
+    return d;
+  });
 
 // Resolve a module by its stable content md5 — how playlists (which persist md5, not the
-// rebake-unstable rowid) turn a stored track into a playable CID at play time.
+// rebake-unstable rowid) turn a stored track into a playable CID at play time. Every
+// success also refreshes the local last-known-good CID cache so the same playlist stays
+// playable if the catalog later goes offline (see cidCache.ts).
 export const getModuleByMd5 = (md5: string): Promise<ModuleDetail> =>
-  query<ModuleDetail>({ op: "get_by_md5", md5 });
+  query<ModuleDetail>({ op: "get_by_md5", md5 }).then((d) => {
+    rememberHit(d);
+    return d;
+  });
 
 export const getFormats = (): Promise<{ formats: FormatCount[]; total: number }> =>
   query({ op: "formats" });
