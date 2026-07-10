@@ -26,6 +26,9 @@ export interface ModuleDetail extends ModuleHit {
   sizeBytes: number;
   instruments: string;
   comment: string;
+  /** TMA genre label (via the genreid→genres join); null for un-genred tracks — the
+   *  majority of the corpus — and on a catalog predating the genre column/table. */
+  genre: string | null;
 }
 
 export interface FormatCount {

@@ -96,6 +96,7 @@
 
     <dl class="meta">
       <dt>format</dt><dd class="fmt-{detail.format}">{detail.format.toUpperCase()}</dd>
+      <dt>genre</dt><dd>{detail.genre || "n/a"}</dd>
       <dt>length</dt><dd>{fmtTime(detail.duration)}</dd>
       <dt>channels</dt><dd>{detail.channels}</dd>
       <dt>samples</dt><dd>{detail.numSamples}</dd>
