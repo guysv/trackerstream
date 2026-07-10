@@ -91,11 +91,13 @@ export const cancelSearch = (): Promise<void> => invoke("catalog_cancel");
 export const warmCatalog = (): Promise<void> => invoke("catalog_warm", { name: CATALOG_NAME });
 
 // `genre` (a genreid from getGenres) browses a single genre — index-only via the partial
-// idx_browse_genre. One facet at a time: if both genre and format are passed the server
-// prefers genre. Omit both to browse the whole corpus.
+// idx_browse_genre. `noGenre` browses the un-genred tail (genreid IS NULL) — the home "n/a"
+// facet, which is most of the corpus. One facet at a time; the server's precedence is
+// noGenre > genre > format. Omit all to browse the whole corpus.
 export const listModules = (opts: {
   format?: string;
   genre?: number;
+  noGenre?: boolean;
   sort?: "latest" | "random" | "title";
   limit?: number;
   offset?: number;
@@ -104,6 +106,7 @@ export const listModules = (opts: {
     op: "list",
     format: opts.format,
     genre: opts.genre,
+    no_genre: opts.noGenre ?? false,
     sort: opts.sort ?? "latest",
     limit: opts.limit ?? 100,
     offset: opts.offset ?? 0,

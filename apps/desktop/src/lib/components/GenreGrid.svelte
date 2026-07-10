@@ -3,12 +3,19 @@
 
   // The home "Browse by genre" directory. Reads meta.genre_counts (via getGenres) — no scan.
   // Shows the most-populous genres by default with an expander for the full 77-genre list.
+  // `naCount` is the un-genred tail (genreid IS NULL) — most of the corpus. It's rendered as a
+  // trailing "n/a" tile (always last, regardless of the count sort / collapse) that browses that
+  // tail via `onpickNa`. Hidden when 0.
   let {
     genres,
+    naCount = 0,
     onpick,
+    onpickNa,
   }: {
     genres: GenreCount[];
+    naCount?: number;
     onpick: (genreid: number, label: string) => void;
+    onpickNa: () => void;
   } = $props();
 
   const COLLAPSED = 12;
@@ -33,6 +40,12 @@
           <span class="count">{g.count.toLocaleString()}</span>
         </button>
       {/each}
+      {#if naCount > 0}
+        <button class="tile" onclick={onpickNa} title="No genre">
+          <span class="label">n/a</span>
+          <span class="count">{naCount.toLocaleString()}</span>
+        </button>
+      {/if}
     </div>
   </section>
 {/if}
@@ -64,7 +77,7 @@
   }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    grid-template-columns: repeat(2, 1fr);
     gap: 0.4rem;
   }
   .tile {
