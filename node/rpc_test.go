@@ -242,6 +242,94 @@ func TestRPCBlockPutRawBodyStoresRealBytes(t *testing.T) {
 	}
 }
 
+// The seed-monitor surface (tsmon): seed/status carries the seed-health fields the panel
+// can't (provide OK/fail + queue, reprovide timing, pin-kind breakdown), bitswap/stat and
+// bitswap/ledger expose the exchange counters + per-peer served-bytes, and peer/identify
+// answers from the peerstore. This asserts shapes on a fresh node (counters may be zero).
+func TestRPCSeedMonitorEndpoints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	n, err := New(ctx, DefaultConfig(RoleServer, "", 0))
+	if err != nil {
+		t.Fatalf("node: %v", err)
+	}
+	defer n.Close()
+	ts := httptest.NewServer(NewRPCServer(n).Handler())
+	defer ts.Close()
+
+	// A pinned track root so PinsByKind is non-trivial.
+	track := rawBlock(t, []byte("seed-monitor track root"))
+	if err := n.PutBlock(ctx, track); err != nil {
+		t.Fatalf("put track: %v", err)
+	}
+	if _, err := http.DefaultClient.Post(ts.URL+"/api/v0/provide/track-root?arg="+track.Cid().String(), "", nil); err != nil {
+		t.Fatalf("provide: %v", err)
+	}
+
+	// seed/status — the consolidated header + seed-health strip.
+	var st struct {
+		ID, Role, AgentVersion string
+		UptimeSec              int64
+		Pins                   int
+		PinsByKind             map[string]int
+		Provide                map[string]int64
+		Reprovide              map[string]int64
+	}
+	resp, err := http.DefaultClient.Post(ts.URL+"/api/v0/seed/status", "", nil)
+	if err != nil {
+		t.Fatalf("seed/status: %v", err)
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&st)
+	resp.Body.Close()
+	if st.ID != n.ID().String() {
+		t.Fatalf("seed/status ID=%q want %q", st.ID, n.ID())
+	}
+	if st.Role != "server" {
+		t.Fatalf("seed/status Role=%q want server", st.Role)
+	}
+	if st.PinsByKind["track_root"] != 1 {
+		t.Fatalf("seed/status PinsByKind track_root=%d want 1 (%v)", st.PinsByKind["track_root"], st.PinsByKind)
+	}
+	if _, ok := st.Provide["OK"]; !ok {
+		t.Fatalf("seed/status missing Provide.OK (%v)", st.Provide)
+	}
+	if _, ok := st.Reprovide["IntervalSec"]; !ok {
+		t.Fatalf("seed/status missing Reprovide.IntervalSec (%v)", st.Reprovide)
+	}
+
+	// bitswap/stat — global exchange counters present (zero on a fresh node is fine).
+	var bstat map[string]any
+	resp, _ = http.DefaultClient.Post(ts.URL+"/api/v0/bitswap/stat", "", nil)
+	_ = json.NewDecoder(resp.Body).Decode(&bstat)
+	resp.Body.Close()
+	for _, k := range []string{"BlocksSent", "DataReceived", "WantlistLen", "EngagedPeers"} {
+		if _, ok := bstat[k]; !ok {
+			t.Fatalf("bitswap/stat missing %q (%v)", k, bstat)
+		}
+	}
+
+	// bitswap/ledger — well-formed ByPeer map (empty with no peers).
+	var ledger struct{ ByPeer map[string]map[string]any }
+	resp, _ = http.DefaultClient.Post(ts.URL+"/api/v0/bitswap/ledger", "", nil)
+	_ = json.NewDecoder(resp.Body).Decode(&ledger)
+	resp.Body.Close()
+	if ledger.ByPeer == nil {
+		t.Fatalf("bitswap/ledger returned no ByPeer object")
+	}
+
+	// peer/identify — self, from the peerstore. A bad id is a 400, not a panic.
+	resp, _ = http.DefaultClient.Post(ts.URL+"/api/v0/peer/identify?arg="+n.ID().String(), "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("peer/identify(self) status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp, _ = http.DefaultClient.Post(ts.URL+"/api/v0/peer/identify?arg=not-a-peer", "", nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("peer/identify(bad) status %d want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func mustCID(t *testing.T, s string) cid.Cid {
 	t.Helper()
 	c, err := cid.Decode(s)

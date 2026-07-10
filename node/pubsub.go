@@ -46,37 +46,60 @@ func newPubSub(ctx context.Context, h host.Host) (*PubSub, error) {
 	return p, nil
 }
 
+// joinAndDrain registers val + joins + drains a LIST of gossipsub topics, feeding every
+// subscription into one drain fn. Validator is registered BEFORE Join so nothing unvalidated
+// ever enters. It returns the PRIMARY topic (topics[0]) for publishing.
+//
+// Dual-register scaffolding (wire-version hardening): today each list has one entry, but the
+// shape means a future topic rename ships as {old, new} here — we SUBSCRIBE to all listed
+// topics but PUBLISH only to the primary, so publish moves to the new name only after adoption,
+// never a hard flip that partitions old peers. See the protocol-evolution policy in config.go.
+func (p *PubSub) joinAndDrain(ctx context.Context, topics []string, val pubsub.ValidatorEx, drain func(*pubsub.Message)) (*pubsub.Topic, error) {
+	var primary *pubsub.Topic
+	for i, name := range topics {
+		if err := p.ps.RegisterTopicValidator(name, val); err != nil {
+			return nil, fmt.Errorf("validator %s: %w", name, err)
+		}
+		t, err := p.ps.Join(name)
+		if err != nil {
+			return nil, fmt.Errorf("join %s: %w", name, err)
+		}
+		if i == 0 {
+			primary = t
+		}
+		sub, err := t.Subscribe()
+		if err != nil {
+			return nil, err
+		}
+		go func() {
+			defer sub.Cancel()
+			for {
+				msg, err := sub.Next(ctx)
+				if err != nil {
+					return // ctx cancelled / topic closed
+				}
+				drain(msg)
+			}
+		}()
+	}
+	return primary, nil
+}
+
 // SetupPlaylist registers the playlist topic validator, joins the topic, and starts
-// draining it into sink. Validator BEFORE Join, so nothing unvalidated ever enters.
-// ALL roles subscribe — gossipsub only forwards on subscribed topics, so the seed's
-// subscription IS its "forward but don't save" role (its sink stores records only).
+// draining it into sink. ALL roles subscribe — gossipsub only forwards on subscribed topics,
+// so the seed's subscription IS its "forward but don't save" role (its sink stores records only).
 func (p *PubSub) SetupPlaylist(ctx context.Context, val pubsub.ValidatorEx, sink func(name string, rec, doc []byte)) error {
-	if err := p.ps.RegisterTopicValidator(PlaylistTopic, val); err != nil {
-		return fmt.Errorf("playlist validator: %w", err)
-	}
-	t, err := p.ps.Join(PlaylistTopic)
-	if err != nil {
-		return fmt.Errorf("join playlist topic: %w", err)
-	}
-	p.playlist = t
-	sub, err := t.Subscribe()
+	t, err := p.joinAndDrain(ctx, []string{PlaylistTopic}, val, func(msg *pubsub.Message) {
+		// The validator already accepted this message; decode cannot fail here
+		// short of a race on tunables, so a failure is just dropped.
+		if name, rec, doc, err := decodePlaylistMsg(msg.Data); err == nil {
+			sink(name, rec, doc)
+		}
+	})
 	if err != nil {
 		return err
 	}
-	go func() {
-		defer sub.Cancel()
-		for {
-			msg, err := sub.Next(ctx)
-			if err != nil {
-				return // ctx cancelled / topic closed
-			}
-			// The validator already accepted this message; decode cannot fail here
-			// short of a race on tunables, so a failure is just dropped.
-			if name, rec, doc, err := decodePlaylistMsg(msg.Data); err == nil {
-				sink(name, rec, doc)
-			}
-		}
-	}()
+	p.playlist = t
 	return nil
 }
 
@@ -96,28 +119,13 @@ func (p *PubSub) PublishPlaylist(ctx context.Context, data []byte) error {
 // subscribe: subscription is what makes a node forward the mesh; the seed counts
 // uselessly but relays usefully.
 func (p *PubSub) SetupBeacon(ctx context.Context, val pubsub.ValidatorEx, sink func(origin peer.ID, data []byte)) error {
-	if err := p.ps.RegisterTopicValidator(PlaylistBeaconTopic, val); err != nil {
-		return fmt.Errorf("beacon validator: %w", err)
-	}
-	t, err := p.ps.Join(PlaylistBeaconTopic)
-	if err != nil {
-		return fmt.Errorf("join beacon topic: %w", err)
-	}
-	p.beacon = t
-	sub, err := t.Subscribe()
+	t, err := p.joinAndDrain(ctx, []string{PlaylistBeaconTopic}, val, func(msg *pubsub.Message) {
+		sink(msg.GetFrom(), msg.Data)
+	})
 	if err != nil {
 		return err
 	}
-	go func() {
-		defer sub.Cancel()
-		for {
-			msg, err := sub.Next(ctx)
-			if err != nil {
-				return // ctx cancelled / topic closed
-			}
-			sink(msg.GetFrom(), msg.Data)
-		}
-	}()
+	p.beacon = t
 	return nil
 }
 

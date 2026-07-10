@@ -43,8 +43,11 @@ if [ -f "$OUT" ] && [ -f "$STAMP" ] && [ -z "$(find "$NODE_DIR" -name '*.go' -ne
 fi
 
 echo "building tsnode → $OUT ($GOOS/$GOARCH)"
+# Stamp the version (node/config.go Version) for the UserAgent + RPC /version; --always
+# falls back to a commit hash, "dev" only if git is unavailable.
+VERSION="${VERSION:-$(git -C "$ROOT" describe --tags --always 2>/dev/null || echo dev)}"
 ( cd "$NODE_DIR" && CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-    go build -trimpath -ldflags "-s -w" -o "$OUT" ./cmd/tsnode )
+    go build -trimpath -ldflags "-s -w -X github.com/trackerstream/tsnode.Version=$VERSION" -o "$OUT" ./cmd/tsnode )
 chmod +x "$OUT"
 touch "$STAMP"
 echo "sidecar ready: $OUT"

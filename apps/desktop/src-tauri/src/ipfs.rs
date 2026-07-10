@@ -200,7 +200,9 @@ struct IndexV2 {
 
 #[derive(Debug, Deserialize)]
 struct ManifestV2 {
-    v: u8,
+    // `v` is read separately via manifest_version() for the streaming dispatch (a v2 body only
+    // reaches this full decode after the version check), so it's intentionally not a field here
+    // — serde ignores the unknown `v` key.
     #[serde(rename = "skeletonChunks")]
     skeleton_chunks: Vec<Cid>,
     // Run-length recipe [nContentChunks, zeroBytes, ...] interleaving the structure
@@ -410,6 +412,22 @@ fn need_key(orders: Option<&Vec<u32>>, ph: u32) -> u64 {
     }
 }
 
+/// Read just the manifest version from its dag-cbor body, for the streaming dispatch. A body
+/// with no `v` field (pre-versioning v1 manifests) — or one that doesn't decode at all — reads
+/// as 0, which routes to the v1 reassembly path (which then verifies/errors on its own terms).
+/// Keeping this separate from the full ManifestV2 decode is what lets an unknown-newer version
+/// be recognised and degraded instead of silently mis-parsed as v1.
+fn manifest_version(bytes: &[u8]) -> u8 {
+    #[derive(Deserialize)]
+    struct ManifestHeader {
+        #[serde(default)]
+        v: u8,
+    }
+    serde_ipld_dagcbor::from_slice::<ManifestHeader>(bytes)
+        .map(|h| h.v)
+        .unwrap_or(0)
+}
+
 /// Stream a v2 root onto the immortal-instance protocol: assemble + emit the
 /// skeleton + plan, then fetch each sample's decoded PCM in playhead-priority
 /// order, emitting a Sample event per arrival. A v1 (un-re-baked / flat) root is
@@ -421,16 +439,33 @@ pub async fn stream_v2(
     state: Arc<StreamState>,
     events: mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<()> {
-    let manifest: ManifestV2 = serde_ipld_dagcbor::from_slice(&fetch_bytes(rpc, root).await?)?;
+    let manifest_bytes = fetch_bytes(rpc, root).await?;
 
-    if manifest.v != 2 {
-        log::info!(target: "stream", "{root}: v1 root -> full reassemble (no streaming)");
-        let bytes = reassemble(rpc, root).await?;
-        *state.skeleton.lock().unwrap() = bytes;
-        let _ = events.send(StreamEvent::Skeleton { plan: PlanV2::default(), samples: 0 });
-        let _ = events.send(StreamEvent::Complete);
-        return Ok(());
+    // Version dispatch on a MINIMAL header first (wire-version hardening). The old code parsed
+    // the body as ManifestV2 and treated "v != 2" as v1 — so a FUTURE v3 root fell into the v1
+    // reassembly and silently mis-decoded. Instead read just `v`, then route explicitly: an
+    // unknown-newer version DEGRADES to a clean error rather than running the v1 path on a body
+    // it doesn't understand.
+    let ver = manifest_version(&manifest_bytes);
+    match ver {
+        2 => {} // fall through to the v2 streaming path below
+        0 | 1 => {
+            log::info!(target: "stream", "{root}: v{ver} root -> full reassemble (no streaming)");
+            let bytes = reassemble(rpc, root).await?;
+            *state.skeleton.lock().unwrap() = bytes;
+            let _ = events.send(StreamEvent::Skeleton { plan: PlanV2::default(), samples: 0 });
+            let _ = events.send(StreamEvent::Complete);
+            return Ok(());
+        }
+        other => {
+            // A manifest from a newer bake than this client understands. Do NOT run the v1
+            // reassembly on it (that mis-decodes); surface a clean error the UI can turn into
+            // "unsupported, please update".
+            return Err(anyhow!("unsupported manifest version {other}; please update trackerstream"));
+        }
     }
+
+    let manifest: ManifestV2 = serde_ipld_dagcbor::from_slice(&manifest_bytes)?;
 
     let index = match manifest.index {
         Some(ix) => ix,
@@ -549,6 +584,28 @@ pub async fn stream_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The streaming dispatch reads the manifest version from a minimal header: v1/v2 route to
+    // their paths, a NEWER version is recognised (so stream_v2 degrades to a clean error rather
+    // than mis-running the v1 reassembly), and an absent/undecodable `v` reads as v1.
+    #[test]
+    fn manifest_version_dispatch() {
+        use std::collections::BTreeMap;
+        let with_v = |v: u8| {
+            let mut m: BTreeMap<String, u8> = BTreeMap::new();
+            m.insert("v".into(), v);
+            serde_ipld_dagcbor::to_vec(&m).unwrap()
+        };
+        assert_eq!(manifest_version(&with_v(1)), 1);
+        assert_eq!(manifest_version(&with_v(2)), 2);
+        assert_eq!(manifest_version(&with_v(3)), 3); // future -> caller emits "please update"
+        // A pre-versioning v1 manifest with no `v` field reads as 0 -> v1 reassembly path.
+        let mut no_v: BTreeMap<String, u64> = BTreeMap::new();
+        no_v.insert("originalLength".into(), 42);
+        assert_eq!(manifest_version(&serde_ipld_dagcbor::to_vec(&no_v).unwrap()), 0);
+        // Undecodable bytes read as 0 (routed to reassembly, which errors on its own terms).
+        assert_eq!(manifest_version(b"\xff not cbor"), 0);
+    }
 
     fn plan(cps: &[(u32, &[u32])]) -> PlanV2 {
         PlanV2 {

@@ -4,6 +4,15 @@
 // Ingest is incremental: `source` (outerZip::innerName) is the idempotency key.
 import { DatabaseSync } from "node:sqlite";
 
+// Catalog schema version, written into meta.schema_version on every bake (wire-version
+// hardening). The client (catalog.rs) hand-ports this SQL with POSITIONAL row-mapping, so a
+// column reorder/drop would silently mis-read with no signal. Bump this ONLY on a
+// non-backward-compatible layout change (column reorder/rename/drop); purely ADDITIVE changes
+// (new columns old clients don't query — as md5 and genreId already were) keep the version, so
+// a newer catalog stays readable by older clients. An incompatible bump needs the signed
+// min_client_version gate before it can ship.
+export const CATALOG_SCHEMA_VERSION = 1;
+
 export interface ModuleRow {
   source: string;
   filename: string;
@@ -325,6 +334,9 @@ export class Catalog {
     up.run("total", String(total));
     up.run("format_counts", JSON.stringify(counts));
     up.run("genre_counts", JSON.stringify(this.scanGenreCounts()));
+    // Schema-version signal so an older client can detect a layout it can't positionally
+    // read and soft-degrade instead of mis-mapping columns (wire-version hardening).
+    up.run("schema_version", String(CATALOG_SCHEMA_VERSION));
   }
 
   /** Rebuild the FTS index in place from the `modules` table, and drop the now-unused

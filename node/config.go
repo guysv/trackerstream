@@ -15,13 +15,22 @@ import (
 // Custom protocol / topic identifiers. The DHT prefix yields `/trackerstream/kad/1.0.0`
 // (a private routing table — libp2p only routes to peers speaking the matching protocol,
 // so no public-IPFS crawl). The catalog topic carries the signed IPNS record push-style.
+//
+// EVOLUTION POLICY (wire-version hardening): DHTPrefix is the network's name AND the routing
+// partition key — it is IMMORTAL; changing it forks the network and strands every existing
+// install (same for the master identity). Every OTHER topic/protocol below is frozen by
+// default: these strings are matched by EXACT string (multistream-select for streams, topic
+// name for pubsub) with no runtime negotiation, so flipping one to a new /x.y.z silently
+// partitions every peer still on the old string. When one genuinely must evolve, DUAL-REGISTER
+// (old + new simultaneously) via registerStreamHandler / subscribeTopics and retire the old ID
+// only after AgentVersion telemetry shows the old version is gone — NEVER a hard flip. A flip
+// with no overlap window is a release-blocking bug.
 const (
 	DHTPrefix    protocol.ID = "/trackerstream"
 	CatalogTopic             = "/trackerstream/catalog/1.0.0"
 	// PlaylistTopic carries {name, signed IPNS record, playlist doc} envelopes — the doc
 	// travels INLINE (no bitswap fetch path exists for playlists); see playlist.go.
-	PlaylistTopic             = "/trackerstream/playlist/1.0.0"
-	PeerProtocol  protocol.ID = "/trackerstream/peer/1.0.0"
+	PlaylistTopic = "/trackerstream/playlist/1.0.0"
 	// PlaylistListProtocol is the direct "what playlists do you hold?" request/response
 	// stream (disclosure set = held + published-mine only; see playlistlist.go).
 	PlaylistListProtocol protocol.ID = "/trackerstream/playlist-list/1.0.0"
@@ -31,6 +40,26 @@ const (
 	// FwdProtocol is the public, content-addressed block-forwarding stream (R5; see fwd.go).
 	FwdProtocol protocol.ID = "/trackerstream/fwd/1.0.0"
 )
+
+// Version is the trackerstream app version, stamped at build time via
+//
+//	-ldflags "-X github.com/trackerstream/tsnode.Version=$(git describe --tags --always)"
+//
+// Plain `go build` / `go test` leave the "dev" fallback. This is the SINGLE source of truth
+// for the version string: it feeds both the libp2p UserAgent (node.go) and the RPC /version
+// response (rpc.go), so the two can never drift. The agent string is ADVISORY only — never
+// gate correctness or security on it; the enforceable "you must update" signal is the
+// separate signed min_client_version (tracked outside this change).
+var Version = "dev"
+
+// agentRole is the role token in the libp2p UserAgent. The master seeds the corpus, so it
+// advertises "seed"; every other node is a "client".
+func (r Role) agentRole() string {
+	if r == RoleServer {
+		return "seed"
+	}
+	return "client"
+}
 
 // donorRendezvous is the stable CID that publicly-reachable donors Provide so a NAT'd peer's
 // AutoRelay peer source can discover them (R5 Phase B). Deterministic — every node computes the

@@ -29,6 +29,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/metrics"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/core/routing"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
@@ -72,6 +73,10 @@ type Node struct {
 	provDedup *lru.Cache[string, struct{}] // recently-Provided CIDs — skip the redundant DHT walk
 	provOK    atomic.Int64                 // advertise successes (summarised, not per-CID logged)
 	provFail  atomic.Int64                 // advertise failures
+
+	startedAt         time.Time     // process start (seed/status uptime)
+	reprovideUnix     atomic.Int64  // unix seconds of the last completed reprovide sweep (0 = never)
+	reprovideInterval time.Duration // reprovide period (for next-sweep ETA in seed/status)
 }
 
 const (
@@ -126,6 +131,11 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	var idht *dht.IpfsDHT
 	opts := []libp2p.Option{
 		libp2p.Identity(priv),
+		// Stamp the app version + role into identify's AgentVersion (e.g.
+		// "trackerstream/0.3.1/client"). Advisory/observability only — lets a future release
+		// read the network's version distribution and avoid offering old peers a newer
+		// protocol variant. Never gate correctness on it. Both roles set it.
+		libp2p.UserAgent("trackerstream/" + Version + "/" + cfg.Role.agentRole()),
 		libp2p.ListenAddrStrings(cfg.ListenAddrs...),
 		libp2p.BandwidthReporter(bwc),
 		libp2p.EnableNATService(),                                   // AutoNAT (reachability)
@@ -286,6 +296,7 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		pins:      pins,
 		fwd:       newFwdState(),
 		seeds:     map[peer.ID]struct{}{},
+		startedAt: time.Now(),
 	}
 	for _, ai := range bootstrap {
 		n.seeds[ai.ID] = struct{}{}
@@ -299,10 +310,10 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	// its OWN pinned content via bitswap but is not a proxy for peer-to-peer user traffic. handleFwd
 	// further gates on public reachability, so only public client donors actually carry forwarding.
 	if cfg.Role == RoleClient {
-		n.host.SetStreamHandler(FwdProtocol, n.handleFwd)
+		n.setStreamHandler(n.handleFwd, FwdProtocol)
 		// Playlist-list serving is also client-only: the seed holds no library
 		// (its manifest is forever empty), so it never answers.
-		n.host.SetStreamHandler(PlaylistListProtocol, n.handlePlaylistList)
+		n.setStreamHandler(n.handlePlaylistList, PlaylistListProtocol)
 	}
 	// Zero-resolve wiring (Phase D): every signed catalog record pushed on the gossipsub topic
 	// is validated + stored locally (newest-seq wins), so a client's `routing/get` answers
@@ -372,6 +383,17 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	return n, nil
 }
 
+// setStreamHandler registers h under a LIST of protocol IDs. Today each call passes a single
+// ID, but the signature takes a variadic so the FIRST real protocol bump is a one-line change
+// — add the new ID alongside the old (`n.setStreamHandler(h, FooProto, FooProtoV2)`) so both
+// are served during the overlap window — instead of flipping a string and partitioning every
+// peer still on the old ID. See the protocol-evolution policy in config.go.
+func (n *Node) setStreamHandler(h network.StreamHandler, ids ...protocol.ID) {
+	for _, id := range ids {
+		n.host.SetStreamHandler(id, h)
+	}
+}
+
 // ID is the node's libp2p PeerId.
 func (n *Node) ID() peer.ID { return n.host.ID() }
 
@@ -386,6 +408,38 @@ func (n *Node) Addrs() []multiaddr.Multiaddr { return n.host.Addrs() }
 
 // Bandwidth exposes the per-peer/per-protocol byte counter (the peers-pane attribution).
 func (n *Node) Bandwidth() *metrics.BandwidthCounter { return n.bwc }
+
+// Bitswap exposes the boxo exchange for read-only stats (Stat / LedgerForPeer / WantlistForPeer)
+// — the seed-monitor ledger view (who we've actually served, and what each peer still wants).
+func (n *Node) Bitswap() *bitswap.Bitswap { return n.bswap }
+
+// ProvideStats reports DHT-advertise health: cumulative successes/failures plus the bounded
+// provide queue's current depth and capacity (a persistently-full queue = advertise backpressure).
+func (n *Node) ProvideStats() (ok, fail int64, queue, capacity int) {
+	q, c := 0, 0
+	if n.provideQ != nil {
+		q, c = len(n.provideQ), cap(n.provideQ)
+	}
+	return n.provOK.Load(), n.provFail.Load(), q, c
+}
+
+// Seeds returns the configured bootstrap/seed peer IDs (excluded from peer-provider dialing).
+func (n *Node) Seeds() []peer.ID {
+	out := make([]peer.ID, 0, len(n.seeds))
+	for id := range n.seeds {
+		out = append(out, id)
+	}
+	return out
+}
+
+// Uptime is how long this process has been assembled (seed/status header).
+func (n *Node) Uptime() time.Duration { return time.Since(n.startedAt) }
+
+// LastReprovide is the unix time of the last completed reprovide sweep (0 = none yet), and the
+// configured interval — the monitor computes the next-sweep ETA from the two.
+func (n *Node) LastReprovide() (unix int64, interval time.Duration) {
+	return n.reprovideUnix.Load(), n.reprovideInterval
+}
 
 // Connect dials a peer (used for bootstrap, warm-set formation, the test harness).
 func (n *Node) Connect(ctx context.Context, ai peer.AddrInfo) error {

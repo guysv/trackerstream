@@ -2,6 +2,7 @@ package tsnode
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -33,8 +34,10 @@ func TestBeaconCodec(t *testing.T) {
 	if _, err := decodeBeacon(nil); err == nil {
 		t.Fatalf("empty frame must fail")
 	}
-	if _, err := decodeBeacon([]byte{0x02, 1, 0, 0, 0, 0, 0, 0, 0, 0}); err == nil {
-		t.Fatalf("unknown version must fail")
+	// Unknown-newer version is not "malformed" — it must surface errUnknownWireVersion so
+	// the validator Ignores (no peer-score penalty) rather than Rejects.
+	if _, err := decodeBeacon([]byte{0x02, 1, 0, 0, 0, 0, 0, 0, 0, 0}); !errors.Is(err, errUnknownWireVersion) {
+		t.Fatalf("unknown version must return errUnknownWireVersion, got %v", err)
 	}
 	trailing := append(encodeBeacon(hashes), 0)
 	if _, err := decodeBeacon(trailing); err == nil {
@@ -146,7 +149,12 @@ func TestBeaconValidatorOriginMinGap(t *testing.T) {
 	if r := n.beaconValidator(ctx, hop, mkMsg(valid)); r != pubsub.ValidationIgnore {
 		t.Fatalf("repeat within the origin min gap must Ignore, got %v", r)
 	}
-	if r := n.beaconValidator(ctx, hop, mkMsg([]byte{0x7f})); r != pubsub.ValidationReject {
+	// Unknown-newer version → Ignore (drop locally, don't penalize the sender).
+	if r := n.beaconValidator(ctx, hop, mkMsg([]byte{0x7f})); r != pubsub.ValidationIgnore {
+		t.Fatalf("unknown-version beacon must Ignore, got %v", r)
+	}
+	// Malformed WITHIN our version (0x01 then a truncated count) → Reject.
+	if r := n.beaconValidator(ctx, hop, mkMsg([]byte{beaconVersion, 0xff})); r != pubsub.ValidationReject {
 		t.Fatalf("malformed beacon must Reject, got %v", r)
 	}
 }

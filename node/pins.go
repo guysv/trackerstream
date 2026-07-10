@@ -189,6 +189,7 @@ func (n *Node) reprovideLoop(ctx context.Context, interval time.Duration) {
 	if n.dht == nil || n.pins == nil {
 		return
 	}
+	n.reprovideInterval = interval // published via ReprovideInterval() for seed/status ETA
 	t := time.NewTimer(30 * time.Second)
 	defer t.Stop()
 	for {
@@ -215,6 +216,7 @@ func (n *Node) reprovideLoop(ctx context.Context, interval time.Duration) {
 				}
 				cancel()
 			}
+			n.reprovideUnix.Store(time.Now().Unix()) // sweep done — seed/status reports last/next
 			t.Reset(interval)
 		}
 	}
