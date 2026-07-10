@@ -171,7 +171,6 @@
 
 {#if !browsing}
   <div class="explore">
-    <GenreGrid {genres} {naCount} onpick={pickGenre} onpickNa={pickNoGenre} />
     <section class="formats">
       <h2>Browse by format</h2>
       <div class="chips">
@@ -186,6 +185,7 @@
         {/each}
       </div>
     </section>
+    <GenreGrid {genres} {naCount} onpick={pickGenre} onpickNa={pickNoGenre} />
   </div>
 {:else}
   <div class="results-head">
