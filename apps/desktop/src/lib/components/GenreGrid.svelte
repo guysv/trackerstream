@@ -2,8 +2,8 @@
   import type { GenreCount } from "$lib/catalog";
 
   // The home "Browse by genre" directory. Reads meta.genre_counts (via getGenres) — no scan.
-  // Sorted by name by default (toggle flips to size/populous-first), with an expander for the
-  // full 77-genre list.
+  // Sorted by name by default (toggle flips to size/populous-first). The full genre list is
+  // always shown.
   // `naCount` is the un-genred tail (genreid IS NULL) — most of the corpus. It's rendered as a
   // trailing "n/a" tile (always last, regardless of the count sort / collapse) that browses that
   // tail via `onpickNa`. Hidden when 0.
@@ -19,19 +19,15 @@
     onpickNa: () => void;
   } = $props();
 
-  const COLLAPSED = 12;
-  let expanded = $state(false);
-
   // Genres arrive from the backend sorted by size (count desc). Name is the default
   // view here; "size" flips back to the populous-first order. The n/a tile is pinned
   // last by the markup below, so it's unaffected by either sort.
   let sortBy = $state<"name" | "size">("name");
-  const sorted = $derived(
+  const shown = $derived(
     sortBy === "name"
       ? [...genres].sort((a, b) => a.genre.localeCompare(b.genre))
       : [...genres].sort((a, b) => b.count - a.count),
   );
-  const shown = $derived(expanded ? sorted : sorted.slice(0, COLLAPSED));
 </script>
 
 {#if genres.length > 0}
@@ -46,12 +42,6 @@
       >
         {sortBy === "name" ? "by name" : "by count"}
       </button>
-      {#if genres.length > COLLAPSED}
-        <span class="sep" aria-hidden="true">·</span>
-        <button class="more" onclick={() => (expanded = !expanded)}>
-          {expanded ? "show less" : `all ${genres.length}`}
-        </button>
-      {/if}
     </div>
     <div class="grid">
       {#each shown as g (g.genreid)}
