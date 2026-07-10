@@ -11,6 +11,7 @@ package tsnode
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -28,7 +29,19 @@ import (
 const (
 	playlistDocMax  = 1 << 20 // 1 MiB — a bigger doc is adversarial by definition (validator drops it)
 	playlistNameMax = 128     // base58 PeerId length bound (envelope sanity)
+	// playlistMsgVersion is the leading byte of the gossip envelope. It exists so a future
+	// framing change can add/reorder frames without a flag-day: an old client that reads a
+	// version it doesn't know Ignores the message (no peer-score penalty) instead of
+	// Rejecting-and-poisoning the sender. Bump only for a genuinely incompatible layout.
+	playlistMsgVersion byte = 0x01
 )
+
+// errUnknownWireVersion marks a custom pubsub/stream message whose leading version byte is
+// one this build doesn't speak — a newer peer, not a bad actor. Validators map it to
+// ValidationIgnore (drop locally, no score penalty), NEVER ValidationReject. Reject is
+// reserved for messages malformed WITHIN a version we claim to speak. Shared by the
+// playlist envelope and the hold beacon (beacon.go).
+var errUnknownWireVersion = errors.New("unknown wire message version")
 
 // Tunables kept as vars so tests can shrink them.
 var (
@@ -86,11 +99,12 @@ func (n *Node) plAllow(from peer.ID, size int) bool {
 
 // ---- gossip envelope ----
 
-// encodePlaylistMsg frames the playlist gossip envelope: uvarint-length-prefixed
-// name ++ record ++ doc. Binary because the doc can be ~1 MiB and the envelope is
-// Go↔Go only — JSON's base64 would add +33% to every mesh hop.
+// encodePlaylistMsg frames the playlist gossip envelope: a leading version byte then
+// uvarint-length-prefixed name ++ record ++ doc. Binary because the doc can be ~1 MiB and
+// the envelope is Go↔Go only — JSON's base64 would add +33% to every mesh hop.
 func encodePlaylistMsg(name string, rec, doc []byte) []byte {
-	buf := make([]byte, 0, len(name)+len(rec)+len(doc)+3*binary.MaxVarintLen64)
+	buf := make([]byte, 0, 1+len(name)+len(rec)+len(doc)+3*binary.MaxVarintLen64)
+	buf = append(buf, playlistMsgVersion)
 	for _, part := range [][]byte{[]byte(name), rec, doc} {
 		buf = binary.AppendUvarint(buf, uint64(len(part)))
 		buf = append(buf, part...)
@@ -107,6 +121,13 @@ func readFrame(b []byte, max int) (part, rest []byte, err error) {
 }
 
 func decodePlaylistMsg(b []byte) (name string, rec, doc []byte, err error) {
+	// Version dispatch FIRST: an unknown-newer version must return errUnknownWireVersion
+	// (→ Ignore) and never reach the frame/trailing-bytes logic below, which is valid only
+	// within this version's layout.
+	if len(b) == 0 || b[0] != playlistMsgVersion {
+		return "", nil, nil, errUnknownWireVersion
+	}
+	b = b[1:]
 	nb, b, err := readFrame(b, playlistNameMax)
 	if err != nil {
 		return "", nil, nil, err
@@ -310,6 +331,10 @@ func (n *Node) playlistValidator(_ context.Context, from peer.ID, m *pubsub.Mess
 	}
 	name, rec, doc, err := decodePlaylistMsg(m.Data)
 	if err != nil {
+		if errors.Is(err, errUnknownWireVersion) {
+			// A newer envelope from the future — drop locally, don't penalize the sender.
+			return pubsub.ValidationIgnore
+		}
 		return pubsub.ValidationReject
 	}
 	if _, err := validatePlaylistMsg(name, rec, doc); err != nil {

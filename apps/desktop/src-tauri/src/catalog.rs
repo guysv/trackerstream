@@ -10,7 +10,7 @@
 //! whole `rusqlite` open+query on a `spawn_blocking` thread and `block_on` a captured
 //! runtime handle for each ranged read — never blocking an async worker.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
@@ -731,6 +731,47 @@ pub async fn warm(rpc: NodeRpc, cid: Cid) -> Result<(), String> {
     Ok(())
 }
 
+/// Client's expected catalog schema version — mirrors `CATALOG_SCHEMA_VERSION` in
+/// apps/server/src/catalog.ts. The client hand-ports the server SQL with POSITIONAL row
+/// mapping (`HIT_COLS` / `DETAIL_COLS` + `r.get(N)`), so a column reorder/drop it can't see
+/// would silently mis-read. Bump in lockstep with the server ONLY on a non-additive layout
+/// change; additive columns (as md5 + genreid already were) keep this version and stay readable.
+const CATALOG_SCHEMA_VERSION: i64 = 1;
+
+/// Catalog CIDs whose schema_version we've already checked — warn at most once per catalog per
+/// process (mirrors the size_cache/manifest_cache accessor pattern).
+fn schema_checked() -> &'static Mutex<HashSet<Cid>> {
+    static S: OnceLock<Mutex<HashSet<Cid>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Read `meta.schema_version` once per catalog CID and WARN if it's newer than this client
+/// understands. The positional row-mapping would otherwise mis-read a reordered/dropped column
+/// with no signal — this is the soft-degrade guard (wire-version hardening). Best-effort: a
+/// catalog predating the key (no row) or a read error is treated as compatible and stays silent,
+/// since additive schema growth remains readable.
+fn check_schema_version(conn: &Connection, cid: &Cid) {
+    if schema_checked().lock().unwrap().contains(cid) {
+        return;
+    }
+    let ver: Option<i64> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get::<_, String>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok());
+    if let Some(v) = ver {
+        if v > CATALOG_SCHEMA_VERSION {
+            log::warn!(
+                target: "catalog",
+                "catalog {cid} schema_version {v} is newer than this client understands \
+                 ({CATALOG_SCHEMA_VERSION}); some columns may read incompletely — please update trackerstream"
+            );
+        }
+    }
+    schema_checked().lock().unwrap().insert(*cid);
+}
+
 /// Resolve + open the catalog over the VFS and answer a query. Runs on a blocking
 /// thread (rusqlite is sync; the VFS block_on's per page read). Returns JSON matching
 /// the frontend response shapes so the Svelte call sites are unchanged.
@@ -754,6 +795,9 @@ pub async fn run_query(rpc: NodeRpc, cid: Cid, req: CatalogReq) -> Result<Value,
             // query, so a small cache thrashes and re-reads pages within a single scan. 64 MB
             // holds any bounded query's working set. Negative = KiB (not page count).
             conn.pragma_update(None, "cache_size", -65536i64).ok();
+            // Soft-degrade guard: warn once if this catalog was baked with a newer schema than
+            // our positional row-mapping understands (wire-version hardening). Never fails the query.
+            check_schema_version(&conn, &cid);
             dispatch(&conn, &req).map_err(|e| e.to_string())
         })();
         OPEN_CTX.with(|c| *c.borrow_mut() = None);

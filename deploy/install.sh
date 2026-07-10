@@ -58,7 +58,11 @@ TSNODE_BIN="$(dirname "$0")/dist/tsnode-linux-amd64"
 if [ -f "$TSNODE_BIN" ]; then
   install -m755 "$TSNODE_BIN" /usr/local/bin/tsnode
 elif command -v go >/dev/null; then
-  ( cd "$(dirname "$0")/../node" && go build -trimpath -ldflags "-s -w" -o /usr/local/bin/tsnode ./cmd/tsnode )
+  # Stamp the version (node/config.go Version) for the UserAgent + RPC /version; --always
+  # falls back to a commit hash, "dev" only if git is unavailable.
+  _ver="$(git -C "$(dirname "$0")/.." describe --tags --always 2>/dev/null || echo dev)"
+  ( cd "$(dirname "$0")/../node" && go build -trimpath \
+      -ldflags "-s -w -X github.com/trackerstream/tsnode.Version=$_ver" -o /usr/local/bin/tsnode ./cmd/tsnode )
 else
   echo "WARN: no deploy/dist/tsnode-linux-amd64 and no Go toolchain — run deploy/build-tsnode.sh first" >&2
 fi

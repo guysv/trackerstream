@@ -71,15 +71,24 @@ pub struct PlaylistDoc {
     pub ts: Vec<TrackRef>,
 }
 
-/// Parse + schema-validate untrusted doc bytes. Strict: unknown versions, oversized
-/// fields, or absurd track counts are rejected (and remembered, so never refetched).
+/// Parse + schema-validate untrusted doc bytes.
+///
+/// FORWARD-TOLERANT (wire-version hardening): a NEWER doc (`v >= DOC_VERSION`) is accepted and
+/// read through the fields this client understands — serde ignores unknown fields (no
+/// `deny_unknown_fields`), and `upsert_row` stores the ORIGINAL bytes, so a future additive
+/// field survives storage and re-announce untouched. Only a genuinely OLDER, dropped schema
+/// (`v < DOC_VERSION` — v1 was rowid-keyed and is gone) is rejected. This is what stops the
+/// reject-and-poison flag-day: an old client must DEGRADE past a `v:3` doc, never permanently
+/// cache it as rejected. The contract: only bump `v` for a truly INCOMPATIBLE change, which
+/// must ship with the signed min_client_version gate (item 4) — additive changes keep `v`.
+/// Oversized fields / absurd track counts are still rejected (genuinely malformed).
 pub fn validate_doc(bytes: &[u8]) -> Result<PlaylistDoc> {
     if bytes.is_empty() || bytes.len() > DOC_MAX {
         bail!("doc size {} out of bounds", bytes.len());
     }
     let doc: PlaylistDoc = serde_json::from_slice(bytes)?;
-    if doc.v != DOC_VERSION {
-        bail!("unknown doc version {}", doc.v);
+    if doc.v < DOC_VERSION {
+        bail!("obsolete doc version {}", doc.v);
     }
     if doc.del {
         return Ok(doc);
@@ -1278,6 +1287,21 @@ mod tests {
     }
 
     #[test]
+    fn ingest_accepts_newer_version_and_does_not_poison() {
+        let pl = mem();
+        let kp = Keypair::generate_ed25519();
+        // A well-formed doc from a FUTURE schema (v:99 + a field we don't know): an old client
+        // must DEGRADE to the fields it understands and STORE it — never reject-and-poison a
+        // version from the future (the pre-hardening bug cached (name, seq) as rejected).
+        let future =
+            br#"{"v":99,"t":"future","ts":[["d41d8cd98f00b204e9800998ecf8427e","a.it","Song A"]],"x":1}"#
+                .to_vec();
+        let w = wire_for(&kp, &future, 1);
+        assert!(pl.ingest_wire(&w).unwrap());
+        assert_eq!(pl.get(&w.name).unwrap().unwrap().meta.title, "future");
+    }
+
+    #[test]
     fn newest_seq_wins_and_stale_is_skipped() {
         let pl = mem();
         let kp = Keypair::generate_ed25519();
@@ -1740,7 +1764,12 @@ mod tests {
     fn validate_doc_rejects_garbage() {
         assert!(validate_doc(b"").is_err());
         assert!(validate_doc(b"not json").is_err());
-        assert!(validate_doc(br#"{"v":99,"t":"x"}"#).is_err()); // unknown version
+        // Forward-tolerant: a NEWER version is accepted and read as the v2 fields we know —
+        // it must DEGRADE, not reject-and-poison. Unknown fields are ignored by serde.
+        let newer = validate_doc(br#"{"v":99,"t":"x","future":true}"#).unwrap();
+        assert_eq!(newer.t, "x");
+        // An OLDER, dropped schema (v1 was rowid-keyed and is gone) is still rejected.
+        assert!(validate_doc(br#"{"v":1,"t":"x"}"#).is_err());
         let long = format!(r#"{{"v":2,"t":"{}"}}"#, "x".repeat(400));
         assert!(validate_doc(long.as_bytes()).is_err()); // title too long
         // A track whose md5 key is empty is rejected (must resolve against the catalog).

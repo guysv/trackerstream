@@ -40,6 +40,28 @@ sudo bash deploy/cutover-tsnode.sh cutover
 curl -fsS -X POST 127.0.0.1:5001/api/v0/node/status | jq .
 ```
 
+## Monitoring (tsmon)
+`tsmon` is a terminal dashboard over the node's loopback RPC — the seed-operator's live view:
+reachability + relay-hop breakdown, per-peer bandwidth, and the seed-only signals
+(`deploy/metrics-export.sh` only scrapes 4 gauges of): DHT provide OK/fail + queue depth,
+reprovide timing, pin-kind breakdown, and the real bitswap ledger (bytes actually served per
+peer + their wantlists). Read-only; needs the `seed/status` + `bitswap/*` RPCs (redeploy tsnode
+first — older nodes show `—` in the seed panels).
+
+```sh
+# built alongside tsnode by build-tsnode.sh → deploy/dist/tsmon-<os>-<arch>
+
+# on the box:
+tsmon --rpc http://127.0.0.1:5001
+
+# from your laptop, auto-tunnel the loopback RPC over SSH:
+tsmon --ssh trackerstream-server         # opens ssh -L to :5001 for you
+# …or tunnel yourself, then point tsmon at the local end:
+ssh -N -L 5001:127.0.0.1:5001 trackerstream-server &
+tsmon --rpc http://127.0.0.1:5001
+```
+Keys: `tab` switch view · `s` cycle sort · `enter` peer detail · `p` pause · `r` refresh · `q` quit.
+
 ## Rollback (instant)
 ```sh
 sudo bash deploy/cutover-tsnode.sh rollback   # stop tsnode, re-enable kubo warm standby

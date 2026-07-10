@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -74,10 +75,12 @@ func encodeBeacon(hashes [][8]byte) []byte {
 	return buf
 }
 
-// decodeBeacon rejects anything but an exact-length, cap-respecting frame.
+// decodeBeacon rejects anything but an exact-length, cap-respecting frame. An unknown
+// leading version byte returns errUnknownWireVersion (→ Ignore, not Reject) so a newer
+// beacon format never penalizes the sender's peer-score.
 func decodeBeacon(b []byte) ([][8]byte, error) {
 	if len(b) == 0 || b[0] != beaconVersion {
-		return nil, fmt.Errorf("bad beacon version")
+		return nil, errUnknownWireVersion
 	}
 	count, n := binary.Uvarint(b[1:])
 	if n <= 0 || count == 0 || count > beaconMaxHashes {
@@ -185,14 +188,19 @@ func (s *beaconState) backers(names []string) map[string]int {
 	return out
 }
 
-// beaconValidator gates the topic: first-hop rate (Ignore), format (Reject), and a
-// per-origin minimum gap (Ignore — repeats can't inflate counts anyway, this just
-// keeps them off the mesh). Own publishes exempt from rate policy.
+// beaconValidator gates the topic: first-hop rate (Ignore), unknown-newer version (Ignore),
+// malformed-within-our-version (Reject), and a per-origin minimum gap (Ignore — repeats
+// can't inflate counts anyway, this just keeps them off the mesh). Own publishes exempt
+// from rate policy.
 func (n *Node) beaconValidator(_ context.Context, from peer.ID, m *pubsub.Message) pubsub.ValidationResult {
 	if from != n.host.ID() && !n.beacons.allow(from, len(m.Data)) {
 		return pubsub.ValidationIgnore
 	}
 	if _, err := decodeBeacon(m.Data); err != nil {
+		if errors.Is(err, errUnknownWireVersion) {
+			// A newer beacon format from the future — drop, don't penalize.
+			return pubsub.ValidationIgnore
+		}
 		return pubsub.ValidationReject
 	}
 	origin := m.GetFrom() // authenticated under gossipsub's default StrictSign

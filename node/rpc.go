@@ -3,9 +3,9 @@ package tsnode
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,6 +53,12 @@ func NewRPCServer(n *Node) *RPCServer {
 	s.mux.HandleFunc("/api/v0/bandwidth/by-peer", s.handleBandwidthByPeer)
 	s.mux.HandleFunc("/api/v0/node/status", s.handleNodeStatus)
 	s.mux.HandleFunc("/api/v0/warm", s.handleWarm)
+	// Seed-monitor surface (tsmon): consolidated seed health + bitswap stats/ledger + peer
+	// identify. Read-only; loopback trust model like the rest of the RPC.
+	s.mux.HandleFunc("/api/v0/seed/status", s.handleSeedStatus)
+	s.mux.HandleFunc("/api/v0/bitswap/stat", s.handleBitswapStat)
+	s.mux.HandleFunc("/api/v0/bitswap/ledger", s.handleBitswapLedger)
+	s.mux.HandleFunc("/api/v0/peer/identify", s.handlePeerIdentify)
 	// Content-typed providing (clients advertise what they hold): a track manifest root at
 	// whole-track granularity, or an individual catalog page at piece granularity.
 	s.mux.HandleFunc("/api/v0/provide/track-root", s.handleProvideTrackRoot)
@@ -102,7 +108,9 @@ func (s *RPCServer) handleID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *RPCServer) handleVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"Version": "tsnode/0.1.0"})
+	// Shares the build-stamped Version (config.go) with the libp2p UserAgent so the two
+	// never drift.
+	writeJSON(w, map[string]any{"Version": "tsnode/" + Version})
 }
 
 // codecFromString maps the kubo `cid-codec` param to a multicodec value. Matches the
@@ -575,6 +583,125 @@ func (s *RPCServer) handleNodeStatus(w http.ResponseWriter, r *http.Request) {
 		"TotalOut":     totals.TotalOut,
 		"Pins":         len(s.node.Pins().Roots()),
 	})
+}
+
+// handleSeedStatus is node/status plus the seed-operator "and beyond": DHT provide
+// success/fail + queue depth, reprovide timing, pin-kind breakdown, seed peers, uptime and
+// the build-stamped agent version. Consumed by the tsmon TUI header + seed-health strip.
+func (s *RPCServer) handleSeedStatus(w http.ResponseWriter, r *http.Request) {
+	n := s.node
+	totals := n.Bandwidth().GetBandwidthTotals()
+	provOK, provFail, provQ, provCap := n.ProvideStats()
+	reprovUnix, reprovInterval := n.LastReprovide()
+	kinds := n.Pins().CountByKind()
+	seeds := n.Seeds()
+	seedIDs := make([]string, 0, len(seeds))
+	for _, id := range seeds {
+		seedIDs = append(seedIDs, id.String())
+	}
+	writeJSON(w, map[string]any{
+		"ID":           n.ID().String(),
+		"Role":         string(n.cfg.Role),
+		"AgentVersion": "trackerstream/" + Version + "/" + n.cfg.Role.agentRole(),
+		"Version":      Version,
+		"UptimeSec":    int64(n.Uptime().Seconds()),
+		"Reachability": n.Control().Reachable(),
+		"RelayStats":   n.Control().Stats(),
+		"Peers":        len(n.Host().Network().Peers()),
+		"CatalogPeers": len(n.PubSub().CatalogPeers()),
+		"TotalIn":      totals.TotalIn,
+		"TotalOut":     totals.TotalOut,
+		"Pins":         len(n.Pins().Roots()),
+		"PinsByKind": map[string]int{
+			"root":          kinds[KindRoot],
+			"track_root":    kinds[KindTrackRoot],
+			"catalog_piece": kinds[KindCatalogPiece],
+		},
+		"Provide": map[string]any{
+			"OK": provOK, "Fail": provFail, "Queue": provQ, "Cap": provCap,
+		},
+		"Reprovide": map[string]any{
+			"LastUnix": reprovUnix, "IntervalSec": int64(reprovInterval.Seconds()),
+		},
+		"Seeds": seedIDs,
+	})
+}
+
+// handleBitswapStat surfaces boxo's global exchange counters (blocks/bytes served vs fetched,
+// dup receives, our wantlist size, engaged-peer count) — the seed-health throughput strip.
+func (s *RPCServer) handleBitswapStat(w http.ResponseWriter, r *http.Request) {
+	bs := s.node.Bitswap()
+	if bs == nil {
+		rpcErr(w, http.StatusServiceUnavailable, errors.New("bitswap unavailable"))
+		return
+	}
+	st, err := bs.Stat()
+	if err != nil {
+		rpcErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"BlocksSent":       st.BlocksSent,
+		"DataSent":         st.DataSent,
+		"BlocksReceived":   st.BlocksReceived,
+		"DataReceived":     st.DataReceived,
+		"DupBlksReceived":  st.DupBlksReceived,
+		"DupDataReceived":  st.DupDataReceived,
+		"MessagesReceived": st.MessagesReceived,
+		"WantlistLen":      len(st.Wantlist),
+		"EngagedPeers":     len(st.Peers),
+	})
+}
+
+// handleBitswapLedger is the per-peer seeding ledger: for every currently-connected peer, the
+// boxo decision-engine receipt (bytes Sent to / Recv from us + debt Value) joined with how many
+// blocks that peer still wants from us (WantlistLen). This is the "who am I actually seeding to,
+// and how much" view the bandwidth counter can't give (it can't tell serve from any other byte).
+func (s *RPCServer) handleBitswapLedger(w http.ResponseWriter, r *http.Request) {
+	bs := s.node.Bitswap()
+	if bs == nil {
+		rpcErr(w, http.StatusServiceUnavailable, errors.New("bitswap unavailable"))
+		return
+	}
+	out := map[string]map[string]any{}
+	for _, p := range s.node.Host().Network().Peers() {
+		rcpt := bs.LedgerForPeer(p)
+		if rcpt == nil {
+			continue
+		}
+		out[p.String()] = map[string]any{
+			"Sent":        rcpt.Sent,
+			"Recv":        rcpt.Recv,
+			"Value":       rcpt.Value,
+			"Exchanged":   rcpt.Exchanged,
+			"WantlistLen": len(bs.WantlistForPeer(p)),
+		}
+	}
+	writeJSON(w, map[string]any{"ByPeer": out})
+}
+
+// handlePeerIdentify fills the peers-pane stubs (agent/protocols) from the peerstore — no live
+// probe, just what identify already recorded. RTT/observed-addr are intentionally omitted (they'd
+// need an active ping). arg = peer id.
+func (s *RPCServer) handlePeerIdentify(w http.ResponseWriter, r *http.Request) {
+	id, err := peer.Decode(r.URL.Query().Get("arg"))
+	if err != nil {
+		rpcErr(w, http.StatusBadRequest, err)
+		return
+	}
+	ps := s.node.Host().Peerstore()
+	agent := ""
+	if v, err := ps.Get(id, "AgentVersion"); err == nil {
+		if sv, ok := v.(string); ok {
+			agent = sv
+		}
+	}
+	protos, _ := ps.GetProtocols(id)
+	protoStrs := make([]string, 0, len(protos))
+	for _, p := range protos {
+		protoStrs = append(protoStrs, string(p))
+	}
+	writeJSON(w, map[string]any{"Agent": agent, "Protocols": protoStrs})
 }
 
 // handleWarm marks a peer keepalive-worthy (warm holder) — the client's warm_root command.

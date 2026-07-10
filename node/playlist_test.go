@@ -2,6 +2,7 @@ package tsnode
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -121,6 +122,30 @@ func TestPlaylistValidatorRejectsTamperedDoc(t *testing.T) {
 	}
 	if _, ok := a.playlists.getRecord(name); ok {
 		t.Fatalf("tampered message reached the store")
+	}
+}
+
+// The gossip envelope carries a leading version byte: it round-trips, and an unknown-newer
+// version decodes to errUnknownWireVersion (→ validator Ignore, no peer-score penalty) WITHOUT
+// ever reaching the frame / trailing-bytes logic that is valid only within this version.
+func TestPlaylistEnvelopeVersion(t *testing.T) {
+	name, rec, doc := "pl", []byte("record"), []byte(`{"v":2}`)
+	wire := encodePlaylistMsg(name, rec, doc)
+	if wire[0] != playlistMsgVersion {
+		t.Fatalf("envelope must lead with the version byte, got %#x", wire[0])
+	}
+	gotName, gotRec, gotDoc, err := decodePlaylistMsg(wire)
+	if err != nil || gotName != name || string(gotRec) != string(rec) || string(gotDoc) != string(doc) {
+		t.Fatalf("roundtrip: %q %q %q %v", gotName, gotRec, gotDoc, err)
+	}
+	// A byte we don't speak (0x02) must short-circuit to errUnknownWireVersion — even though
+	// the rest of the frame is otherwise well-formed.
+	future := append([]byte{0x02}, wire[1:]...)
+	if _, _, _, err := decodePlaylistMsg(future); !errors.Is(err, errUnknownWireVersion) {
+		t.Fatalf("unknown version must return errUnknownWireVersion, got %v", err)
+	}
+	if _, _, _, err := decodePlaylistMsg(nil); !errors.Is(err, errUnknownWireVersion) {
+		t.Fatalf("empty envelope must return errUnknownWireVersion, got %v", err)
 	}
 }
 
