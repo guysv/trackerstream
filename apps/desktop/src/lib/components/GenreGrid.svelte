@@ -46,6 +46,7 @@
         {sortBy === "name" ? "sort by size" : "sort by name"}
       </button>
       {#if genres.length > COLLAPSED}
+        <span class="sep" aria-hidden="true">·</span>
         <button class="more" onclick={() => (expanded = !expanded)}>
           {expanded ? "show less" : `all ${genres.length}`}
         </button>
@@ -92,6 +93,10 @@
     font-size: 11px;
     cursor: pointer;
     padding: 0;
+  }
+  .sep {
+    color: var(--dim);
+    font-size: 11px;
   }
   .grid {
     display: grid;
