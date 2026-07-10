@@ -2,7 +2,8 @@
   import type { GenreCount } from "$lib/catalog";
 
   // The home "Browse by genre" directory. Reads meta.genre_counts (via getGenres) — no scan.
-  // Shows the most-populous genres by default with an expander for the full 77-genre list.
+  // Sorted by name by default (toggle flips to size/populous-first), with an expander for the
+  // full 77-genre list.
   // `naCount` is the un-genred tail (genreid IS NULL) — most of the corpus. It's rendered as a
   // trailing "n/a" tile (always last, regardless of the count sort / collapse) that browses that
   // tail via `onpickNa`. Hidden when 0.
@@ -20,13 +21,30 @@
 
   const COLLAPSED = 12;
   let expanded = $state(false);
-  const shown = $derived(expanded ? genres : genres.slice(0, COLLAPSED));
+
+  // Genres arrive from the backend sorted by size (count desc). Name is the default
+  // view here; "size" flips back to the populous-first order. The n/a tile is pinned
+  // last by the markup below, so it's unaffected by either sort.
+  let sortBy = $state<"name" | "size">("name");
+  const sorted = $derived(
+    sortBy === "name"
+      ? [...genres].sort((a, b) => a.genre.localeCompare(b.genre))
+      : [...genres].sort((a, b) => b.count - a.count),
+  );
+  const shown = $derived(expanded ? sorted : sorted.slice(0, COLLAPSED));
 </script>
 
 {#if genres.length > 0}
   <section class="genres">
     <div class="head">
       <h2>Browse by genre</h2>
+      <button
+        class="more"
+        onclick={() => (sortBy = sortBy === "name" ? "size" : "name")}
+        title="Toggle sort order"
+      >
+        {sortBy === "name" ? "sort by size" : "sort by name"}
+      </button>
       {#if genres.length > COLLAPSED}
         <button class="more" onclick={() => (expanded = !expanded)}>
           {expanded ? "show less" : `all ${genres.length}`}
