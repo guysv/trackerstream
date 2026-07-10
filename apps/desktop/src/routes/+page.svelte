@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import ResultsTable from "$lib/components/ResultsTable.svelte";
-  import Rail from "$lib/components/Rail.svelte";
   import GenreGrid from "$lib/components/GenreGrid.svelte";
   import {
     listModules,
@@ -20,6 +19,7 @@
   let browsing = $state(false);
   let genre = $state<number | null>(null);
   let genreLabel = $state("");
+  let noGenre = $state(false); // the "n/a" facet: browse the un-genred tail (genreid IS NULL)
   let format = $state<string | null>(null);
   let sort = $state<"latest" | "random" | "title">("latest");
 
@@ -27,19 +27,30 @@
   let formats = $state<FormatCount[]>([]);
   let genres = $state<GenreCount[]>([]);
   let total = $state(0);
-  // Landing rails. Fresh = latest ingested; surprise = random. (TMA-charts rails land here later.)
-  let fresh = $state<ModuleHit[]>([]);
-  let surprise = $state<ModuleHit[]>([]);
+
+  // The un-genred tail: whole corpus minus everything the per-genre counts cover. Most of the
+  // corpus is un-genred, so this is the largest bucket — shown as a trailing "n/a" genre tile.
+  const naCount = $derived(
+    Math.max(0, total - genres.reduce((s, g) => s + g.count, 0)),
+  );
 
   const facetLabel = $derived(
-    genre !== null ? genreLabel : format !== null ? format.toUpperCase() : "All modules",
+    noGenre
+      ? "No genre"
+      : genre !== null
+        ? genreLabel
+        : format !== null
+          ? format.toUpperCase()
+          : "All modules",
   );
   const facetCount = $derived(
-    genre !== null
-      ? (genres.find((g) => g.genreid === genre)?.count ?? 0)
-      : format !== null
-        ? (formats.find((f) => f.format === format)?.count ?? 0)
-        : total,
+    noGenre
+      ? naCount
+      : genre !== null
+        ? (genres.find((g) => g.genreid === genre)?.count ?? 0)
+        : format !== null
+          ? (formats.find((f) => f.format === format)?.count ?? 0)
+          : total,
   );
 
   const sorts: Array<"latest" | "random" | "title"> = ["latest", "random", "title"];
@@ -54,11 +65,12 @@
 
   // Restore the whole view (facet + selection + scroll) across back/forward navigation.
   export const snapshot = {
-    capture: () => ({ browsing, genre, genreLabel, format, sort, selectedId, scrollTop }),
+    capture: () => ({ browsing, genre, genreLabel, noGenre, format, sort, selectedId, scrollTop }),
     restore: (v: {
       browsing: boolean;
       genre: number | null;
       genreLabel: string;
+      noGenre: boolean;
       format: string | null;
       sort: "latest" | "random" | "title";
       selectedId: number | null;
@@ -67,6 +79,7 @@
       browsing = v.browsing;
       genre = v.genre;
       genreLabel = v.genreLabel;
+      noGenre = v.noGenre;
       format = v.format;
       sort = v.sort;
       selectedId = v.selectedId;
@@ -76,23 +89,33 @@
 
   function pickGenre(id: number, label: string) {
     format = null;
+    noGenre = false;
     genreLabel = label;
     genre = id;
     browsing = true;
   }
+  function pickNoGenre() {
+    genre = null;
+    format = null;
+    noGenre = true;
+    browsing = true;
+  }
   function pickFormat(fmt: string) {
     genre = null;
+    noGenre = false;
     format = fmt;
     browsing = true;
   }
   function browseAll() {
     genre = null;
+    noGenre = false;
     format = null;
     browsing = true;
   }
   function backToExplore() {
     browsing = false;
     genre = null;
+    noGenre = false;
     format = null;
   }
 
@@ -100,12 +123,6 @@
     playList(
       rows,
       rows.findIndex((r) => r.id === h.id),
-    );
-  }
-  function playFrom(list: ModuleHit[], h: ModuleHit) {
-    playList(
-      list,
-      list.findIndex((r) => r.id === h.id),
     );
   }
 
@@ -116,12 +133,6 @@
     getGenres()
       .then((g) => (genres = g.genres))
       .catch(() => {});
-    listModules({ sort: "latest", limit: 18 })
-      .then((r) => (fresh = r))
-      .catch(() => {});
-    listModules({ sort: "random", limit: 18 })
-      .then((r) => (surprise = r))
-      .catch(() => {});
   });
 
   let timer: ReturnType<typeof setTimeout>;
@@ -129,6 +140,7 @@
   $effect(() => {
     const b = browsing;
     const g = genre;
+    const ng = noGenre;
     const fmt = format;
     const s = sort;
     if (!b) return; // landing mode: no results query
@@ -141,6 +153,7 @@
       try {
         const result = await listModules({
           genre: g ?? undefined,
+          noGenre: ng,
           format: fmt ?? undefined,
           sort: s,
           limit: 300,
@@ -158,9 +171,7 @@
 
 {#if !browsing}
   <div class="explore">
-    <Rail title="Fresh" rows={fresh} onplay={(h) => playFrom(fresh, h)} />
-    <Rail title="Surprise me" rows={surprise} onplay={(h) => playFrom(surprise, h)} />
-    <GenreGrid {genres} onpick={pickGenre} />
+    <GenreGrid {genres} {naCount} onpick={pickGenre} onpickNa={pickNoGenre} />
     <section class="formats">
       <h2>Browse by format</h2>
       <div class="chips">

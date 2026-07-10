@@ -694,6 +694,11 @@ pub enum CatalogReq {
         /// Browse a single genre (TMA genreid). Served index-only by the partial
         /// idx_browse_genre; takes precedence over `format` (one facet at a time).
         #[serde(default)] genre: Option<i64>,
+        /// Browse the *un-genred* tail (`genreid IS NULL`) — the home "n/a" facet. The majority
+        /// of the corpus is un-genred, so idx_browse_genre (partial, IS NOT NULL) can't serve
+        /// this; the latest-sort path walks idx_latest and matches fast (most rows qualify).
+        /// Takes precedence over both `genre` and `format`.
+        #[serde(default)] no_genre: bool,
         #[serde(default)] sort: Option<String>,
         #[serde(default)] limit: Option<i64>,
         #[serde(default)] offset: Option<i64>,
@@ -907,8 +912,8 @@ pub async fn run_search_parallel(
 fn dispatch(conn: &Connection, req: &CatalogReq) -> rusqlite::Result<Value> {
     match req {
         CatalogReq::Search { q, limit, after, names } => search(conn, q, limit.unwrap_or(50), *after, *names),
-        CatalogReq::List { format, genre, sort, limit, offset } => {
-            list(conn, format.as_deref(), *genre, sort.as_deref(), limit.unwrap_or(100), offset.unwrap_or(0))
+        CatalogReq::List { format, genre, no_genre, sort, limit, offset } => {
+            list(conn, format.as_deref(), *genre, *no_genre, sort.as_deref(), limit.unwrap_or(100), offset.unwrap_or(0))
         }
         CatalogReq::Get { id } => get(conn, *id),
         CatalogReq::GetByMd5 { md5 } => get_by_md5(conn, md5),
@@ -1082,6 +1087,7 @@ fn list(
     conn: &Connection,
     format: Option<&str>,
     genre: Option<i64>,
+    no_genre: bool,
     sort: Option<&str>,
     limit: i64,
     offset: i64,
@@ -1094,9 +1100,12 @@ fn list(
         _ => "ingested_at DESC, id DESC",
     };
     // One facet at a time keeps every browse index-only (idx_browse_genre / idx_browse_format).
-    // genre wins if both are set; `genreid = ?` implies IS NOT NULL, so the *partial*
-    // idx_browse_genre still covers it (verified via EXPLAIN QUERY PLAN).
-    let where_clause = if genre.is_some() {
+    // no_genre ("n/a") wins first, then genre, then format. `genreid = ?` implies IS NOT NULL, so
+    // the *partial* idx_browse_genre still covers it (verified via EXPLAIN QUERY PLAN). The IS NULL
+    // tail has no partial index (it's most of the corpus), so it filters over the sort index.
+    let where_clause = if no_genre {
+        "WHERE genreid IS NULL"
+    } else if genre.is_some() {
         "WHERE genreid = ?"
     } else if format.is_some() {
         "WHERE format = ?"
@@ -1108,7 +1117,9 @@ fn list(
         HIT_COLS.replace("m.", "")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let results = if let Some(g) = genre {
+    let results = if no_genre {
+        collect(&mut stmt, &[&limit as &dyn rusqlite::ToSql, &offset])?
+    } else if let Some(g) = genre {
         collect(&mut stmt, &[&g as &dyn rusqlite::ToSql, &limit, &offset])?
     } else if let Some(fmt) = format {
         collect(&mut stmt, &[&fmt as &dyn rusqlite::ToSql, &limit, &offset])?
