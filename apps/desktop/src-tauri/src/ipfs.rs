@@ -321,6 +321,165 @@ pub async fn reassemble(rpc: &NodeRpc, root: Cid) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// --- v3 manifest: v2 streaming + BYTE-EXACT reassembly from the SAME blocks (REBUILD.md) ---
+// v3 streams exactly like v2 (parsed as ManifestV2 for playback — serde ignores the extra
+// fields). For DOWNLOAD it carries, per streamed sample, the on-disk file `offset` + an `enc`
+// transform tag, plus `originalLength`, so the original file is reconstructed by assembling the
+// skeleton then writing enc(decodedPCM) back at each sample's offset. The decoded native PCM v2
+// stores is a deterministic, invertible transform of the on-disk bytes, so no bytes are dup'd.
+
+#[derive(Debug, Deserialize)]
+struct SampleV3 {
+    #[allow(dead_code)]
+    index: u32,
+    #[allow(dead_code)]
+    frames: u32,
+    channels: u32, // native interleave 1|2
+    #[serde(rename = "bitDepth")]
+    bit_depth: u32, // 8|16
+    chunks: Vec<Cid>, // decoded native-layout PCM leaves (same blocks v2 streams)
+    offset: u64, // on-disk byte offset in the original file
+    enc: u32, // ENC_* bitmask: enc(decoded) == on-disk bytes
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexV3 {
+    samples: Vec<SampleV3>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestV3 {
+    #[serde(rename = "originalLength")]
+    original_length: u64,
+    #[serde(rename = "skeletonChunks")]
+    skeleton_chunks: Vec<Cid>,
+    #[serde(default, rename = "skeletonLayout")]
+    skeleton_layout: Vec<u64>,
+    #[serde(default)]
+    index: Option<IndexV3>,
+    #[serde(default, rename = "indexRoot")]
+    index_root: Option<Cid>,
+}
+
+const ENC_SIGN: u32 = 0x1;
+const ENC_DELTA: u32 = 0x2;
+const ENC_DEINT: u32 = 0x4;
+
+/// Turn decoded native PCM into on-disk bytes under `enc` (DEINT -> SIGN -> DELTA). MUST stay in
+/// lockstep with `applyEnc` in packages/repack/src/dag.ts (the bake byte-verified the tag).
+fn apply_enc(enc: u32, d: &[u8], bit_depth: u32, channels: u32) -> Vec<u8> {
+    let bps = if bit_depth == 16 { 2usize } else { 1usize };
+    let mut cur = d.to_vec();
+
+    if enc & ENC_DEINT != 0 && channels == 2 && cur.len() % (bps * 2) == 0 {
+        let frames = cur.len() / (bps * 2);
+        let mut out = vec![0u8; cur.len()];
+        for f in 0..frames {
+            for c in 0..2 {
+                for b in 0..bps {
+                    out[(c * frames + f) * bps + b] = cur[(f * 2 + c) * bps + b];
+                }
+            }
+        }
+        cur = out;
+    }
+    if enc & ENC_SIGN != 0 {
+        if bps == 1 {
+            for x in cur.iter_mut() {
+                *x ^= 0x80;
+            }
+        } else {
+            let mut i = 1;
+            while i < cur.len() {
+                cur[i] ^= 0x80;
+                i += 2;
+            }
+        }
+    }
+    if enc & ENC_DELTA != 0 {
+        let nch = if enc & ENC_DEINT != 0 && channels == 2 { 2 } else { 1 };
+        let ch_len = cur.len() / nch;
+        let mut out = vec![0u8; cur.len()];
+        for c in 0..nch {
+            let base = c * ch_len;
+            if bps == 1 {
+                let mut p: u8 = 0;
+                for i in 0..ch_len {
+                    let v = cur[base + i];
+                    out[base + i] = v.wrapping_sub(p);
+                    p = v;
+                }
+            } else {
+                let mut p: u16 = 0;
+                let mut i = 0;
+                while i + 1 < ch_len {
+                    let v = (cur[base + i] as u16) | ((cur[base + i + 1] as u16) << 8);
+                    let dd = v.wrapping_sub(p);
+                    out[base + i] = dd as u8;
+                    out[base + i + 1] = (dd >> 8) as u8;
+                    p = v;
+                    i += 2;
+                }
+            }
+        }
+        cur = out;
+    }
+    cur
+}
+
+/// Reassemble the BYTE-EXACT original from a v3 root: assemble the skeleton (streamed regions are
+/// zero there), then write enc(decodedPCM) into each sample's file offset. Resident samples already
+/// sit in the skeleton. Every block CID is verified on fetch (fetch_bytes / fetch_many).
+pub async fn reassemble_v3(rpc: &NodeRpc, root: Cid) -> Result<Vec<u8>> {
+    let manifest_bytes = fetch_bytes(rpc, root).await?;
+    let manifest: ManifestV3 = serde_ipld_dagcbor::from_slice(&manifest_bytes)?;
+    let index = match manifest.index {
+        Some(ix) => ix,
+        None => {
+            let ir = manifest.index_root.ok_or_else(|| anyhow!("v3 manifest missing index + indexRoot"))?;
+            serde_ipld_dagcbor::from_slice(&fetch_bytes(rpc, ir).await?)?
+        }
+    };
+
+    // One concurrent fetch of every block (skeleton structure + all sample PCM leaves).
+    let mut all: Vec<Cid> = manifest.skeleton_chunks.clone();
+    for s in &index.samples {
+        all.extend_from_slice(&s.chunks);
+    }
+    let blocks = fetch_many(rpc, &all).await?;
+
+    let mut out = assemble_skeleton(&manifest.skeleton_chunks, &manifest.skeleton_layout, &blocks)?;
+    if out.len() as u64 != manifest.original_length {
+        return Err(anyhow!("v3 skeleton length {} != originalLength {}", out.len(), manifest.original_length));
+    }
+    for s in &index.samples {
+        let mut pcm = Vec::new();
+        for c in &s.chunks {
+            pcm.extend_from_slice(blocks.get(c).ok_or_else(|| anyhow!("missing sample chunk {c}"))?);
+        }
+        let enc = apply_enc(s.enc, &pcm, s.bit_depth, s.channels);
+        let off = s.offset as usize;
+        if off + enc.len() > out.len() {
+            return Err(anyhow!("v3 sample at {off} (+{}) overruns {}", enc.len(), out.len()));
+        }
+        out[off..off + enc.len()].copy_from_slice(&enc);
+    }
+    Ok(out)
+}
+
+/// Reassemble the byte-exact original from ANY reassemble-able root, dispatching on manifest
+/// version: v3 (streaming + reassembly), v0/v1 (whole-file byte-exact). A v2 (streaming-only)
+/// root has no byte-exact path; a newer version is unsupported. Used by the "Open with" download.
+pub async fn reassemble_any(rpc: &NodeRpc, root: Cid) -> Result<Vec<u8>> {
+    let manifest_bytes = fetch_bytes(rpc, root).await?;
+    match manifest_version(&manifest_bytes) {
+        3 => reassemble_v3(rpc, root).await,
+        0 | 1 => reassemble(rpc, root).await,
+        2 => Err(anyhow!("v2 (streaming-only) root has no byte-exact reassembly; re-bake to v3")),
+        other => Err(anyhow!("unsupported manifest version {other}; please update trackerstream")),
+    }
+}
+
 // --- v2 streaming: immortal instance + provide_sample + playhead prefetch ------
 
 /// Per-stream shared state: the assembled skeleton, decoded sample PCM as it
@@ -448,7 +607,9 @@ pub async fn stream_v2(
     // it doesn't understand.
     let ver = manifest_version(&manifest_bytes);
     match ver {
-        2 => {} // fall through to the v2 streaming path below
+        // v3 streams identically to v2 — it only ADDS reassembly fields (offset/enc/originalLength)
+        // that the ManifestV2 decode below ignores. So both route through the v2 streaming path.
+        2 | 3 => {} // fall through to the v2 streaming path below
         0 | 1 => {
             log::info!(target: "stream", "{root}: v{ver} root -> full reassemble (no streaming)");
             let bytes = reassemble(rpc, root).await?;
@@ -585,6 +746,52 @@ pub async fn stream_v2(
 mod tests {
     use super::*;
 
+    // apply_enc must byte-match packages/repack/src/dag.ts applyEnc (the bake picks + byte-verifies
+    // the tag there; the client reverses it here). Vectors generated from the TS impl over the same
+    // 16-byte input across every enc mask (0..8) x bitDepth {8,16} x channels {1,2}.
+    #[test]
+    fn apply_enc_matches_ts() {
+        let input: [u8; 16] = [11, 48, 85, 122, 159, 196, 233, 14, 51, 88, 125, 162, 199, 236, 17, 54];
+        let cases: &[(u32, u32, u32, &[u8])] = &[
+            (0, 8, 1, &[11, 48, 85, 122, 159, 196, 233, 14, 51, 88, 125, 162, 199, 236, 17, 54]),
+            (1, 8, 1, &[139, 176, 213, 250, 31, 68, 105, 142, 179, 216, 253, 34, 71, 108, 145, 182]),
+            (2, 8, 1, &[11, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37]),
+            (3, 8, 1, &[139, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37]),
+            (4, 8, 1, &[11, 48, 85, 122, 159, 196, 233, 14, 51, 88, 125, 162, 199, 236, 17, 54]),
+            (5, 8, 1, &[139, 176, 213, 250, 31, 68, 105, 142, 179, 216, 253, 34, 71, 108, 145, 182]),
+            (6, 8, 1, &[11, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37]),
+            (7, 8, 1, &[139, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37]),
+            (0, 8, 2, &[11, 48, 85, 122, 159, 196, 233, 14, 51, 88, 125, 162, 199, 236, 17, 54]),
+            (1, 8, 2, &[139, 176, 213, 250, 31, 68, 105, 142, 179, 216, 253, 34, 71, 108, 145, 182]),
+            (2, 8, 2, &[11, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37]),
+            (3, 8, 2, &[139, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37]),
+            (4, 8, 2, &[11, 85, 159, 233, 51, 125, 199, 17, 48, 122, 196, 14, 88, 162, 236, 54]),
+            (5, 8, 2, &[139, 213, 31, 105, 179, 253, 71, 145, 176, 250, 68, 142, 216, 34, 108, 182]),
+            (6, 8, 2, &[11, 74, 74, 74, 74, 74, 74, 74, 48, 74, 74, 74, 74, 74, 74, 74]),
+            (7, 8, 2, &[139, 74, 74, 74, 74, 74, 74, 74, 176, 74, 74, 74, 74, 74, 74, 74]),
+            (0, 16, 1, &[11, 48, 85, 122, 159, 196, 233, 14, 51, 88, 125, 162, 199, 236, 17, 54]),
+            (1, 16, 1, &[11, 176, 85, 250, 159, 68, 233, 142, 51, 216, 125, 34, 199, 108, 17, 182]),
+            (2, 16, 1, &[11, 48, 74, 74, 74, 74, 74, 74, 74, 73, 74, 74, 74, 74, 74, 73]),
+            (3, 16, 1, &[11, 176, 74, 74, 74, 74, 74, 74, 74, 73, 74, 74, 74, 74, 74, 73]),
+            (4, 16, 1, &[11, 48, 85, 122, 159, 196, 233, 14, 51, 88, 125, 162, 199, 236, 17, 54]),
+            (5, 16, 1, &[11, 176, 85, 250, 159, 68, 233, 142, 51, 216, 125, 34, 199, 108, 17, 182]),
+            (6, 16, 1, &[11, 48, 74, 74, 74, 74, 74, 74, 74, 73, 74, 74, 74, 74, 74, 73]),
+            (7, 16, 1, &[11, 176, 74, 74, 74, 74, 74, 74, 74, 73, 74, 74, 74, 74, 74, 73]),
+            (0, 16, 2, &[11, 48, 85, 122, 159, 196, 233, 14, 51, 88, 125, 162, 199, 236, 17, 54]),
+            (1, 16, 2, &[11, 176, 85, 250, 159, 68, 233, 142, 51, 216, 125, 34, 199, 108, 17, 182]),
+            (2, 16, 2, &[11, 48, 74, 74, 74, 74, 74, 74, 74, 73, 74, 74, 74, 74, 74, 73]),
+            (3, 16, 2, &[11, 176, 74, 74, 74, 74, 74, 74, 74, 73, 74, 74, 74, 74, 74, 73]),
+            (4, 16, 2, &[11, 48, 159, 196, 51, 88, 199, 236, 85, 122, 233, 14, 125, 162, 17, 54]),
+            (5, 16, 2, &[11, 176, 159, 68, 51, 216, 199, 108, 85, 250, 233, 142, 125, 34, 17, 182]),
+            (6, 16, 2, &[11, 48, 148, 148, 148, 147, 148, 148, 85, 122, 148, 148, 148, 147, 148, 147]),
+            (7, 16, 2, &[11, 176, 148, 148, 148, 147, 148, 148, 85, 250, 148, 148, 148, 147, 148, 147]),
+        ];
+        for &(enc, bd, ch, expected) in cases {
+            let got = apply_enc(enc, &input, bd, ch);
+            assert_eq!(got, expected, "apply_enc(enc={enc}, bd={bd}, ch={ch}) mismatch vs TS");
+        }
+    }
+
     // The streaming dispatch reads the manifest version from a minimal header: v1/v2 route to
     // their paths, a NEWER version is recognised (so stream_v2 degrades to a clean error rather
     // than mis-running the v1 reassembly), and an absent/undecodable `v` reads as v1.
@@ -598,7 +805,8 @@ mod tests {
         };
         assert_eq!(manifest_version(&with_v(1)), 1);
         assert_eq!(manifest_version(&with_v(2)), 2);
-        assert_eq!(manifest_version(&with_v(3)), 3); // future -> caller emits "please update"
+        assert_eq!(manifest_version(&with_v(3)), 3); // v3 -> streams via the v2 path (+ reassembly)
+        assert_eq!(manifest_version(&with_v(4)), 4); // newer -> caller emits "please update"
         // A pre-versioning v1 manifest with no `v` field reads as 0 -> v1 reassembly path.
         let mut no_v: BTreeMap<String, u64> = BTreeMap::new();
         no_v.insert("originalLength".into(), 42);

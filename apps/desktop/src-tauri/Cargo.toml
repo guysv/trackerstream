@@ -49,6 +49,7 @@ rust-ipns = { version = "0.8.1", default-features = false, features = ["libp2p"]
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid"] }
 base64 = "0.22"
 sha2 = "0.11.0"
+md5 = "0.7" # verify a reassembled original against the catalog's raw-file md5 ("Open with")
 futures = "0.3.32"
 anyhow = "1.0.102"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "time"] }

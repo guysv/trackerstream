@@ -5,6 +5,7 @@
 
 import type { MenuItem } from "$lib/contextmenu.svelte";
 import type { ModuleHit } from "$lib/catalog";
+import { downloadAndOpen } from "$lib/p2p";
 import { enqueue, playList } from "$lib/player.svelte";
 import {
   plState,
@@ -30,6 +31,28 @@ export interface TrackCtx {
   inQueue?: boolean;
   /** The context-specific removal handler for the two cases above. */
   onRemove?: () => void;
+}
+
+// External trackers the "Open with" submenu offers. `app` is the opener target handed to the OS
+// (macOS `open -a <app>`, Linux the binary name); label is what the menu shows.
+const OPEN_WITH_APPS: { label: string; app: string }[] = [
+  { label: "SchismTracker", app: "schismtracker" },
+  { label: "MilkyTracker", app: "milkytracker" },
+];
+
+/** Reassemble `h`'s byte-exact original and open it in an external tracker. The backend fetches
+ *  the module's own rootCid, reassembles (v3 or v1, byte-exact), verifies MD5 parity vs the
+ *  catalog, saves to ~/Downloads, and launches `app`. Fire-and-forget like the other menu
+ *  actions; failures are logged (the app has no toast surface). */
+async function openWithTracker(h: ModuleHit, app: string): Promise<void> {
+  try {
+    const res = await downloadAndOpen({ root: h.rootCid, md5: h.md5, filename: h.filename, openWith: app });
+    if (!res.launched) {
+      console.error(`[open-with] saved ${res.path} but could not launch ${app}: ${res.launch_error ?? "unknown"}`);
+    }
+  } catch (e) {
+    console.error(`[open-with] failed for ${h.filename}:`, e);
+  }
 }
 
 export function trackMenuItems(h: ModuleHit, ctx: TrackCtx = {}): MenuItem[] {
@@ -83,6 +106,17 @@ export function trackMenuItems(h: ModuleHit, ctx: TrackCtx = {}): MenuItem[] {
   }
   items.push(
     { kind: "separator" },
+    {
+      kind: "submenu",
+      label: "Open with",
+      items: OPEN_WITH_APPS.map(
+        (a): MenuItem => ({
+          kind: "action",
+          label: a.label,
+          onSelect: () => void openWithTracker(h, a.app),
+        }),
+      ),
+    },
     {
       kind: "action",
       label: "Copy CID",
