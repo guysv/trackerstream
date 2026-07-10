@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { constants as zlibConstants, zstdCompressSync } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
-import { buildDagV2, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
+import { buildDag, buildDagV3, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
 import { CATALOG_IPNS_KEY } from "@trackerstream/config";
 import { Catalog } from "./catalog.ts";
 import { initMeta, extractModule, type ModuleMeta } from "./meta.ts";
@@ -114,12 +114,23 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
 
       let dag;
       let isFlat = false;
-      // v2 bake for parsed+decodable formats; mo3/unparseable -> v1 flat DAG.
+      // v3 bake (v2 streaming + byte-exact reassembly from the SAME blocks) for parsed+decodable
+      // formats. buildDagV3 throws for modules with compressed samples (IT 0x08) or unparseable
+      // slots -> fall to v1 buildDag (sample-separated, byte-exact, still reassemble-able; this is
+      // where "compressed IT stays on v1" lands). mo3/unparseable -> v1 flat DAG. Every root is
+      // reassemble-able: v3 via reassembleV3, v1/flat via reassemble. See REBUILD.md.
       if (mod && fmt && fmt !== "mo3") {
         try {
-          dag = await buildDagV2(bytes, mod.decoded);
+          dag = await buildDagV3(bytes, mod.decoded);
         } catch {
-          /* fall through to flat */
+          /* compressed sample(s) / unparseable slots -> v1 byte-exact below */
+        }
+      }
+      if (!dag) {
+        try {
+          dag = await buildDag(bytes); // v1 sample-separated: byte-exact + cross-module sample dedup
+        } catch {
+          /* not parseable at all -> whole-file flat DAG */
         }
       }
       if (!dag) {

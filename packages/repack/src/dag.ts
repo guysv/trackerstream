@@ -591,6 +591,288 @@ export async function buildDagV2(
   };
 }
 
+// ===========================================================================
+// Repack v3 — v2 streaming + byte-exact reassembly from the SAME blocks (REBUILD.md).
+//
+// v3 streams EXACTLY like v2 (identical skeleton/decoded-PCM/plan blocks — the playback
+// path is unchanged and ignores the extra fields). It ADDS, per streamed sample, the
+// on-disk file `offset` + an `enc` transform tag, plus `originalLength`, so a client can
+// reconstruct the byte-exact original: assemble the skeleton, then write enc(decodedPCM)
+// back into each sample's file region. The decoded native PCM v2 already stores is a
+// deterministic, invertible transform of the on-disk bytes (identity / sign-flip / delta),
+// so NO sample bytes are duplicated. The tag is chosen EMPIRICALLY at bake and byte-checked
+// against the on-disk region, so reassembly is byte-exact by construction.
+//
+// Scope: modules with NO compressed samples. A compressed sample (IT 0x08) routes the whole
+// module to v1 (buildDag, byte-exact) — "compressed IT stays on v1". An uncompressed sample
+// whose decoded PCM matches no tag simply stays RESIDENT in the skeleton (its original bytes
+// are already there → reassembles free), exactly as v2 leaves such a slot — never wrong audio.
+// ===========================================================================
+
+export const MANIFEST_V3 = 3;
+
+// On-disk sample encoding relative to libopenmpt's decoded native PCM. `enc` is a bitmask of the
+// steps that turn decoded (interleaved, signed) bytes into the exact on-disk bytes, applied in
+// this order: DEINT (stereo interleaved->planar) -> SIGN (per-sample sign flip) -> DELTA
+// (per-channel delta). bitDepth (8|16) + channels (1|2) come from the sample entry, so the mask
+// is format-agnostic. The bake byte-VERIFIES the chosen mask against the on-disk region, so a
+// wrong/unmodeled combo can never corrupt reassembly — at worst a rare sample stays resident.
+// Observed: MOD=0, S3M/unsigned-IT=SIGN, XM=DELTA, IT-16bit-stereo=DEINT. MUST stay in lockstep
+// with the Rust reassembler.
+export const ENC_SIGN = 0x1; // signed<->unsigned (8: ^0x80; 16: flip high byte of each LE word)
+export const ENC_DELTA = 0x2; // per-channel delta encode
+export const ENC_DEINT = 0x4; // stereo: interleaved -> planar (all of ch0, then ch1)
+const ENC_MASKS = [0, 1, 2, 3, 4, 5, 6, 7]; // every DEINT|SIGN|DELTA combination
+
+/** Turn decoded native PCM into on-disk bytes under `enc`. Pure; fresh buffer. Same routine runs
+ *  at bake (mask search) and at reassembly. `bitDepth` 8|16, `channels` 1|2. */
+export function applyEnc(enc: number, d: Uint8Array, bitDepth: number, channels: number): Uint8Array {
+  const bps = bitDepth === 16 ? 2 : 1; // bytes per sample (per channel)
+  let cur = new Uint8Array(d); // start: interleaved, signed native
+
+  if (enc & ENC_DEINT && channels === 2) {
+    const out = new Uint8Array(cur.length);
+    const frames = cur.length / (bps * 2);
+    for (let f = 0; f < frames; f++)
+      for (let c = 0; c < 2; c++)
+        for (let b = 0; b < bps; b++) out[(c * frames + f) * bps + b] = cur[(f * 2 + c) * bps + b];
+    cur = out;
+  }
+  if (enc & ENC_SIGN) {
+    if (bps === 1) for (let i = 0; i < cur.length; i++) cur[i] ^= 0x80;
+    else for (let i = 1; i < cur.length; i += 2) cur[i] ^= 0x80;
+  }
+  if (enc & ENC_DELTA) {
+    const nch = enc & ENC_DEINT && channels === 2 ? 2 : 1; // planar channels to delta independently
+    const chLen = cur.length / nch;
+    const out = new Uint8Array(cur.length);
+    for (let c = 0; c < nch; c++) {
+      const base = c * chLen;
+      let p = 0;
+      if (bps === 1) {
+        for (let i = 0; i < chLen; i++) {
+          out[base + i] = (cur[base + i] - p) & 0xff;
+          p = cur[base + i];
+        }
+      } else {
+        for (let i = 0; i + 1 < chLen; i += 2) {
+          const v = cur[base + i] | (cur[base + i + 1] << 8);
+          const dd = (v - p) & 0xffff;
+          out[base + i] = dd & 0xff;
+          out[base + i + 1] = (dd >> 8) & 0xff;
+          p = v;
+        }
+      }
+    }
+    cur = out;
+  }
+  return cur;
+}
+
+const bytesEq = (a: Uint8Array, b: Uint8Array): boolean => {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+};
+
+/** Find the enc mask whose transform reproduces `onDisk` from `decoded`, or -1 if none (the slot
+ *  then stays resident in the skeleton). Byte-verified, so reassembly can't drift. */
+function pickEnc(decoded: Uint8Array, onDisk: Uint8Array, bitDepth: number, channels: number): number {
+  for (const m of ENC_MASKS) if (bytesEq(applyEnc(m, decoded, bitDepth, channels), onDisk)) return m;
+  return -1;
+}
+
+/** v3 streamed sample: a v2 sample plus its on-disk file offset + encoding tag (for reassembly). */
+export interface SampleV3 extends SampleV2 {
+  offset: number; // on-disk byte offset in the original file
+  enc: number; // ENC_* tag: enc(decoded PCM) === on-disk bytes
+}
+
+export interface IndexV3 {
+  samples: SampleV3[];
+  plan: PlanV2;
+}
+
+export interface ManifestV3 {
+  v: number; // 3
+  format: Format;
+  cdc: CdcConfig;
+  originalLength: number; // byte length of the reassembled original file
+  skeletonChunks: CID[];
+  skeletonLayout: number[];
+  index?: IndexV3;
+  indexRoot?: CID;
+}
+
+/**
+ * Build the v3 DAG: v2 streaming + byte-exact reassembly metadata. Throws if the module has any
+ * compressed sample (caller falls back to v1 buildDag) or can't be parsed. Uncompressed slots
+ * whose decoded PCM matches an enc tag are STREAMED (region zeroed in the skeleton, decoded PCM
+ * chunked, offset+enc recorded); any other slot stays resident in the skeleton and reassembles
+ * from there. The streaming blocks (skeleton/PCM/plan) are identical to what buildDagV2 emits for
+ * the same module, so playback is unchanged.
+ */
+export async function buildDagV3(
+  data: Uint8Array,
+  decoded: DecodedSample[],
+  cdc: CdcConfig = DEFAULT_CDC,
+): Promise<BuiltDagV2 & { manifest: ManifestV3 }> {
+  const parsed = sampleSlots(data);
+  if (!parsed) throw new Error("unparseable module (cannot locate sample slots)");
+  const { format, slots } = parsed;
+  if (slots.some((s) => s.compressed)) throw new Error("v3: module has compressed sample(s) — route to v1");
+
+  const dumpByIndex = new Map<number, DecodedSample>();
+  for (const d of decoded) dumpByIndex.set(d.index, d);
+
+  // Streamed slots: uncompressed, decoded length matches on-disk, AND an enc tag reproduces the
+  // on-disk bytes. Everything else stays resident in the skeleton (reassembles from there).
+  const streamed: { slot: (typeof slots)[number]; dump: DecodedSample; enc: number }[] = [];
+  for (const slot of slots) {
+    const dump = dumpByIndex.get(slot.index);
+    if (!dump || dump.data.length === 0 || dump.data.length !== slot.length) continue;
+    const onDisk = data.subarray(slot.offset, slot.offset + slot.length);
+    const enc = pickEnc(dump.data, onDisk, slot.bitDepth, slot.channels);
+    if (enc < 0) continue; // no byte-exact transform -> leave resident
+    streamed.push({ slot, dump, enc });
+  }
+
+  // Plan (identical to v2): computeSeekTables in PCM offsets -> streamed slot indices.
+  const idxByOffset = new Map<number, number>();
+  for (const { slot } of streamed) idxByOffset.set(slot.offset, slot.index);
+  const toSlots = (offs: number[]): number[] => {
+    const out: number[] = [];
+    for (const o of offs) {
+      const i = idxByOffset.get(o);
+      if (i !== undefined) out.push(i);
+    }
+    return out;
+  };
+  const plan: PlanV2 = { orderSeconds: [], checkpoints: [] };
+  const tables = computeSeekTables(data, format);
+  if (tables) {
+    plan.orderSeconds = tables.orderSeconds;
+    plan.checkpoints = tables.checkpoints
+      .map((c) => ({ order: c.order, samples: toSlots(c.residentOffsets) }))
+      .filter((c) => c.samples.length);
+    if (!plan.checkpoints.length) {
+      const seg0 = toSlots(tables.segment0Offsets);
+      if (seg0.length) plan.checkpoints = [{ order: 0, samples: seg0 }];
+    }
+  }
+
+  const byCid = new Map<string, Block>();
+  const add = (b: Block): CID => {
+    const k = b.cid.toString();
+    if (!byCid.has(k)) byCid.set(k, b);
+    return b.cid;
+  };
+  let numChunks = 0;
+  const chunkToCids = async (buf: Uint8Array): Promise<CID[]> => {
+    const cids: CID[] = [];
+    for (const c of cdcChunks(buf, cdc)) {
+      numChunks++;
+      cids.push(add(await rawBlock(c.slice())));
+    }
+    return cids;
+  };
+
+  // Sample table with inline leaf CIDs + reassembly metadata (offset, enc).
+  const samples: SampleV3[] = [];
+  let sampleBytes = 0;
+  for (const { slot, dump, enc } of streamed) {
+    sampleBytes += dump.data.length;
+    const chunks = await chunkToCids(dump.data);
+    samples.push({ index: slot.index, frames: dump.frames, channels: slot.channels, bitDepth: slot.bitDepth, chunks, offset: slot.offset, enc });
+  }
+
+  // Skeleton: file with streamed regions zeroed (no compressed => no header mutation, no tail).
+  const { skeleton, zeroSpans } = buildSkeletonV2(data, streamed.map((s) => s.slot));
+  const skeletonChunks: CID[] = [];
+  const skeletonLayout: number[] = [];
+  {
+    const spans = mergeSpans(zeroSpans, skeleton.length);
+    let pos = 0;
+    for (const [a, b] of spans) {
+      let nc = 0;
+      if (a > pos) for (const cid of await chunkToCids(skeleton.subarray(pos, a))) (skeletonChunks.push(cid), nc++);
+      skeletonLayout.push(nc, b - a);
+      pos = b;
+    }
+    if (pos < skeleton.length) {
+      let nc = 0;
+      for (const cid of await chunkToCids(skeleton.subarray(pos))) (skeletonChunks.push(cid), nc++);
+      skeletonLayout.push(nc, 0);
+    }
+  }
+
+  const index: IndexV3 = { samples, plan };
+  let manifest: ManifestV3 = { v: MANIFEST_V3, format, cdc, originalLength: data.length, skeletonChunks, skeletonLayout, index };
+  let manifestBlock = await cborBlock(manifest);
+  let spilled = false;
+  if (manifestBlock.bytes.length > INDEX_SPILL_BYTES) {
+    const indexBlock = await cborBlock(index);
+    add(indexBlock);
+    manifest = { v: MANIFEST_V3, format, cdc, originalLength: data.length, skeletonChunks, skeletonLayout, indexRoot: indexBlock.cid };
+    manifestBlock = await cborBlock(manifest);
+    spilled = true;
+  }
+  add(manifestBlock);
+
+  return {
+    root: manifestBlock.cid,
+    manifest,
+    blocks: [...byCid.values()],
+    stats: {
+      format,
+      skeletonBytes: skeleton.length,
+      streamedSamples: streamed.length,
+      residentSamples: slots.length - streamed.length,
+      sampleBytes,
+      numChunks,
+      uniqueChunks: byCid.size,
+      manifestBytes: manifestBlock.bytes.length,
+      spilled,
+    },
+  };
+}
+
+/**
+ * Reassemble the BYTE-EXACT original file from a v3 root. Assemble the skeleton (streamed
+ * regions are zero there), then write enc(decodedPCM) back into each sample's file offset.
+ * Resident samples already sit in the skeleton. CID-verifies every block when `verify`.
+ */
+export async function reassembleV3(
+  root: CID,
+  get: BlockGetter,
+  opts: { verify?: boolean } = {},
+): Promise<{ bytes: Uint8Array; manifest: ManifestV3 }> {
+  const verify = opts.verify ?? true;
+  const manifest = dagCbor.decode<ManifestV3>(await fetchVerified(root, get, verify));
+  if (manifest.v !== MANIFEST_V3) throw new Error(`not a v3 manifest (v=${manifest.v})`);
+  const index = manifest.index ?? dagCbor.decode<IndexV3>(await fetchVerified(manifest.indexRoot!, get, verify));
+
+  const parts: Uint8Array[] = [];
+  for (const cid of manifest.skeletonChunks) parts.push(await fetchVerified(cid, get, verify));
+  const out = assembleSkeletonV2(parts, manifest.skeletonLayout);
+  if (out.length !== manifest.originalLength) throw new Error(`v3 skeleton length ${out.length} != originalLength ${manifest.originalLength}`);
+
+  for (const s of index.samples) {
+    let pcmLen = 0;
+    const chunks: Uint8Array[] = [];
+    for (const cid of s.chunks) {
+      const c = await fetchVerified(cid, get, verify);
+      chunks.push(c);
+      pcmLen += c.length;
+    }
+    const pcm = new Uint8Array(pcmLen);
+    let w = 0;
+    for (const c of chunks) (pcm.set(c, w), (w += c.length));
+    out.set(applyEnc(s.enc, pcm, s.bitDepth, s.channels), s.offset);
+  }
+  return { bytes: out, manifest };
+}
+
 export type BlockGetter = (cid: CID) => Promise<Uint8Array>;
 
 /**
