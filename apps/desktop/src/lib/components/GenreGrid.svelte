@@ -38,6 +38,7 @@
   <section class="genres">
     <div class="head">
       <h2>Browse by genre</h2>
+      <span class="sep" aria-hidden="true">·</span>
       <button
         class="more"
         onclick={() => (sortBy = sortBy === "name" ? "size" : "name")}
