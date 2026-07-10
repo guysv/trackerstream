@@ -17,6 +17,9 @@
     refreshLiked,
     type PlaylistDetail,
   } from "$lib/playlists.svelte";
+  import { getModuleByMd5, type ModuleHit } from "$lib/catalog";
+  import { cachedHit } from "$lib/cidCache";
+  import { fmtTime } from "$lib/format";
   import { ui } from "$lib/ui.svelte";
 
   let { name }: { name: string | null } = $props();
@@ -32,6 +35,15 @@
   let editingTitle = $state(false); // title shown as an editable input
   let titleDraft = $state("");
   let loadedFor: string | null = null; // last name a fetch completed for (not reactive)
+
+  // Full catalog metadata per track md5 (format/channels/duration/filename), so rows can show
+  // the same columns as the main results table — playlist items themselves carry only
+  // md5/modName/title. Seeded synchronously from the local last-known-good cache (cidCache),
+  // then filled for anything uncached from the catalog in the background (same resolve path
+  // playPlaylist uses). Keyed by md5 so duplicate rows share one lookup.
+  let meta = $state<Record<string, ModuleHit>>({});
+  let selIdx = $state(-1); // keyboard cursor into detail.items (-1 = nothing selected)
+  let listEl: HTMLDivElement | undefined = $state();
 
   $effect(() => {
     const cur = name;
@@ -52,6 +64,7 @@
       editingTitle = false;
       error = null;
       linkCopied = false;
+      selIdx = -1;
     }
     plGet(cur)
       .then(async (d) => {
@@ -74,6 +87,69 @@
     const d = Math.floor((Date.now() / 1000 - secs) / 86400);
     return d <= 0 ? "today" : d === 1 ? "1 day" : `${d} days`;
   };
+
+  // Resolve each track's full metadata for the parity columns. Seed from the local cache so
+  // known tracks render complete rows immediately, then fetch only the genuinely-uncached md5s
+  // from the catalog (serially, to avoid a burst of VFS queries). Re-runs when `detail` swaps,
+  // but the cache seed means the periodic sync tick refetches nothing already resolved.
+  $effect(() => {
+    const d = detail;
+    if (!d) {
+      meta = {};
+      return;
+    }
+    const seed: Record<string, ModuleHit> = {};
+    for (const it of d.items) {
+      const c = cachedHit(it.md5);
+      if (c) seed[it.md5] = c;
+    }
+    meta = seed;
+    const missing = [...new Set(d.items.map((i) => i.md5))].filter((m) => !seed[m]);
+    if (!missing.length) return;
+    let cancelled = false;
+    void (async () => {
+      for (const md5 of missing) {
+        if (cancelled || detail !== d) return;
+        try {
+          const h = await getModuleByMd5(md5);
+          if (cancelled || detail !== d) return;
+          meta = { ...meta, [md5]: h };
+        } catch {
+          /* leave the row without format/time — resolution needs the catalog online */
+        }
+      }
+    })();
+    return () => (cancelled = true);
+  });
+
+  // Keyboard navigation over the track list, mirroring the results table: Arrow/Page/Home/End
+  // move a cursor (which also drives the right-hand detail pane, like a click), Enter plays.
+  function select(i: number, scroll = true) {
+    const items = detail?.items ?? [];
+    if (!items.length) return;
+    const n = Math.min(items.length - 1, Math.max(0, i));
+    selIdx = n;
+    ui.inspectorTrackMd5 = items[n].md5;
+    ui.inspectorTrackId = null;
+    ui.right = "detail";
+    if (scroll) (listEl?.children[n] as HTMLElement | undefined)?.scrollIntoView({ block: "nearest" });
+  }
+
+  function onKey(e: KeyboardEvent) {
+    const items = detail?.items ?? [];
+    if (!items.length) return;
+    const cur = selIdx < 0 ? 0 : selIdx;
+    if (e.key === "ArrowDown") (e.preventDefault(), select(selIdx < 0 ? 0 : cur + 1));
+    else if (e.key === "ArrowUp") (e.preventDefault(), select(selIdx < 0 ? 0 : cur - 1));
+    else if (e.key === "PageDown") (e.preventDefault(), select(cur + 10));
+    else if (e.key === "PageUp") (e.preventDefault(), select(cur - 10));
+    else if (e.key === "Home") (e.preventDefault(), select(0));
+    else if (e.key === "End") (e.preventDefault(), select(items.length - 1));
+    else if (e.key === "Enter" && selIdx >= 0 && detail) {
+      e.preventDefault();
+      playPlaylist(detail, selIdx).catch((err) => (error = String(err)));
+    }
+  }
 
   async function copyLink() {
     if (!detail) return;
@@ -335,20 +411,46 @@
       </div>
     {/if}
 
-    <div class="tlist">
+    {#if detail.items.length}
+      <div class="thead">
+        <span class="num">#</span>
+        <span class="c-title">title</span>
+        <span class="c-file">file</span>
+        <span class="c-fmt">fmt</span>
+        <span class="c-ch">ch</span>
+        <span class="c-time">time</span>
+        <span class="c-rm"></span>
+      </div>
+    {/if}
+    <div
+      class="tlist"
+      bind:this={listEl}
+      onkeydown={onKey}
+      tabindex="0"
+      role="listbox"
+      aria-label="playlist tracks"
+    >
       {#each detail.items as t, i (t.md5 + "-" + i)}
+        {@const h = meta[t.md5]}
         <div
           class="trow"
-          class:sel={ui.inspectorTrackMd5 === t.md5}
-          onclick={() => { ui.inspectorTrackMd5 = t.md5; ui.inspectorTrackId = null; ui.right = "detail"; }}
+          class:sel={selIdx === i}
+          onclick={() => select(i, false)}
           ondblclick={() => detail && playPlaylist(detail, i)}
-          role="button"
+          role="option"
+          aria-selected={selIdx === i}
           tabindex="-1"
         >
           <span class="num">{i + 1}</span>
-          <span class="tname" title={t.modName}>{t.title || t.modName}</span>
+          <span class="c-title" title={h?.filename ?? t.modName}>{h?.title || t.title || t.modName}</span>
+          <span class="c-file">{h?.filename ?? t.modName}</span>
+          <span class="c-fmt fmt-{h?.format ?? ''}">{h?.format ?? ''}</span>
+          <span class="c-ch">{h?.channels ?? ''}</span>
+          <span class="c-time">{h ? fmtTime(h.duration) : ''}</span>
           {#if detail.isMine}
             <button class="rm" onclick={(e) => { e.stopPropagation(); removeTrack(i); }} title="remove">✕</button>
+          {:else}
+            <span class="c-rm"></span>
           {/if}
         </div>
       {/each}
@@ -360,7 +462,7 @@
 <style>
   .pdetail {
     height: 100%;
-    overflow-y: auto;
+    overflow: hidden; /* the track list scrolls on its own (below); the header/meta stay pinned */
     padding: 1rem;
     display: flex;
     flex-direction: column;
@@ -485,16 +587,35 @@
     color: var(--amber);
     border-color: var(--amber);
   }
+  /* The list is its own scroll area (like ResultsTable's .vlist) with the header pinned above
+     it as a non-scrolling sibling — so scrolling/arrow-nav never slides a row under the header. */
   .tlist {
     flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    outline: none;
   }
+  /* Same column grid as the main results table (ResultsTable.svelte) plus a leading track
+     number and a trailing remove slot, so the playlist reads as the same list widget. */
+  .thead,
   .trow {
     display: grid;
-    grid-template-columns: 28px 1fr auto;
+    grid-template-columns: 28px 1fr 1fr 48px 36px 56px 20px;
     gap: 0.4rem;
     align-items: center;
+  }
+  .thead {
+    height: 24px;
+    color: var(--dim);
+    border-bottom: 1px solid var(--border);
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+  }
+  .trow {
     padding: 0.2rem 0;
     height: 24px;
+    white-space: nowrap;
     cursor: default; /* rows are dblclick targets, not links (matches QueuePanel) */
   }
   .trow:hover {
@@ -506,10 +627,36 @@
   .num {
     color: var(--dim);
   }
-  .tname {
+  .c-title {
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
+    color: var(--fg);
+  }
+  .c-file {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--dim);
+  }
+  .c-ch,
+  .c-time {
+    text-align: right;
+    color: var(--dim);
+  }
+  .c-fmt {
+    text-transform: uppercase;
+    font-size: 11px;
+  }
+  .fmt-it {
+    color: var(--accent);
+  }
+  .fmt-xm {
+    color: var(--blue);
+  }
+  .fmt-mod {
+    color: var(--amber);
+  }
+  .fmt-s3m {
+    color: var(--violet);
   }
   .rm {
     padding: 0 0.3rem;
