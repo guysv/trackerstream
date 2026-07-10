@@ -1173,11 +1173,22 @@ fn list(
     Ok(json!({ "results": results }))
 }
 
+// Genre-less column list — the fallback query for a catalog predating the genre
+// column/table (see `detail_get`). Unprefixed since it selects from `modules` alone.
 const DETAIL_COLS: &str =
     "id, md5, filename, format, title, duration, channels, root_cid, \
      num_samples, num_instruments, num_subsongs, size_bytes, instruments, comment";
 
-/// Map a full detail row (the `DETAIL_COLS` order) to the `ModuleDetail` JSON shape.
+// Genre-enabled column list: same 14 columns (aliased `m.`) plus the joined genre label
+// at index 14. LEFT JOIN so un-genred rows (the majority) still return, with genre NULL.
+const DETAIL_COLS_GENRE: &str =
+    "m.id, m.md5, m.filename, m.format, m.title, m.duration, m.channels, m.root_cid, \
+     m.num_samples, m.num_instruments, m.num_subsongs, m.size_bytes, m.instruments, m.comment, \
+     g.genre";
+
+/// Map a full detail row to the `ModuleDetail` JSON shape. Handles both column lists:
+/// `genre` reads column 14, which is absent in the genre-less fallback — an out-of-range
+/// `get` there yields None (→ null → "n/a" in the UI), so one mapper serves both queries.
 fn detail_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
     Ok(json!({
         "id": r.get::<_, i64>(0)?,
@@ -1194,13 +1205,29 @@ fn detail_row(r: &rusqlite::Row) -> rusqlite::Result<Value> {
         "sizeBytes": r.get::<_, Option<i64>>(11)?.unwrap_or(0),
         "instruments": r.get::<_, Option<String>>(12)?.unwrap_or_default(),
         "comment": r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+        "genre": r.get::<_, Option<String>>(14).ok().flatten(),
     }))
 }
 
-fn get(conn: &Connection, id: i64) -> rusqlite::Result<Value> {
-    let sql = format!("SELECT {DETAIL_COLS} FROM modules WHERE id = ?1");
-    let row = conn.query_row(&sql, [id], detail_row).optional()?;
+/// Run the genre-joined detail query, falling back to the genre-less one on a catalog that
+/// predates the genre column/table (the JOIN would fail to prepare there). Either way the
+/// detail pane loads; on the fallback path `genre` is simply null. `where_frag` is the
+/// predicate after `modules`/`modules m` (e.g. `id = ?1`), using the `m.` alias.
+fn detail_get(conn: &Connection, where_frag: &str, params: &[&dyn rusqlite::ToSql]) -> rusqlite::Result<Value> {
+    let sql = format!(
+        "SELECT {DETAIL_COLS_GENRE} FROM modules m \
+         LEFT JOIN genres g ON g.genreid = m.genreid WHERE m.{where_frag}"
+    );
+    if let Ok(row) = conn.query_row(&sql, params, detail_row).optional() {
+        return Ok(row.unwrap_or(Value::Null));
+    }
+    let sql = format!("SELECT {DETAIL_COLS} FROM modules WHERE {where_frag}");
+    let row = conn.query_row(&sql, params, detail_row).optional()?;
     Ok(row.unwrap_or(Value::Null))
+}
+
+fn get(conn: &Connection, id: i64) -> rusqlite::Result<Value> {
+    detail_get(conn, "id = ?1", &[&id])
 }
 
 /// Resolve a module by its content md5 — the stable key playlists persist. Seeks the
@@ -1208,9 +1235,7 @@ fn get(conn: &Connection, id: i64) -> rusqlite::Result<Value> {
 /// md5 is not unique (the same file can be cataloged under multiple sources), but such
 /// rows are byte-identical, hence share a `root_cid` — `LIMIT 1` is well-defined.
 fn get_by_md5(conn: &Connection, md5: &str) -> rusqlite::Result<Value> {
-    let sql = format!("SELECT {DETAIL_COLS} FROM modules WHERE md5 = ?1 LIMIT 1");
-    let row = conn.query_row(&sql, [md5], detail_row).optional()?;
-    Ok(row.unwrap_or(Value::Null))
+    detail_get(conn, "md5 = ?1 LIMIT 1", &[&md5])
 }
 
 fn formats(conn: &Connection) -> rusqlite::Result<Value> {
