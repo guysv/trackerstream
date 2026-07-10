@@ -521,6 +521,78 @@ fn open_logs_dir(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Result of a "download + open with" so the UI can report where the file landed and whether the
+/// external tracker actually launched (the download half succeeds independently of the launch).
+#[derive(Serialize)]
+struct DownloadResult {
+    path: String,
+    launched: bool,
+    launch_error: Option<String>,
+}
+
+/// Reassemble a module's BYTE-EXACT original from its root CID (v3 streaming root or v1/flat root
+/// — dispatched on manifest version), verify it against the catalog `md5`, write it to the OS
+/// Downloads dir, and open it with an external tracker (schismtracker / milkytracker). The desktop
+/// "Open with" path. `open_with` is the opener target (macOS `open -a <app>`, Linux the binary);
+/// None opens with the OS default. The file is saved BEFORE launching, so a missing tracker still
+/// leaves the rebuilt module in Downloads (launched=false + launch_error). See REBUILD.md.
+#[tauri::command]
+async fn download_and_open(
+    app: tauri::AppHandle,
+    root: String,
+    md5: String,
+    filename: String,
+    open_with: Option<String>,
+    state: State<'_, NodeState>,
+    held: State<'_, Arc<HeldRoots>>,
+) -> Result<DownloadResult, String> {
+    let cid: Cid = root.parse().map_err(|e| format!("bad CID {root}: {e}"))?;
+    held.mark(&root, false);
+    // Surface non-seed providers in the background so bitswap can pull the blocks from peers.
+    {
+        let rpc = state.rpc.clone();
+        let root = root.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = rpc.dial_providers(&root).await;
+        });
+    }
+    // Byte-exact reconstruction (v3 -> reassemble_v3; v1/flat -> reassemble). Every block is
+    // CID-verified; the DAG is byte-exact by construction (REBUILD.md / repack test/v3-roundtrip).
+    let bytes = ipfs::reassemble_any(&state.rpc, cid)
+        .await
+        .map_err(|e| format!("reassemble {root} failed: {e}"))?;
+    held.mark(&root, true);
+
+    // MD5 parity gate: guards against a wrong/mismatched root. The catalog md5 is the raw-file
+    // md5 (lowercase hex). Empty md5 (older catalog row) -> skip.
+    if !md5.is_empty() {
+        let got = format!("{:x}", md5::compute(&bytes));
+        if got != md5.to_lowercase() {
+            return Err(format!("md5 mismatch for {filename}: expected {md5}, rebuilt {got}"));
+        }
+    }
+
+    // Write to the OS Downloads dir under the module's own filename (basename only — never let a
+    // catalog filename escape the directory). Overwrites an existing same-name file (same bytes).
+    let dir = app.path().download_dir().map_err(|e| format!("no Downloads dir: {e}"))?;
+    let base = std::path::Path::new(&filename)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{root}.mod"));
+    let out = dir.join(&base);
+    std::fs::write(&out, &bytes).map_err(|e| format!("write {}: {e}", out.display()))?;
+    let path = out.to_string_lossy().into_owned();
+
+    // Launch the external tracker on the saved file. Download already succeeded, so a launch
+    // failure is reported (launched=false) but not fatal.
+    let with = open_with.as_deref().filter(|s| !s.is_empty());
+    match tauri_plugin_opener::OpenerExt::opener(&app).open_path(&path, with) {
+        Ok(()) => Ok(DownloadResult { path, launched: true, launch_error: None }),
+        Err(e) => Ok(DownloadResult { path, launched: false, launch_error: Some(e.to_string()) }),
+    }
+}
+
 #[tauri::command]
 fn set_playhead(root: String, order: u32, streams: State<'_, Streams>) -> Result<(), String> {
     let st = stream_for(&streams, &root)?;
@@ -889,6 +961,7 @@ pub fn run() {
             get_sample,
             set_playhead,
             open_logs_dir,
+            download_and_open,
             playlist_search,
             playlist_list,
             playlist_get,

@@ -106,6 +106,31 @@ export const keepaliveMaster = (addrs: string[]): Promise<void> =>
 export const fetchModule = (root: string): Promise<ArrayBuffer> =>
   invoke<ArrayBuffer>("fetch_module", { root });
 
+/** Where a rebuilt original landed + whether the external tracker launched. */
+export interface DownloadResult {
+  path: string;
+  launched: boolean;
+  launch_error: string | null;
+}
+
+/** Reassemble a module's byte-exact original from its root CID (v3 streaming root or v1/flat root
+ *  — dispatched on manifest version), verify it against the catalog `md5`, save it to the OS
+ *  Downloads dir under `filename`, and open it with an external tracker (`openWith`:
+ *  "schismtracker" | "milkytracker" | undefined for the OS default). The download succeeds
+ *  independently of the launch. See REBUILD.md. */
+export const downloadAndOpen = (args: {
+  root: string;
+  md5: string;
+  filename: string;
+  openWith?: string;
+}): Promise<DownloadResult> =>
+  invoke<DownloadResult>("download_and_open", {
+    root: args.root,
+    md5: args.md5,
+    filename: args.filename,
+    openWith: args.openWith ?? null,
+  });
+
 /** Begin a v2 stream; `onEvent` ticks Skeleton -> Sample… -> Complete. */
 export function startStream(root: string, onEvent: (e: StreamEvent) => void): Promise<void> {
   const ch = new Channel<StreamEvent>();
