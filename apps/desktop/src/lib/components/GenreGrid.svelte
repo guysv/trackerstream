@@ -44,7 +44,7 @@
         onclick={() => (sortBy = sortBy === "name" ? "size" : "name")}
         title="Toggle sort order"
       >
-        {sortBy === "name" ? "sort by size" : "sort by name"}
+        {sortBy === "name" ? "by name" : "by count"}
       </button>
       {#if genres.length > COLLAPSED}
         <span class="sep" aria-hidden="true">·</span>
