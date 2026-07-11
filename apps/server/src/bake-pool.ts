@@ -58,23 +58,49 @@ export class BakePool {
   private workers: Worker[] = [];
   private free: Worker[] = [];
   private jobs = new Map<number, (r: BakeResult) => void>();
+  private busy = new Map<Worker, number>(); // worker -> the job id it is currently running
   private pending: Array<{ id: number; bytes: Uint8Array; name: string }> = [];
   private nextId = 0;
+  private closed = false;
 
-  constructor(n: number, workerUrl: URL) {
-    for (let i = 0; i < n; i++) {
-      const w = new Worker(workerUrl);
-      w.on("message", (m: BakeResult) => {
-        const resolve = this.jobs.get(m.id)!;
-        this.jobs.delete(m.id);
-        this.free.push(w);
-        resolve(m);
-        this.pump();
-      });
-      w.on("error", (e) => console.error(`bake worker error: ${e}`));
-      this.workers.push(w);
+  constructor(
+    n: number,
+    private workerUrl: URL,
+  ) {
+    for (let i = 0; i < n; i++) this.spawn();
+  }
+
+  private spawn(): void {
+    const w = new Worker(this.workerUrl);
+    w.on("message", (m: BakeResult) => {
+      const resolve = this.jobs.get(m.id);
+      this.jobs.delete(m.id);
+      this.busy.delete(w);
       this.free.push(w);
-    }
+      resolve?.(m);
+      this.pump();
+    });
+    w.on("error", (e) => {
+      // A worker crash (uncaught throw / OOM) fires here with NO message, so the in-flight job's
+      // resolver would never be called and `Promise.all` over the bakes would hang forever. Settle
+      // that job as a failure, drop the dead worker, and respawn to keep pool capacity.
+      const jobId = this.busy.get(w);
+      this.busy.delete(w);
+      this.workers = this.workers.filter((x) => x !== w);
+      this.free = this.free.filter((x) => x !== w);
+      if (jobId !== undefined) {
+        const resolve = this.jobs.get(jobId);
+        this.jobs.delete(jobId);
+        resolve?.({ id: jobId, ok: false, error: `bake worker crashed: ${String(e)}` });
+      }
+      console.error(`[bake] worker crashed${jobId !== undefined ? ` (job ${jobId})` : ""}: ${e}`);
+      if (!this.closed) {
+        this.spawn();
+        this.pump();
+      }
+    });
+    this.workers.push(w);
+    this.free.push(w);
   }
 
   run(bytes: Uint8Array, name: string): Promise<BakeResult> {
@@ -90,6 +116,7 @@ export class BakePool {
     while (this.free.length && this.pending.length) {
       const w = this.free.pop()!;
       const job = this.pending.shift()!;
+      this.busy.set(w, job.id);
       // Structured-clone the input (no transfer): module bytes come from a pooled Node Buffer whose
       // ArrayBuffer is shared, so transferring it would corrupt siblings. The copy is ~module-size.
       w.postMessage({ id: job.id, bytes: job.bytes, name: job.name });
@@ -101,6 +128,7 @@ export class BakePool {
   }
 
   async close(): Promise<void> {
+    this.closed = true; // stop the error handler from respawning during teardown
     await Promise.all(this.workers.map((w) => w.terminate()));
   }
 }

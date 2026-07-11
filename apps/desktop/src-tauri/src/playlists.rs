@@ -48,6 +48,19 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// `filter_map` predicate for query rows: keep `Ok`, but log-and-drop an `Err` instead of
+/// silently swallowing it (a per-row deserialize/read failure would otherwise vanish a playlist
+/// from a list with no trace). `ctx` names the query for the log line.
+fn row_or_log<T>(r: rusqlite::Result<T>, ctx: &str) -> Option<T> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) => {
+            log::warn!(target: "playlist", "{ctx}: row skipped: {e}");
+            None
+        }
+    }
+}
+
 // ---- document model ----
 
 /// One track reference: `[md5, module name, song title]` — denormalized so the playlist
@@ -341,10 +354,12 @@ impl Playlists {
 
     fn remember_rejected(&self, name: &str, seq: u64) {
         let db = self.db.lock().unwrap();
-        let _ = db.execute(
+        if let Err(e) = db.execute(
             "INSERT OR IGNORE INTO rejected(name, seq) VALUES(?1, ?2)",
             params![name, seq as i64],
-        );
+        ) {
+            log::warn!(target: "playlist", "remember_rejected {name}@{seq}: {e}");
+        }
     }
 
     /// Evict least-recently-updated FOREIGN playlists until under the byte budget.
@@ -374,8 +389,12 @@ impl Playlists {
                 .optional()
                 .unwrap_or(None);
             let Some(name) = victim else { return evicted };
-            let _ = db.execute("DELETE FROM playlists WHERE name=?1", params![name]);
-            let _ = db.execute("DELETE FROM playlists_fts WHERE name=?1", params![name]);
+            if let Err(e) = db.execute("DELETE FROM playlists WHERE name=?1", params![name]) {
+                log::warn!(target: "playlist", "budget-evict {name}: {e}");
+            }
+            if let Err(e) = db.execute("DELETE FROM playlists_fts WHERE name=?1", params![name]) {
+                log::warn!(target: "playlist", "budget-evict fts {name}: {e}");
+            }
             evicted = true;
         }
     }
@@ -682,7 +701,7 @@ impl Playlists {
              ORDER BY bm25(playlists_fts) LIMIT 200",
         )?;
         let rows = stmt.query_map(params![fts], row_meta)?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|r| row_or_log(r, "search")).collect())
     }
 
     /// scope: "library" = mine + held; "seen" = unheld foreign (the discover pool);
@@ -702,7 +721,7 @@ impl Playlists {
                       MAX(last_update_at, COALESCE(last_played_at, 0)) DESC LIMIT 500",
         ))?;
         let rows = stmt.query_map([], row_meta)?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|r| row_or_log(r, "list")).collect())
     }
 
     /// Add/remove a FOREIGN playlist to/from the library ("holder" tier): held rows are
@@ -918,7 +937,7 @@ impl Playlists {
                 title: r.get(2)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|r| row_or_log(r, "manifest")).collect())
     }
 
     /// Post the disclosure set to the node iff it changed since the last successful
@@ -993,7 +1012,7 @@ impl Playlists {
                 return removed;
             };
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .map(|rows| rows.filter_map(|r| row_or_log(r, "decay-scan")).collect())
                 .unwrap_or_default()
         };
         for (name, rec) in seen {
@@ -1006,8 +1025,12 @@ impl Playlists {
                 .unwrap_or(false);
             if !alive {
                 let db = self.db.lock().unwrap();
-                let _ = db.execute("DELETE FROM playlists WHERE name=?1", params![name]);
-                let _ = db.execute("DELETE FROM playlists_fts WHERE name=?1", params![name]);
+                if let Err(e) = db.execute("DELETE FROM playlists WHERE name=?1", params![name]) {
+                    log::warn!(target: "playlist", "decay-delete {name}: {e}");
+                }
+                if let Err(e) = db.execute("DELETE FROM playlists_fts WHERE name=?1", params![name]) {
+                    log::warn!(target: "playlist", "decay-delete fts {name}: {e}");
+                }
                 removed = true;
             }
         }
@@ -1033,7 +1056,7 @@ impl Playlists {
             stmt.query_map([], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, i64>(4)? != 0))
             })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .map(|rows| rows.filter_map(|r| row_or_log(r, "announce-library")).collect())
             .unwrap_or_default()
         };
         let mut entries = Vec::new();
@@ -1083,14 +1106,16 @@ fn backfill_eol(db: &Connection) {
         .prepare("SELECT name, record_b64 FROM playlists WHERE eol=0 AND record_b64 IS NOT NULL")
         .and_then(|mut st| {
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .map(|it| it.filter_map(|r| row_or_log(r, "backfill_eol")).collect())
         })
         .unwrap_or_default();
     for (name, rec) in rows {
-        let _ = db.execute(
+        if let Err(e) = db.execute(
             "UPDATE playlists SET eol=?2 WHERE name=?1",
             params![name, record_eol_secs(&rec)],
-        );
+        ) {
+            log::warn!(target: "playlist", "backfill_eol {name}: {e}");
+        }
     }
 }
 

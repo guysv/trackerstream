@@ -21,6 +21,7 @@
   import { cachedHit } from "$lib/cidCache";
   import { fmtTime } from "$lib/format";
   import { ui } from "$lib/ui.svelte";
+  import { logError, logWarn } from "$lib/debug";
 
   let { name }: { name: string | null } = $props();
 
@@ -72,12 +73,16 @@
         detail = d;
         loadedFor = cur;
         // No local row: a name-only deep link may still be syncing from the network.
-        pending = d === null && (await plPending().catch((): string[] => [])).includes(cur);
+        pending =
+          d === null &&
+          (await plPending().catch((e): string[] => (logWarn("pldetail:pending", e), []))).includes(cur);
         backerCount = d
-          ? ((await plBackers([cur]).catch((): Record<string, number> => ({})))[cur] ?? 0)
+          ? ((await plBackers([cur]).catch((e): Record<string, number> => (logWarn("pldetail:backers", e), {})))[
+              cur
+            ] ?? 0)
           : 0;
       })
-      .catch((e) => (error = String(e)));
+      .catch((e) => (logError("pldetail:load", e, { name: cur }), (error = String(e))));
   });
 
   // Hold-beacon holder count (24h window; 0 = none heard yet — beacons are hourly).
@@ -114,8 +119,10 @@
           const h = await getModuleByMd5(md5);
           if (cancelled || detail !== d) return;
           meta = { ...meta, [md5]: h };
-        } catch {
-          /* leave the row without format/time — resolution needs the catalog online */
+        } catch (e) {
+          // Leave the row without format/time — resolution needs the catalog online (expected
+          // offline, hence warn); fires per unresolved track.
+          logWarn("pldetail:resolveMeta", e, { md5 });
         }
       }
     })();
@@ -147,7 +154,7 @@
     else if (e.key === "End") (e.preventDefault(), select(items.length - 1));
     else if (e.key === "Enter" && selIdx >= 0 && detail) {
       e.preventDefault();
-      playPlaylist(detail, selIdx).catch((err) => (error = String(err)));
+      playPlaylist(detail, selIdx).catch((err) => (logError("pldetail:play", err), (error = String(err))));
     }
   }
 
@@ -158,6 +165,7 @@
       linkCopied = true;
       setTimeout(() => (linkCopied = false), 2000);
     } catch (e) {
+      logError("pldetail:copyLink", e);
       error = String(e);
     }
   }
@@ -192,6 +200,7 @@
       await plUpdate(detail.name, next, itemTuples(detail.items));
       plBump();
     } catch (e) {
+      logError("pldetail:rename", e);
       error = `rename failed: ${e}`;
     }
   }
@@ -210,6 +219,7 @@
       await plPublish(detail.name);
       plBump();
     } catch (e) {
+      logError("pldetail:share", e);
       error = `share failed: ${e}`;
     } finally {
       busy = false;
@@ -225,6 +235,7 @@
       await plUnpublish(detail.name);
       plBump();
     } catch (e) {
+      logError("pldetail:unshare", e);
       error = `make private failed: ${e}`;
     } finally {
       busy = false;
@@ -240,6 +251,7 @@
       await plDelete(detail.name);
       plBump();
     } catch (e) {
+      logError("pldetail:delete", e);
       error = `delete failed: ${e}`;
     } finally {
       busy = false;
@@ -328,7 +340,8 @@
     <div class="actions">
       <button
         class="play"
-        onclick={() => detail && playPlaylist(detail).catch((e) => (error = String(e)))}
+        onclick={() =>
+          detail && playPlaylist(detail).catch((e) => (logError("pldetail:play", e), (error = String(e))))}
         disabled={!detail.items.length}
       >
         ▶ play
@@ -362,7 +375,7 @@
           class:held={detail.held}
           onclick={async () => {
             if (!detail) return;
-            await plHold(detail.name, !detail.held).catch((e) => (error = String(e)));
+            await plHold(detail.name, !detail.held).catch((e) => (logError("pldetail:hold", e), (error = String(e))));
             plBump();
           }}
         >

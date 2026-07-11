@@ -23,6 +23,8 @@ import {
   plCopyLink,
   type PlaylistMeta,
 } from "$lib/playlists.svelte";
+import { logError, logWarn } from "$lib/debug";
+import { reportError, toast } from "$lib/toast.svelte";
 
 export interface TrackCtx {
   /** Right-clicked inside a playlist you own — offer "Remove from this playlist". */
@@ -42,16 +44,18 @@ const OPEN_WITH_APPS: { label: string; app: string }[] = [
 
 /** Reassemble `h`'s byte-exact original and open it in an external tracker. The backend fetches
  *  the module's own rootCid, reassembles (v3 or v1, byte-exact), verifies MD5 parity vs the
- *  catalog, saves to ~/Downloads, and launches `app`. Fire-and-forget like the other menu
- *  actions; failures are logged (the app has no toast surface). */
+ *  catalog, saves to ~/Downloads, and launches `app`. Fire-and-forget; failures both log and
+ *  toast, since the user explicitly asked to open the file. */
 async function openWithTracker(h: ModuleHit, app: string): Promise<void> {
   try {
     const res = await downloadAndOpen({ root: h.rootCid, md5: h.md5, filename: h.filename, openWith: app });
     if (!res.launched) {
-      console.error(`[open-with] saved ${res.path} but could not launch ${app}: ${res.launch_error ?? "unknown"}`);
+      // The file WAS saved; only the launch failed — say so rather than "failed".
+      logWarn("open-with", res.launch_error ?? "unknown", { app, saved: res.path });
+      toast(`Saved to ${res.path} but couldn't open ${app}`, "info");
     }
   } catch (e) {
-    console.error(`[open-with] failed for ${h.filename}:`, e);
+    reportError("open-with", e, `Couldn't open ${h.filename} with ${app}`);
   }
 }
 
@@ -67,7 +71,9 @@ export function trackMenuItems(h: ModuleHit, ctx: TrackCtx = {}): MenuItem[] {
       kind: "submenu",
       label: "Add to playlist",
       items: async () => {
-        const mine = (await plList().catch(() => [])).filter((p) => p.isMine && !p.liked);
+        const mine = (
+          await plList().catch((e) => (logError("menus:plList", e), []))
+        ).filter((p) => p.isMine && !p.liked);
         const out: MenuItem[] = mine.map((p) => ({
           kind: "action",
           label: p.title || "(untitled)",
@@ -120,7 +126,10 @@ export function trackMenuItems(h: ModuleHit, ctx: TrackCtx = {}): MenuItem[] {
     {
       kind: "action",
       label: "Copy CID",
-      onSelect: () => void navigator.clipboard.writeText(h.rootCid).catch(() => {}),
+      onSelect: () =>
+        void navigator.clipboard
+          .writeText(h.rootCid)
+          .catch((e) => reportError("copy-cid", e, "Couldn't copy CID to clipboard")),
     },
   );
   return items;
@@ -134,8 +143,9 @@ async function playByName(name: string): Promise<void> {
 async function copyPlaylistLink(name: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(await plCopyLink(name));
-  } catch {
-    /* no live record / clipboard denied — best-effort */
+  } catch (e) {
+    // No live record yet (not published) or clipboard denied — tell the user, log the cause.
+    reportError("copy-playlist-link", e, "Couldn't copy playlist link");
   }
 }
 

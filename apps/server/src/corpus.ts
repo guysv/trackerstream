@@ -125,7 +125,10 @@ export async function forEachModule(
     const _to = Date.now();
     try {
       zf = await openZip(oz);
-    } catch {
+    } catch (e) {
+      // A corrupt/unreadable OUTER zip drops every module inside it from the catalog — log which
+      // one and why rather than vanishing them silently.
+      console.error(`[corpus] skip unreadable outer zip ${outerRel}: ${String(e)}`);
       continue;
     }
     corpusStats.openMs += Date.now() - _to;
@@ -142,7 +145,9 @@ export async function forEachModule(
         let izf: yauzl.ZipFile;
         try {
           izf = await openZip(innerBuf);
-        } catch {
+        } catch (e) {
+          // Malformed inner zip → this module is dropped; log it instead of silently skipping.
+          console.error(`[corpus] skip unreadable inner zip ${outerRel}!${nm}: ${String(e)}`);
           return;
         }
         corpusStats.readMs += Date.now() - _t;

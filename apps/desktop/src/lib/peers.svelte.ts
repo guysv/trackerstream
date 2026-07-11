@@ -6,6 +6,7 @@
 // totals intact, and continues from them on reconnect. Polling runs for the app's
 // lifetime so the toggle count stays live with the pane closed.
 import { peerStats, type PeerRole } from "./p2p";
+import { logWarn } from "./debug";
 
 export interface PeerRow {
   id: string;
@@ -59,9 +60,14 @@ const firstConnected = new Map<string, number>();
 export const speedHistory = (id: string): number[] => speedHist.get(id) ?? [];
 export const connectedSince = (id: string): number | null => firstConnected.get(id) ?? null;
 
+// Log an outage only on the working→failing edge, not every tick — this poll runs ~1/s and a
+// per-tick warn would flood the log during any node-not-ready window.
+let peersHealthy = true;
+
 async function tick(): Promise<void> {
   try {
     const s = await peerStats();
+    peersHealthy = true;
     const now = Date.now();
     const dt = lastT ? (now - lastT) / 1000 : 0;
     let totalDown = 0;
@@ -119,8 +125,10 @@ async function tick(): Promise<void> {
     peers.speedUp = aggUp;
     peers.offloadDown = offloadDown;
     peers.reachable = s.reachable;
-  } catch {
-    // Node not ready yet — keep the last snapshot, retry next tick.
+  } catch (e) {
+    // Node not ready yet — keep the last snapshot, retry next tick. Log once per outage.
+    if (peersHealthy) logWarn("peers:tick", e);
+    peersHealthy = false;
   }
 }
 

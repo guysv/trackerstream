@@ -9,6 +9,7 @@
   import { openContextMenu } from "$lib/contextmenu.svelte";
   import { playlistMenuItems } from "$lib/menus";
   import { ui } from "$lib/ui.svelte";
+  import { logError } from "$lib/debug";
 
   const q = $derived(($page.url.searchParams.get("q") ?? "").trim());
   // "names only" toggle (set in the header): restrict the match to title/filename via the
@@ -103,7 +104,10 @@
         plrows = pl;
         done = count < PAGE; // a short first page means there's no more
         ui.status = `${count}${done ? "" : "+"} track${count === 1 ? "" : "s"} · ${pl.length} playlist${pl.length === 1 ? "" : "s"}`;
-      } catch {
+      } catch (e) {
+        // The header status is the user-facing surface (a toast per keystroke would spam);
+        // but the real error — an FTS syntax error, a node outage, etc. — reaches the log.
+        logError("search", e, { q: query, names });
         if (myReq === reqSeq) ui.status = "search offline";
       } finally {
         if (myReq === reqSeq) fetching = false;
@@ -127,8 +131,10 @@
       if (myReq !== reqSeq) return; // superseded by a newer query
       if (count < PAGE) done = true;
       ui.status = `${rows.length}${done ? "" : "+"} tracks · ${plrows.length} playlist${plrows.length === 1 ? "" : "s"}`;
-    } catch {
-      /* transient — leave `done` false so a later scroll retries */
+    } catch (e) {
+      // Transient — leave `done` false so a later scroll retries; log so a persistent
+      // paging failure (vs a one-off blip) is visible rather than an infinite silent retry.
+      logError("search:loadMore", e, { q, cursor });
     } finally {
       if (myReq === reqSeq) fetching = false;
     }

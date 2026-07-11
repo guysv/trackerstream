@@ -101,6 +101,13 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
     flat = 0,
     rebuilt = 0,
     unchanged = 0;
+  // Count a module as failed AND say which one + why. Previously every failure path was a bare
+  // `failed++`, so a run reporting "N failed" gave no clue which module or what broke. `reason`
+  // labels the phase; `err` (when present) carries the actual error.
+  const fail = (source: string, reason: string, err?: unknown): void => {
+    failed++;
+    console.error(`[ingest] fail ${source}: ${reason}${err !== undefined ? ` — ${String(err)}` : ""}`);
+  };
   // Bake profiler (PROFILE=1): cumulative wall-time per phase, to spot the bottleneck.
   const PROFILE = process.env.PROFILE === "1";
   const prof = { decode: 0, dag: 0, kubo: 0, cat: 0, pin: 0 };
@@ -117,7 +124,7 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
     const inflight = new Set<Promise<void>>();
     const applyRebuild = async (m: { source: string }, existingRoot: string, r: BakeResult) => {
       if (!r.ok || !r.root) {
-        failed++;
+        fail(m.source, "worker bake failed", r.error);
         return;
       }
       if (r.root === existingRoot) {
@@ -129,11 +136,11 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
       try {
         const { mismatched } = await loadDagToKubo(rpc, blocks, CID.parse(r.root));
         if (mismatched.length) {
-          failed++;
+          fail(m.source, `loadDagToKubo: ${mismatched.length} block(s) mismatched`);
           return;
         }
-      } catch {
-        failed++;
+      } catch (e) {
+        fail(m.source, "loadDagToKubo threw (rebuild)", e);
         return;
       }
       prof.kubo += Date.now() - _t;
@@ -164,9 +171,7 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
         const p = pool
           .run(m.bytes, m.name) // structured-cloned into the worker (m.bytes is a shared pool Buffer)
           .then((r) => io.run(() => applyRebuild(m, existing.rootCid, r)))
-          .catch(() => {
-            failed++;
-          })
+          .catch((e) => fail(m.source, "bake/apply pipeline threw", e))
           .finally(() => sem.release());
         inflight.add(p);
         void p.finally(() => inflight.delete(p));
@@ -227,8 +232,8 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
         try {
           dag = await buildFlatDag(bytes, ext);
           isFlat = true;
-        } catch {
-          failed++;
+        } catch (e) {
+          fail(m.source, "buildFlatDag threw (unbakeable)", e);
           return;
         }
       }
@@ -245,11 +250,11 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
         try {
           const { mismatched } = await loadDagToKubo(rpc, dag.blocks, dag.root);
           if (mismatched.length) {
-            failed++;
+            fail(m.source, `loadDagToKubo: ${mismatched.length} block(s) mismatched (rebuild)`);
             return;
           }
-        } catch {
-          failed++;
+        } catch (e) {
+          fail(m.source, "loadDagToKubo threw (rebuild)", e);
           return;
         }
         prof.kubo += Date.now() - _t;
@@ -276,16 +281,16 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
       try {
         const { mismatched } = await loadDagToKubo(rpc, dag.blocks, dag.root);
         if (mismatched.length) {
-          failed++;
+          fail(m.source, `loadDagToKubo: ${mismatched.length} block(s) mismatched (new)`);
           return;
         }
-      } catch {
-        failed++;
+      } catch (e) {
+        fail(m.source, "loadDagToKubo threw (new)", e);
         return;
       }
 
       if (!meta) {
-        failed++;
+        fail(m.source, "no metadata (libopenmpt could not parse)");
         return;
       }
 

@@ -15,6 +15,7 @@
   import { fmtBytes } from "$lib/format";
   import { openContextMenu } from "$lib/contextmenu.svelte";
   import { playlistMenuItems } from "$lib/menus";
+  import { logError, logWarn } from "$lib/debug";
 
   // Reused both as the nav-rail "Your Library" list and (potentially) elsewhere. Selection
   // is driven by the caller (the open playlist's route param), so `selectedName` is a plain
@@ -36,7 +37,7 @@
     void plState.version; // same cadence as the list: mutations + the 10s sync tick
     plStatus()
       .then((st) => (status = st))
-      .catch(() => (status = null));
+      .catch((e) => (logWarn("plStatus", e), (status = null)));
   });
 
   // Hold-beacon backer counts for the visible rows: ranks discover by backing and
@@ -49,7 +50,7 @@
     void plState.version; // re-query after any mutation + the sync tick
     (q ? plSearch(q) : plList(t === "library" ? "library" : "seen"))
       .then(async (r) => {
-        backers = await plBackers(r.map((p) => p.name)).catch(() => ({}));
+        backers = await plBackers(r.map((p) => p.name)).catch((e) => (logWarn("plBackers", e), {}));
         // Discover ranks by backing (holder count desc, then recency): popularity =
         // durability on this network, so back-worthy lists float up.
         rows =
@@ -62,7 +63,7 @@
             : r;
         error = null;
       })
-      .catch((e) => (error = String(e)));
+      .catch((e) => (logError("playlists:list", e, { q, tab: t }), (error = String(e))));
   });
 
   async function createNew() {
@@ -71,13 +72,14 @@
       plBump();
       onopen?.(meta.name);
     } catch (e) {
+      logError("playlists:create", e);
       error = `create failed: ${e}`;
     }
   }
 
   async function play(p: PlaylistMeta) {
     const d = await plGet(p.name);
-    if (d) await playPlaylist(d).catch((e) => (error = String(e)));
+    if (d) await playPlaylist(d).catch((e) => (logError("playlists:play", e, { name: p.name }), (error = String(e))));
   }
 </script>
 
