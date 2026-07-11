@@ -29,6 +29,7 @@ case "$TRIPLE" in
   x86_64-unknown-linux-gnu)  GOOS=linux   GOARCH=amd64 ;;
   aarch64-unknown-linux-gnu) GOOS=linux   GOARCH=arm64 ;;
   x86_64-pc-windows-msvc)    GOOS=windows GOARCH=amd64 ;;
+  aarch64-pc-windows-msvc)   GOOS=windows GOARCH=arm64 ;;
   *) echo "unmapped target triple: $TRIPLE (add it to prepare-sidecar.sh)" >&2; exit 1 ;;
 esac
 
