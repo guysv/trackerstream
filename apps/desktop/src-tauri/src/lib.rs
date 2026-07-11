@@ -548,6 +548,26 @@ struct DownloadResult {
     launch_error: Option<String>,
 }
 
+/// Nudge the macOS Dock's Downloads stack to register + bounce for a freshly-saved file — the same
+/// `com.apple.DownloadFileFinished` distributed notification Safari/Chrome post when a download
+/// completes. Best-effort: we shell out to JXA (`osascript -l JavaScript`) so we don't have to pull
+/// in an Objective-C dependency, and pass the path via env var so no shell/AppleScript quoting can
+/// break on odd filenames. Any failure is swallowed — the file is already in Downloads regardless.
+#[cfg(target_os = "macos")]
+fn notify_downloads_stack(path: &str) {
+    const JS: &str = "ObjC.import('Foundation');\
+        var p = $.NSProcessInfo.processInfo.environment.objectForKey('TS_DL_PATH');\
+        if (p) $.NSDistributedNotificationCenter.defaultCenter\
+            .postNotificationNameObjectUserInfoDeliverImmediately('com.apple.DownloadFileFinished', p, $(), true);";
+    let _ = std::process::Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", JS])
+        .env("TS_DL_PATH", path)
+        .spawn();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn notify_downloads_stack(_path: &str) {}
+
 /// Reassemble a module's BYTE-EXACT original from its root CID (v3/v4 streaming root or v1/flat
 /// root — dispatched on manifest version), verify it against the catalog `md5`, write it to the OS
 /// Downloads dir, and open it with an external tracker (schismtracker / milkytracker). The desktop
@@ -602,6 +622,10 @@ async fn download_and_open(
     let out = dir.join(&base);
     std::fs::write(&out, &bytes).map_err(|e| format!("write {}: {e}", out.display()))?;
     let path = out.to_string_lossy().into_owned();
+
+    // Register the file with the macOS Dock Downloads stack (bounce + stack entry) now that the
+    // bytes are on disk — matches the OS "download finished" affordance. No-op off macOS.
+    notify_downloads_stack(&path);
 
     // Launch the external tracker on the saved file. Download already succeeded, so a launch
     // failure is reported (launched=false) but not fatal.
