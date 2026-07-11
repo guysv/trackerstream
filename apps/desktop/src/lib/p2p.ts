@@ -113,6 +113,20 @@ export interface DownloadResult {
   launch_error: string | null;
 }
 
+/** An external tracker detected on this machine. `target` is the resolved `openWith` launch
+ *  target (macOS `.app` path / CLI binary, Linux binary path, Windows full `.exe` path) to pass
+ *  straight to `downloadAndOpen`. */
+export interface TrackerInfo {
+  id: string;
+  label: string;
+  target: string;
+}
+
+/** Detect which external trackers are installed (filesystem probe in the backend). The "Open with"
+ *  menu resolves this on hover and offers only what's launchable. */
+export const listInstalledTrackers = (): Promise<TrackerInfo[]> =>
+  invoke<TrackerInfo[]>("list_installed_trackers");
+
 /** Reassemble a module's byte-exact original from its root CID (v3 streaming root or v1/flat root
  *  — dispatched on manifest version), verify it against the catalog `md5`, save it to the OS
  *  Downloads dir under `filename`, and open it with an external tracker (`openWith`:

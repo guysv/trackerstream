@@ -5,7 +5,7 @@
 
 import type { MenuItem } from "$lib/contextmenu.svelte";
 import type { ModuleHit } from "$lib/catalog";
-import { downloadAndOpen } from "$lib/p2p";
+import { downloadAndOpen, listInstalledTrackers, type TrackerInfo } from "$lib/p2p";
 import { enqueue, playList } from "$lib/player.svelte";
 import {
   plState,
@@ -35,28 +35,37 @@ export interface TrackCtx {
   onRemove?: () => void;
 }
 
-// External trackers the "Open with" submenu offers. `app` is the opener target handed to the OS
-// (macOS `open -a <app>`, Linux the binary name); label is what the menu shows.
-const OPEN_WITH_APPS: { label: string; app: string }[] = [
-  { label: "SchismTracker", app: "schismtracker" },
-  { label: "MilkyTracker", app: "milkytracker" },
-];
-
 /** Reassemble `h`'s byte-exact original and open it in an external tracker. The backend fetches
  *  the module's own rootCid, reassembles (v3 or v1, byte-exact), verifies MD5 parity vs the
- *  catalog, saves to ~/Downloads, and launches `app`. Fire-and-forget; failures both log and
- *  toast, since the user explicitly asked to open the file. */
-async function openWithTracker(h: ModuleHit, app: string): Promise<void> {
+ *  catalog, saves to ~/Downloads, and launches `t.target` (the resolved per-OS launch target).
+ *  Fire-and-forget; failures both log and toast, since the user explicitly asked to open the file. */
+async function openWithTracker(h: ModuleHit, t: TrackerInfo): Promise<void> {
   try {
-    const res = await downloadAndOpen({ root: h.rootCid, md5: h.md5, filename: h.filename, openWith: app });
+    const res = await downloadAndOpen({ root: h.rootCid, md5: h.md5, filename: h.filename, openWith: t.target });
     if (!res.launched) {
       // The file WAS saved; only the launch failed — say so rather than "failed".
-      logWarn("open-with", res.launch_error ?? "unknown", { app, saved: res.path });
-      toast(`Saved to ${res.path} but couldn't open ${app}`, "info");
+      logWarn("open-with", res.launch_error ?? "unknown", { app: t.target, saved: res.path });
+      toast(`Saved to ${res.path} but couldn't open ${t.label}`, "info");
     }
   } catch (e) {
-    reportError("open-with", e, `Couldn't open ${h.filename} with ${app}`);
+    reportError("open-with", e, `Couldn't open ${h.filename} with ${t.label}`);
   }
+}
+
+/** Build the "Open with" submenu contents, resolved on hover: probe the backend for installed
+ *  trackers and offer only those. A disabled placeholder covers "none installed". */
+async function openWithItems(h: ModuleHit): Promise<MenuItem[]> {
+  const found = await listInstalledTrackers().catch((e) => (logError("menus:trackers", e), []));
+  if (found.length === 0) {
+    return [{ kind: "action", label: "No tracker found", disabled: true, onSelect: () => {} }];
+  }
+  return found.map(
+    (t): MenuItem => ({
+      kind: "action",
+      label: t.label,
+      onSelect: () => void openWithTracker(h, t),
+    }),
+  );
 }
 
 export function trackMenuItems(h: ModuleHit, ctx: TrackCtx = {}): MenuItem[] {
@@ -115,13 +124,7 @@ export function trackMenuItems(h: ModuleHit, ctx: TrackCtx = {}): MenuItem[] {
     {
       kind: "submenu",
       label: "Open with",
-      items: OPEN_WITH_APPS.map(
-        (a): MenuItem => ({
-          kind: "action",
-          label: a.label,
-          onSelect: () => void openWithTracker(h, a.app),
-        }),
-      ),
+      items: () => openWithItems(h),
     },
     {
       kind: "action",

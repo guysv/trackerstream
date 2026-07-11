@@ -1002,6 +1002,7 @@ dependencies = [
  "libp2p-identity",
  "log",
  "md5",
+ "open",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "rusqlite",
@@ -2901,14 +2902,12 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "open"
-version = "5.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fbaa89d2ddc8473c78a3adf69eea8cffa28c483b8e02a971ef31527cd0fc92c"
+version = "5.3.6"
+source = "git+https://github.com/guysv/open-rs?rev=55f3b2c849e5ca45f62f1622ce72371913e65f13#55f3b2c849e5ca45f62f1622ce72371913e65f13"
 dependencies = [
  "dunce",
  "is-wsl",
  "libc",
- "pathdiff",
 ]
 
 [[package]]
@@ -2996,12 +2995,6 @@ dependencies = [
  "smallvec",
  "windows-link 0.2.1",
 ]
-
-[[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "percent-encoding"

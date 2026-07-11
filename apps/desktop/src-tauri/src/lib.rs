@@ -11,6 +11,7 @@ pub mod link;
 pub mod playlists;
 pub mod rpc;
 pub mod sidecar;
+pub mod trackers;
 
 use cid::Cid;
 use rpc::NodeRpc;
@@ -574,6 +575,15 @@ fn notify_downloads_stack(_path: &str) {}
 /// "Open with" path. `open_with` is the opener target (macOS `open -a <app>`, Linux the binary);
 /// None opens with the OS default. The file is saved BEFORE launching, so a missing tracker still
 /// leaves the rebuilt module in Downloads (launched=false + launch_error). See REBUILD.md.
+/// Detect which external trackers are actually installed, so the "Open with" menu offers only
+/// launchable ones (resolved lazily when the user hovers the submenu). Pure filesystem probe — no
+/// process is spawned. Each result carries the resolved `open_with` `target` to hand straight back
+/// to `download_and_open`. See `trackers`.
+#[tauri::command]
+fn list_installed_trackers() -> Vec<trackers::TrackerInfo> {
+    trackers::installed()
+}
+
 #[tauri::command]
 async fn download_and_open(
     app: tauri::AppHandle,
@@ -1004,6 +1014,7 @@ pub fn run() {
             get_sample,
             set_playhead,
             open_logs_dir,
+            list_installed_trackers,
             download_and_open,
             playlist_search,
             playlist_list,
