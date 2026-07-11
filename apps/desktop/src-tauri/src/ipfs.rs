@@ -90,7 +90,16 @@ struct PcmRoot {
 struct SampleV2 {
     index: u32, // 1-based libopenmpt slot (== provide_sample arg)
     frames: u32,
-    chunks: Vec<Cid>, // decoded native-layout PCM leaves
+    // Native layout of the DECODED PCM — always present in the CBOR (the bake writes them for
+    // every v2/v3/v4 sample); needed to FLAC-decode + de-interleave v4 leaves. Defaulted so a
+    // raw (encCodec=0) sample, which ignores them, tolerates their absence on any older root.
+    #[serde(default)]
+    channels: u32, // 1 | 2
+    #[serde(default, rename = "bitDepth")]
+    bit_depth: u32, // 8 | 16
+    chunks: Vec<Cid>, // v2/v3: decoded native-layout PCM leaves. v4: FLAC stream when encCodec=1.
+    #[serde(default, rename = "encCodec")]
+    enc_codec: u8, // 0 = raw planar PCM (v2/v3), 1 = FLAC (v4)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -337,9 +346,11 @@ struct SampleV3 {
     channels: u32, // native interleave 1|2
     #[serde(rename = "bitDepth")]
     bit_depth: u32, // 8|16
-    chunks: Vec<Cid>, // decoded native-layout PCM leaves (same blocks v2 streams)
+    chunks: Vec<Cid>, // decoded native-layout PCM leaves (v3) or FLAC stream (v4, encCodec=1)
     offset: u64, // on-disk byte offset in the original file
     enc: u32, // ENC_* bitmask: enc(decoded) == on-disk bytes
+    #[serde(default, rename = "encCodec")]
+    enc_codec: u8, // 0 = raw planar PCM (v3), 1 = FLAC (v4)
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,9 +438,61 @@ fn apply_enc(enc: u32, d: &[u8], bit_depth: u32, channels: u32) -> Vec<u8> {
     cur
 }
 
-/// Reassemble the BYTE-EXACT original from a v3 root: assemble the skeleton (streamed regions are
-/// zero there), then write enc(decodedPCM) into each sample's file offset. Resident samples already
-/// sit in the skeleton. Every block CID is verified on fetch (fetch_bytes / fetch_many).
+/// v4 leaf codec (mirrors FLAC_CODEC/FLAC_RAW in packages/repack/src/flac.ts).
+const FLAC_CODEC: u8 = 1;
+
+/// Decode a FLAC stream back to PLANAR native PCM — the inverse of flac.ts's flacEncode. claxon
+/// yields channel-interleaved i32 samples; we pack them to native 8/16-bit LE (matching the
+/// bake's `--endian=little --sign=signed`), then de-interleave stereo to planar (all of ch0,
+/// then ch1), which is the exact layout provide_sample / reassembly expect. Identity for mono.
+/// MUST stay in lockstep with flac.ts (interleave/deinterleave + the encoder flags).
+fn flac_decode(bytes: &[u8], channels: u32, bit_depth: u32) -> Result<Vec<u8>> {
+    let mut reader = claxon::FlacReader::new(std::io::Cursor::new(bytes))
+        .map_err(|e| anyhow!("flac: open failed: {e}"))?;
+    let bps = if bit_depth == 16 { 2usize } else { 1usize };
+    let mut inter: Vec<u8> = Vec::new();
+    for s in reader.samples() {
+        let v = s.map_err(|e| anyhow!("flac: decode failed: {e}"))?;
+        if bps == 1 {
+            inter.push((v as i8) as u8);
+        } else {
+            let x = v as i16;
+            inter.push(x as u8);
+            inter.push((x >> 8) as u8);
+        }
+    }
+    if channels != 2 {
+        return Ok(inter); // mono: interleaved == planar
+    }
+    if inter.len() % (2 * bps) != 0 {
+        return Err(anyhow!("flac: decoded {} bytes not a whole stereo frame", inter.len()));
+    }
+    let frames = inter.len() / (2 * bps);
+    let mut out = vec![0u8; inter.len()];
+    let r = frames * bps;
+    for f in 0..frames {
+        for b in 0..bps {
+            out[f * bps + b] = inter[(f * 2) * bps + b];
+            out[r + f * bps + b] = inter[(f * 2 + 1) * bps + b];
+        }
+    }
+    Ok(out)
+}
+
+/// Turn a sample's assembled leaf bytes into its decoded native PCM: FLAC-decode when `enc_codec`
+/// says so (v4), else the leaves already ARE that PCM (v2/v3). The single seam that makes v4
+/// transparent to everything downstream (provide_sample, the fence, reassembly).
+fn decode_sample(leaf: Vec<u8>, channels: u32, bit_depth: u32, enc_codec: u8) -> Result<Vec<u8>> {
+    if enc_codec == FLAC_CODEC {
+        flac_decode(&leaf, channels, bit_depth)
+    } else {
+        Ok(leaf)
+    }
+}
+
+/// Reassemble the BYTE-EXACT original from a v3/v4 root: assemble the skeleton (streamed regions are
+/// zero there), then write enc(decodedPCM) into each sample's file offset. v4 leaves are FLAC-decoded
+/// first. Resident samples already sit in the skeleton. Every block CID is verified on fetch.
 pub async fn reassemble_v3(rpc: &NodeRpc, root: Cid) -> Result<Vec<u8>> {
     let manifest_bytes = fetch_bytes(rpc, root).await?;
     let manifest: ManifestV3 = serde_ipld_dagcbor::from_slice(&manifest_bytes)?;
@@ -457,6 +520,7 @@ pub async fn reassemble_v3(rpc: &NodeRpc, root: Cid) -> Result<Vec<u8>> {
         for c in &s.chunks {
             pcm.extend_from_slice(blocks.get(c).ok_or_else(|| anyhow!("missing sample chunk {c}"))?);
         }
+        let pcm = decode_sample(pcm, s.channels, s.bit_depth, s.enc_codec)?;
         let enc = apply_enc(s.enc, &pcm, s.bit_depth, s.channels);
         let off = s.offset as usize;
         if off + enc.len() > out.len() {
@@ -473,9 +537,9 @@ pub async fn reassemble_v3(rpc: &NodeRpc, root: Cid) -> Result<Vec<u8>> {
 pub async fn reassemble_any(rpc: &NodeRpc, root: Cid) -> Result<Vec<u8>> {
     let manifest_bytes = fetch_bytes(rpc, root).await?;
     match manifest_version(&manifest_bytes) {
-        3 => reassemble_v3(rpc, root).await,
+        3 | 4 => reassemble_v3(rpc, root).await, // v4 = v3 + FLAC leaves (decoded in reassemble_v3)
         0 | 1 => reassemble(rpc, root).await,
-        2 => Err(anyhow!("v2 (streaming-only) root has no byte-exact reassembly; re-bake to v3")),
+        2 => Err(anyhow!("v2 (streaming-only) root has no byte-exact reassembly; re-bake to v3/v4")),
         other => Err(anyhow!("unsupported manifest version {other}; please update trackerstream")),
     }
 }
@@ -608,8 +672,10 @@ pub async fn stream_v2(
     let ver = manifest_version(&manifest_bytes);
     match ver {
         // v3 streams identically to v2 — it only ADDS reassembly fields (offset/enc/originalLength)
-        // that the ManifestV2 decode below ignores. So both route through the v2 streaming path.
-        2 | 3 => {} // fall through to the v2 streaming path below
+        // the ManifestV2 decode ignores. v4 additionally FLAC-compresses the sample leaves, decoded
+        // transparently in the sample loop (SampleV2 now reads encCodec/channels/bitDepth). All three
+        // route through the v2 streaming path.
+        2 | 3 | 4 => {} // fall through to the v2 streaming path below
         0 | 1 => {
             log::info!(target: "stream", "{root}: v{ver} root -> full reassemble (no streaming)");
             let bytes = reassemble(rpc, root).await?;
@@ -710,6 +776,7 @@ pub async fn stream_v2(
         for c in &s.chunks {
             pcm.extend_from_slice(warm.get(c).ok_or_else(|| anyhow!("missing sample chunk {c}"))?);
         }
+        let pcm = decode_sample(pcm, s.channels, s.bit_depth, s.enc_codec)?;
         state.samples.lock().unwrap().insert(s.index, pcm);
         let _ = events.send(StreamEvent::Sample { index: s.index, frames: s.frames });
         delivered.insert(s.index);
@@ -734,6 +801,7 @@ pub async fn stream_v2(
         let si = remaining.swap_remove(best);
         let s = &samples[si];
         let pcm = assemble(rpc, &s.chunks).await?;
+        let pcm = decode_sample(pcm, s.channels, s.bit_depth, s.enc_codec)?;
         state.samples.lock().unwrap().insert(s.index, pcm);
         let _ = events.send(StreamEvent::Sample { index: s.index, frames: s.frames });
     }
@@ -792,6 +860,27 @@ mod tests {
         }
     }
 
+    // flac_decode must reproduce the bake's PLANAR native PCM byte-for-byte from the FLAC stream the
+    // encoder (flac.ts) emits — the risky seam is claxon's i32 output -> 8/16-bit LE packing ->
+    // de-interleave. Fixtures are generated by packages/repack/test/gen-flac-fixtures.ts (regenerate
+    // after any flac.ts change): <case>.flac decoded must equal <case>.planar.
+    #[test]
+    fn flac_decode_matches_bake() {
+        macro_rules! case {
+            ($name:literal, $ch:expr, $bd:expr) => {{
+                let flac = include_bytes!(concat!("testdata/flac/", $name, ".flac"));
+                let planar = include_bytes!(concat!("testdata/flac/", $name, ".planar"));
+                let got = flac_decode(flac, $ch, $bd).expect(concat!($name, ": decode failed"));
+                assert_eq!(got.as_slice(), planar.as_slice(), concat!($name, ": flac_decode != bake planar PCM"));
+            }};
+        }
+        case!("c1_b8", 1, 8);
+        case!("c1_b16", 1, 16);
+        case!("c2_b8", 2, 8);
+        case!("c2_b16", 2, 16);
+        case!("c2_b16_odd", 2, 16);
+    }
+
     // The streaming dispatch reads the manifest version from a minimal header: v1/v2 route to
     // their paths, a NEWER version is recognised (so stream_v2 degrades to a clean error rather
     // than mis-running the v1 reassembly), and an absent/undecodable `v` reads as v1.
@@ -806,7 +895,8 @@ mod tests {
         assert_eq!(manifest_version(&with_v(1)), 1);
         assert_eq!(manifest_version(&with_v(2)), 2);
         assert_eq!(manifest_version(&with_v(3)), 3); // v3 -> streams via the v2 path (+ reassembly)
-        assert_eq!(manifest_version(&with_v(4)), 4); // newer -> caller emits "please update"
+        assert_eq!(manifest_version(&with_v(4)), 4); // v4 -> v2 path + FLAC-decoded leaves
+        assert_eq!(manifest_version(&with_v(5)), 5); // newer -> caller emits "please update"
         // A pre-versioning v1 manifest with no `v` field reads as 0 -> v1 reassembly path.
         let mut no_v: BTreeMap<String, u64> = BTreeMap::new();
         no_v.insert("originalLength".into(), 42);

@@ -74,4 +74,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 sqlite-vfs = "0.2.0"
 # Decompresses per-page-zstd catalogs (the TSZCAT manifest format) over the Bitswap VFS.
 zstd = "0.13"
+# Lossless FLAC decode for v4 sample leaves (decode-only, pure Rust). Encoder side is the bake's
+# pinned libFLAC; this MUST decode its output bit-exactly (see flac.ts + the interop test).
+claxon = "0.4"
 

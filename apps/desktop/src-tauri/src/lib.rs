@@ -530,8 +530,8 @@ struct DownloadResult {
     launch_error: Option<String>,
 }
 
-/// Reassemble a module's BYTE-EXACT original from its root CID (v3 streaming root or v1/flat root
-/// — dispatched on manifest version), verify it against the catalog `md5`, write it to the OS
+/// Reassemble a module's BYTE-EXACT original from its root CID (v3/v4 streaming root or v1/flat
+/// root — dispatched on manifest version), verify it against the catalog `md5`, write it to the OS
 /// Downloads dir, and open it with an external tracker (schismtracker / milkytracker). The desktop
 /// "Open with" path. `open_with` is the opener target (macOS `open -a <app>`, Linux the binary);
 /// None opens with the OS default. The file is saved BEFORE launching, so a missing tracker still
@@ -556,8 +556,9 @@ async fn download_and_open(
             let _ = rpc.dial_providers(&root).await;
         });
     }
-    // Byte-exact reconstruction (v3 -> reassemble_v3; v1/flat -> reassemble). Every block is
-    // CID-verified; the DAG is byte-exact by construction (REBUILD.md / repack test/v3-roundtrip).
+    // Byte-exact reconstruction (v3/v4 -> reassemble_v3, FLAC-decoding v4 leaves; v1/flat ->
+    // reassemble). Every block is CID-verified; the DAG is byte-exact by construction (REBUILD.md /
+    // repack test/v3-roundtrip + v4-roundtrip).
     let bytes = ipfs::reassemble_any(&state.rpc, cid)
         .await
         .map_err(|e| format!("reassemble {root} failed: {e}"))?;
