@@ -60,7 +60,7 @@ This is a deliberate departure from prior art. The reference Mod Archive web pla
 
 trackerstream is a **hybrid**: a peer-to-peer **data plane** anchored by a single always-on master, over a deliberately thin **control plane**. Module bytes, the catalog, *and* user playlists all travel as content-addressed, self-verifying blocks over libp2p; the only centralized pieces are one **master node** (the availability + discovery floor) and an **offline ingest pipeline** that bakes and publishes the catalog. There are **no user accounts and no client-facing HTTP APIs**—identity is a local libp2p keypair.
 
-(An earlier draft split a decentralized *delivery* plane under a server-owned catalog/playlist/accounts control plane over HTTP; the [content-addressing labs](MVP.md) showed ~30–41% byte-exact sample dedup across the archive, which made decentralizing delivery worth it. Since then the **catalog and playlists have also moved onto the P2P plane**, and the client and master consolidated onto one Go node.)
+(An earlier draft split a decentralized *delivery* plane under a server-owned catalog/playlist/accounts control plane over HTTP; the content-addressing labs showed ~30–41% byte-exact sample dedup across the archive, which made decentralizing delivery worth it. Since then the **catalog and playlists have also moved onto the P2P plane**, and the client and master consolidated onto one Go node.)
 
 ### One node, two roles — `tsnode`
 
