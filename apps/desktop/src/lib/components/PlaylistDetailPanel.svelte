@@ -18,6 +18,8 @@
     type PlaylistDetail,
   } from "$lib/playlists.svelte";
   import { getModuleByMd5, type ModuleHit } from "$lib/catalog";
+  import { openContextMenu } from "$lib/contextmenu.svelte";
+  import { trackMenuItems } from "$lib/menus";
   import { cachedHit } from "$lib/cidCache";
   import { fmtTime } from "$lib/format";
   import { ui } from "$lib/ui.svelte";
@@ -450,6 +452,16 @@
           class:sel={selIdx === i}
           onclick={() => select(i, false)}
           ondblclick={() => detail && playPlaylist(detail, i)}
+          oncontextmenu={(e) => {
+            select(i, false);
+            // meta[t.md5] may be unresolved (offline / still fetching) — trackMenuItems needs a
+            // ModuleHit, so only open once it's available. The builder re-reads meta so a menu left
+            // open reflects the latest resolve.
+            if (meta[t.md5])
+              openContextMenu(e, () =>
+                trackMenuItems(meta[t.md5], { inPlaylistYouOwn: !!detail?.isMine, onRemove: () => removeTrack(i) }),
+              );
+          }}
           role="option"
           aria-selected={selIdx === i}
           tabindex="-1"
