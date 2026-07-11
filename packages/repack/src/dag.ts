@@ -18,6 +18,7 @@ import * as dagCbor from "@ipld/dag-cbor";
 import { cdcChunks, DEFAULT_CDC, type CdcConfig } from "./cdc.ts";
 import { sampleRegions, sampleSlots, type Format } from "./parse.ts";
 import { computeSeekTables } from "./seek.ts";
+import { flacEncode, flacDecode, FLAC_CODEC, FLAC_RAW, initFlac } from "./flac.ts";
 
 const RAW_CODE = 0x55;
 const DAG_CBOR_CODE = 0x71;
@@ -868,6 +869,221 @@ export async function reassembleV3(
     const pcm = new Uint8Array(pcmLen);
     let w = 0;
     for (const c of chunks) (pcm.set(c, w), (w += c.length));
+    out.set(applyEnc(s.enc, pcm, s.bitDepth, s.channels), s.offset);
+  }
+  return { bytes: out, manifest };
+}
+
+// ===========================================================================
+// v4 — v3 streaming + reassembly, with FLAC-compressed sample leaves.
+//
+// v4 == v3 EXCEPT each streamed sample's decoded native PCM is optionally FLAC-compressed
+// (lossless) before chunking. A per-sample gate keeps a sample RAW when FLAC wouldn't shrink
+// it (tiny/incompressible samples expand from framing overhead), recorded in `encCodec`. The
+// skeleton, plan, offset and enc tag are byte-identical to v3 — only the sample leaves differ.
+// After decode the sample PCM is identical to what v2/v3 stream, so playback is bit-exact.
+//
+// v4 is NOT backward-readable: a v2/v3 client would feed FLAC bytes to provide_sample and play
+// noise, so the version bump to 4 makes old clients reject it, and the v4-aware client MUST ship
+// before any prod v4 re-bake. See flac.ts for the codec + determinism requirements.
+// ===========================================================================
+
+export const MANIFEST_V4 = 4;
+
+/** v4 streamed sample: a v3 sample plus the codec of its leaves (raw planar PCM, or FLAC). */
+export interface SampleV4 extends SampleV3 {
+  encCodec: number; // FLAC_RAW (0) = leaves are planar native PCM; FLAC_CODEC (1) = FLAC stream
+}
+
+export interface IndexV4 {
+  samples: SampleV4[];
+  plan: PlanV2;
+}
+
+export interface ManifestV4 {
+  v: number; // 4
+  format: Format;
+  cdc: CdcConfig;
+  originalLength: number;
+  skeletonChunks: CID[];
+  skeletonLayout: number[];
+  index?: IndexV4;
+  indexRoot?: CID;
+}
+
+/**
+ * Build the v4 DAG: identical to buildDagV3 (skeleton/plan/offset/enc) but each streamed sample's
+ * decoded PCM is FLAC-compressed when that shrinks it (else kept raw; `encCodec` records which).
+ * Throws on any compressed sample (caller falls back to v1) or an unparseable module.
+ */
+export async function buildDagV4(
+  data: Uint8Array,
+  decoded: DecodedSample[],
+  cdc: CdcConfig = DEFAULT_CDC,
+): Promise<BuiltDagV2 & { manifest: ManifestV4 }> {
+  await initFlac();
+  const parsed = sampleSlots(data);
+  if (!parsed) throw new Error("unparseable module (cannot locate sample slots)");
+  const { format, slots } = parsed;
+  if (slots.some((s) => s.compressed)) throw new Error("v4: module has compressed sample(s) — route to v1");
+
+  const dumpByIndex = new Map<number, DecodedSample>();
+  for (const d of decoded) dumpByIndex.set(d.index, d);
+
+  // Streamed slots: uncompressed, decoded length matches on-disk, AND an enc tag reproduces the
+  // on-disk bytes (identical selection to v3 — FLAC is orthogonal to reassembly).
+  const streamed: { slot: (typeof slots)[number]; dump: DecodedSample; enc: number }[] = [];
+  for (const slot of slots) {
+    const dump = dumpByIndex.get(slot.index);
+    if (!dump || dump.data.length === 0 || dump.data.length !== slot.length) continue;
+    const onDisk = data.subarray(slot.offset, slot.offset + slot.length);
+    const enc = pickEnc(dump.data, onDisk, slot.bitDepth, slot.channels);
+    if (enc < 0) continue;
+    streamed.push({ slot, dump, enc });
+  }
+
+  const idxByOffset = new Map<number, number>();
+  for (const { slot } of streamed) idxByOffset.set(slot.offset, slot.index);
+  const toSlots = (offs: number[]): number[] => {
+    const out: number[] = [];
+    for (const o of offs) {
+      const i = idxByOffset.get(o);
+      if (i !== undefined) out.push(i);
+    }
+    return out;
+  };
+  const plan: PlanV2 = { orderSeconds: [], checkpoints: [] };
+  const tables = computeSeekTables(data, format);
+  if (tables) {
+    plan.orderSeconds = tables.orderSeconds;
+    plan.checkpoints = tables.checkpoints
+      .map((c) => ({ order: c.order, samples: toSlots(c.residentOffsets) }))
+      .filter((c) => c.samples.length);
+    if (!plan.checkpoints.length) {
+      const seg0 = toSlots(tables.segment0Offsets);
+      if (seg0.length) plan.checkpoints = [{ order: 0, samples: seg0 }];
+    }
+  }
+
+  const byCid = new Map<string, Block>();
+  const add = (b: Block): CID => {
+    const k = b.cid.toString();
+    if (!byCid.has(k)) byCid.set(k, b);
+    return b.cid;
+  };
+  let numChunks = 0;
+  const chunkToCids = async (buf: Uint8Array): Promise<CID[]> => {
+    const cids: CID[] = [];
+    for (const c of cdcChunks(buf, cdc)) {
+      numChunks++;
+      cids.push(add(await rawBlock(c.slice())));
+    }
+    return cids;
+  };
+
+  // Sample table: FLAC-compress each sample's decoded PCM, keep raw if FLAC doesn't shrink it.
+  const samples: SampleV4[] = [];
+  let sampleBytes = 0;
+  for (const { slot, dump, enc } of streamed) {
+    sampleBytes += dump.data.length;
+    const flac = flacEncode(dump.data, slot.channels, slot.bitDepth);
+    const useFlac = flac.length < dump.data.length; // per-sample gate: never grow a leaf
+    const encCodec = useFlac ? FLAC_CODEC : FLAC_RAW;
+    const chunks = await chunkToCids(useFlac ? flac : dump.data);
+    samples.push({ index: slot.index, frames: dump.frames, channels: slot.channels, bitDepth: slot.bitDepth, chunks, offset: slot.offset, enc, encCodec });
+  }
+
+  // Skeleton (identical to v3).
+  const { skeleton, zeroSpans } = buildSkeletonV2(data, streamed.map((s) => s.slot));
+  const skeletonChunks: CID[] = [];
+  const skeletonLayout: number[] = [];
+  {
+    const spans = mergeSpans(zeroSpans, skeleton.length);
+    let pos = 0;
+    for (const [a, b] of spans) {
+      let nc = 0;
+      if (a > pos) for (const cid of await chunkToCids(skeleton.subarray(pos, a))) (skeletonChunks.push(cid), nc++);
+      skeletonLayout.push(nc, b - a);
+      pos = b;
+    }
+    if (pos < skeleton.length) {
+      let nc = 0;
+      for (const cid of await chunkToCids(skeleton.subarray(pos))) (skeletonChunks.push(cid), nc++);
+      skeletonLayout.push(nc, 0);
+    }
+  }
+
+  const index: IndexV4 = { samples, plan };
+  let manifest: ManifestV4 = { v: MANIFEST_V4, format, cdc, originalLength: data.length, skeletonChunks, skeletonLayout, index };
+  let manifestBlock = await cborBlock(manifest);
+  let spilled = false;
+  if (manifestBlock.bytes.length > INDEX_SPILL_BYTES) {
+    const indexBlock = await cborBlock(index);
+    add(indexBlock);
+    manifest = { v: MANIFEST_V4, format, cdc, originalLength: data.length, skeletonChunks, skeletonLayout, indexRoot: indexBlock.cid };
+    manifestBlock = await cborBlock(manifest);
+    spilled = true;
+  }
+  add(manifestBlock);
+
+  return {
+    root: manifestBlock.cid,
+    manifest,
+    blocks: [...byCid.values()],
+    stats: {
+      format,
+      skeletonBytes: skeleton.length,
+      streamedSamples: streamed.length,
+      residentSamples: slots.length - streamed.length,
+      sampleBytes,
+      numChunks,
+      uniqueChunks: byCid.size,
+      manifestBytes: manifestBlock.bytes.length,
+      spilled,
+    },
+  };
+}
+
+/** Decode a v4 sample's assembled leaf bytes back to its decoded native PCM (planar) — the exact
+ *  bytes v2/v3 stream and provide_sample expects. FLAC-decode when `encCodec` says so, else the
+ *  leaves already ARE that PCM. Shared by reassembly and the client's streaming decode. */
+export function decodeV4Sample(leafBytes: Uint8Array, s: Pick<SampleV4, "encCodec" | "channels" | "bitDepth">): Uint8Array {
+  return s.encCodec === FLAC_CODEC ? flacDecode(leafBytes, s.channels, s.bitDepth) : leafBytes;
+}
+
+/**
+ * Reassemble the BYTE-EXACT original file from a v4 root. Like reassembleV3, but each sample's
+ * leaves are FLAC-decoded (per `encCodec`) back to native PCM before enc(decodedPCM) is written
+ * into its file offset.
+ */
+export async function reassembleV4(
+  root: CID,
+  get: BlockGetter,
+  opts: { verify?: boolean } = {},
+): Promise<{ bytes: Uint8Array; manifest: ManifestV4 }> {
+  await initFlac();
+  const verify = opts.verify ?? true;
+  const manifest = dagCbor.decode<ManifestV4>(await fetchVerified(root, get, verify));
+  if (manifest.v !== MANIFEST_V4) throw new Error(`not a v4 manifest (v=${manifest.v})`);
+  const index = manifest.index ?? dagCbor.decode<IndexV4>(await fetchVerified(manifest.indexRoot!, get, verify));
+
+  const parts: Uint8Array[] = [];
+  for (const cid of manifest.skeletonChunks) parts.push(await fetchVerified(cid, get, verify));
+  const out = assembleSkeletonV2(parts, manifest.skeletonLayout);
+  if (out.length !== manifest.originalLength) throw new Error(`v4 skeleton length ${out.length} != originalLength ${manifest.originalLength}`);
+
+  for (const s of index.samples) {
+    let leafLen = 0;
+    const chunks: Uint8Array[] = [];
+    for (const cid of s.chunks) {
+      const c = await fetchVerified(cid, get, verify);
+      chunks.push(c);
+      leafLen += c.length;
+    }
+    const leaves = new Uint8Array(leafLen);
+    let w = 0;
+    for (const c of chunks) (leaves.set(c, w), (w += c.length));
+    const pcm = decodeV4Sample(leaves, s);
     out.set(applyEnc(s.enc, pcm, s.bitDepth, s.channels), s.offset);
   }
   return { bytes: out, manifest };
