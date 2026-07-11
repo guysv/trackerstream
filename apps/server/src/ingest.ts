@@ -6,11 +6,14 @@ import { createHash } from "node:crypto";
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { constants as zlibConstants, zstdCompressSync } from "node:zlib";
 import { DatabaseSync } from "node:sqlite";
-import { buildDag, buildDagV3, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo } from "@trackerstream/repack";
+import { buildDag, buildDagV3, buildDagV4, buildFlatDag, detectFormat, KuboRpc, loadDagToKubo, flacStats } from "@trackerstream/repack";
+import { CID } from "multiformats/cid";
+import { corpusStats } from "./corpus.ts";
 import { CATALOG_IPNS_KEY } from "@trackerstream/config";
 import { Catalog } from "./catalog.ts";
 import { initMeta, extractModule, type ModuleMeta } from "./meta.ts";
 import { forEachModule } from "./corpus.ts";
+import { BakePool, Semaphore, Mutex, type BakeResult } from "./bake-pool.ts";
 
 // Catalog publish layout (R1): page-aligned 16 KB chunks so each SQLite page maps to
 // one stable UnixFS block (deterministic chunking -> high cross-rebake block reuse).
@@ -55,6 +58,10 @@ export interface IngestOpts {
   /** Publish the catalog DB to IPFS under the master-signed IPNS key at the end of
    *  ingest (R1). Default true; set false for dev slices. */
   publish?: boolean;
+  /** Subset re-bake allowlist: when set, only modules whose `source` is in this set are
+   *  walked/re-baked (everything else is skipped). Used with rebuild=true to re-bake a
+   *  targeted slice (e.g. a genre + a liked list) to v4 without touching the rest. */
+  sources?: Set<string>;
   onProgress?: (s: IngestStats) => void;
 }
 
@@ -94,34 +101,117 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
     flat = 0,
     rebuilt = 0,
     unchanged = 0;
+  // Bake profiler (PROFILE=1): cumulative wall-time per phase, to spot the bottleneck.
+  const PROFILE = process.env.PROFILE === "1";
+  const prof = { decode: 0, dag: 0, kubo: 0, cat: 0, pin: 0 };
 
-  await forEachModule(
-    opts.root,
-    async (m) => {
-      const existing = cat.getSourceMeta(m.source);
-      // Default (incremental) mode: skip anything already cataloged.
-      if (existing && !opts.rebuild) {
-        skipped++;
+  // Parallel bake (BAKE_WORKERS=N): a pool of worker threads does the CPU half (decode + FLAC
+  // encode + CDC) while THIS thread keeps the shared-resource I/O (block/put + catalog + pin)
+  // serialized. REBUILD-ONLY: every module must already be cataloged (the full v4 re-bake is
+  // pure rebuild); a not-yet-cataloged module is skipped in this mode.
+  const nWorkers = +(process.env.BAKE_WORKERS ?? 0);
+  if (nWorkers > 0) {
+    const pool = new BakePool(nWorkers, new URL("./bake-worker.ts", import.meta.url));
+    const sem = new Semaphore(nWorkers + 2); // bound in-flight modules (backpressure vs the serial I/O)
+    const io = new Mutex();
+    const inflight = new Set<Promise<void>>();
+    const applyRebuild = async (m: { source: string }, existingRoot: string, r: BakeResult) => {
+      if (!r.ok || !r.root) {
+        failed++;
+        return;
+      }
+      if (r.root === existingRoot) {
+        unchanged++;
+        return;
+      }
+      const blocks = r.blocks!.map((b) => ({ cid: CID.parse(b.cid), bytes: b.bytes }));
+      let _t = Date.now();
+      try {
+        const { mismatched } = await loadDagToKubo(rpc, blocks, CID.parse(r.root));
+        if (mismatched.length) {
+          failed++;
+          return;
+        }
+      } catch {
+        failed++;
+        return;
+      }
+      prof.kubo += Date.now() - _t;
+      _t = Date.now();
+      cat.updateRoot(m.source, r.root, blocks.length);
+      prof.cat += Date.now() - _t;
+      _t = Date.now();
+      try {
+        await rpc.pinRm(existingRoot, true);
+      } catch {
+        /* orphan pin — harmless */
+      }
+      prof.pin += Date.now() - _t;
+      rebuilt++;
+      if (opts.onProgress && (rebuilt + unchanged) % 200 === 0) {
+        opts.onProgress({ processed, skipped, failed, flat, rebuilt, unchanged, total: cat.count(), ms: Date.now() - t0 });
+      }
+    };
+    await forEachModule(
+      opts.root,
+      async (m) => {
+        const existing = cat.getSourceMeta(m.source);
+        if (!existing || !opts.rebuild) {
+          skipped++;
+          return;
+        }
+        await sem.acquire(); // backpressure: at most nWorkers+2 modules in flight
+        const p = pool
+          .run(m.bytes, m.name) // structured-cloned into the worker (m.bytes is a shared pool Buffer)
+          .then((r) => io.run(() => applyRebuild(m, existing.rootCid, r)))
+          .catch(() => {
+            failed++;
+          })
+          .finally(() => sem.release());
+        inflight.add(p);
+        void p.finally(() => inflight.delete(p));
+      },
+      { formats: opts.formats, limit: opts.limit, sources: opts.sources },
+    );
+    await Promise.all(inflight);
+    await pool.close();
+  } else
+    await forEachModule(
+      opts.root,
+      async (m) => {
+        const existing = cat.getSourceMeta(m.source);
+        // Default (incremental) mode: skip anything already cataloged.
+        if (existing && !opts.rebuild) {
+          skipped++;
         return;
       }
       const bytes = new Uint8Array(m.bytes);
       const ext = m.name.split(".").pop()?.toLowerCase() ?? "";
 
       // Single libopenmpt load -> metadata + decoded per-slot PCM (v2 input).
+      let _t = Date.now();
       const mod = extractModule(bytes);
       const meta: ModuleMeta | null = mod ? mod.meta : null;
       const fmt = detectFormat(bytes);
+      prof.decode += Date.now() - _t;
 
       let dag;
       let isFlat = false;
-      // v3 bake (v2 streaming + byte-exact reassembly from the SAME blocks) for parsed+decodable
-      // formats. buildDagV3 throws for modules with compressed samples (IT 0x08) or unparseable
+      _t = Date.now();
+      // v3/v4 bake (v2 streaming + byte-exact reassembly from the SAME blocks) for parsed+decodable
+      // formats. buildDagV3/V4 throw for modules with compressed samples (IT 0x08) or unparseable
       // slots -> fall to v1 buildDag (sample-separated, byte-exact, still reassemble-able; this is
       // where "compressed IT stays on v1" lands). mo3/unparseable -> v1 flat DAG. Every root is
-      // reassemble-able: v3 via reassembleV3, v1/flat via reassemble. See REBUILD.md.
+      // reassemble-able: v3/v4 via reassembleV3/V4, v1/flat via reassemble. See REBUILD.md.
+      //
+      // v4 = v3 + FLAC-compressed sample leaves (~2x smaller, ~52% smaller first-playable). It is
+      // NOT backward-readable (a v2/v3 client plays FLAC bytes as noise), so it is GATED behind
+      // BAKE_V4=1: flip it ONLY once the v4-aware desktop client has shipped, then do the full
+      // v4 REBUILD. Default stays v3 so an accidental ingest can't strand the deployed fleet.
+      const bakeV4 = process.env.BAKE_V4 === "1";
       if (mod && fmt && fmt !== "mo3") {
         try {
-          dag = await buildDagV3(bytes, mod.decoded);
+          dag = bakeV4 ? await buildDagV4(bytes, mod.decoded) : await buildDagV3(bytes, mod.decoded);
         } catch {
           /* compressed sample(s) / unparseable slots -> v1 byte-exact below */
         }
@@ -142,6 +232,7 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
           return;
         }
       }
+      prof.dag += Date.now() - _t;
 
       // Re-bake path: the module is already cataloged. Only do work when the DAG
       // root actually changed (e.g. seek tables added since the first ingest).
@@ -150,6 +241,7 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
           unchanged++;
           return;
         }
+        _t = Date.now();
         try {
           const { mismatched } = await loadDagToKubo(rpc, dag.blocks, dag.root);
           if (mismatched.length) {
@@ -160,14 +252,19 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
           failed++;
           return;
         }
+        prof.kubo += Date.now() - _t;
+        _t = Date.now();
         cat.updateRoot(m.source, dag.root.toString(), dag.blocks.length);
+        prof.cat += Date.now() - _t;
         // Drop the superseded root's pin (shared leaves remain pinned under the
         // new root). Best-effort: an orphan pin is harmless, just disk.
+        _t = Date.now();
         try {
           await rpc.pinRm(existing.rootCid, true);
         } catch {
           /* leave the old root pinned; verify-pinset will flag it as an orphan */
         }
+        prof.pin += Date.now() - _t;
         rebuilt++;
         if (opts.onProgress && (rebuilt + unchanged + processed) % 200 === 0) {
           opts.onProgress({ processed, skipped, failed, flat, rebuilt, unchanged, total: cat.count(), ms: Date.now() - t0 });
@@ -218,8 +315,34 @@ export async function runIngest(opts: IngestOpts): Promise<IngestStats> {
         opts.onProgress({ processed, skipped, failed, flat, rebuilt, unchanged, total: cat.count(), ms: Date.now() - t0 });
       }
     },
-    { formats: opts.formats, limit: opts.limit },
+    { formats: opts.formats, limit: opts.limit, sources: opts.sources },
   );
+
+  if (PROFILE) {
+    const wall = Date.now() - t0;
+    const n = rebuilt + processed || 1; // modules that did real work (unchanged skip write phases)
+    const unzip = corpusStats.openMs + corpusStats.readMs;
+    const other = wall - (prof.decode + prof.dag + prof.kubo + prof.cat + prof.pin + corpusStats.listMs + unzip);
+    const s = (ms: number) => (ms / 1000).toFixed(1) + "s";
+    const pc = (ms: number) => ((100 * ms) / wall).toFixed(0) + "%";
+    const per = (ms: number) => (ms / n).toFixed(1) + "ms";
+    // Extrapolate to the full corpus: one-time tree scan is FIXED; per-module phases scale by 170049/n.
+    const full = (ms: number) => ((ms / n) * 170049) / 3.6e6; // hours
+    console.log(
+      `\n=== PROFILE (wall ${s(wall)} · ${n} did-work · ${unchanged} unchanged-skipped) ===\n` +
+        `  phase                cum       %     per-module\n` +
+        `  decode(libopenmpt)  ${s(prof.decode).padStart(6)}  ${pc(prof.decode).padStart(4)}  ${per(prof.decode)}\n` +
+        `  FLAC encode         ${s(flacStats.ms).padStart(6)}  ${pc(flacStats.ms).padStart(4)}  ${per(flacStats.ms)}  (${flacStats.calls} calls)\n` +
+        `  dag-other(cdc/cbor) ${s(prof.dag - flacStats.ms).padStart(6)}  ${pc(prof.dag - flacStats.ms).padStart(4)}  ${per(prof.dag - flacStats.ms)}\n` +
+        `  block/put (node)    ${s(prof.kubo).padStart(6)}  ${pc(prof.kubo).padStart(4)}  ${per(prof.kubo)}\n` +
+        `  pinRm (node)        ${s(prof.pin).padStart(6)}  ${pc(prof.pin).padStart(4)}  ${per(prof.pin)}\n` +
+        `  catalog updateRoot  ${s(prof.cat).padStart(6)}  ${pc(prof.cat).padStart(4)}  ${per(prof.cat)}\n` +
+        `  unzip (open+read)   ${s(unzip).padStart(6)}  ${pc(unzip).padStart(4)}  ${per(unzip)}\n` +
+        `  tree-scan ONE-TIME  ${s(corpusStats.listMs).padStart(6)}  ${pc(corpusStats.listMs).padStart(4)}  (fixed, not per-module)\n` +
+        `  other/overhead      ${s(other).padStart(6)}  ${pc(other).padStart(4)}\n` +
+        `  --> full-170k extrapolation: FLAC ${full(flacStats.ms).toFixed(1)}h · unzip ${full(unzip).toFixed(1)}h · block/put ${full(prof.kubo).toFixed(1)}h · decode ${full(prof.decode).toFixed(1)}h · pin ${full(prof.pin).toFixed(1)}h · TOTAL/module ${per(wall - corpusStats.listMs)} => ~${(((wall - corpusStats.listMs) / n * 170049) / 3.6e6).toFixed(1)}h + scan\n`,
+    );
+  }
 
   // Refresh precomputed aggregates and fold the WAL into the main file so the
   // on-disk DB is a consistent, page-aligned snapshot before we publish it.
