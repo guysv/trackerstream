@@ -14,6 +14,7 @@
 //                  No corpus walk / DAG build — catalog-only, seconds not hours)
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { runIngest } from "../src/ingest.ts";
 
 const root = process.env.CORPUS ?? join(homedir(), "tmp/modarchive");
@@ -26,11 +27,23 @@ const backfillMd5 = /^(1|true|yes)$/i.test(process.env.BACKFILL_MD5 ?? "");
 const backfillGenre = /^(1|true|yes)$/i.test(process.env.BACKFILL_GENRE ?? "");
 const genreMap = process.env.GENRE_MAP; // md5->genre JSON; defaults inside ingest
 const reindexFts = /^(1|true|yes)$/i.test(process.env.REINDEX_FTS ?? "");
+// Subset re-bake: REBAKE_SOURCES=<file> restricts the walk to the `source` keys listed in
+// that file (one per line). Combine with REBUILD=1 (+ BAKE_V4=1) to re-bake a targeted slice
+// — e.g. a genre + a liked list — to v4 without walking/touching the rest of the corpus.
+const rebakeSourcesFile = process.env.REBAKE_SOURCES;
+const sources = rebakeSourcesFile
+  ? new Set(
+      readFileSync(rebakeSourcesFile, "utf8")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean),
+    )
+  : undefined;
 // Publish the catalog to IPNS at the end (R1). On by default; PUBLISH=0 for dev slices.
 const publish = !/^(0|false|no)$/i.test(process.env.PUBLISH ?? "");
 
 console.log(
-  `ingest: corpus=${root} db=${dbPath} kubo=${kuboApi} limit=${limit || "∞"}${rebuild ? " REBUILD" : ""}${backfillMd5 ? " BACKFILL_MD5" : ""}${backfillGenre ? " BACKFILL_GENRE" : ""}${reindexFts ? " REINDEX_FTS" : ""}${publish ? "" : " NO-PUBLISH"}`,
+  `ingest: corpus=${root} db=${dbPath} kubo=${kuboApi} limit=${limit || "∞"}${rebuild ? " REBUILD" : ""}${backfillMd5 ? " BACKFILL_MD5" : ""}${backfillGenre ? " BACKFILL_GENRE" : ""}${reindexFts ? " REINDEX_FTS" : ""}${sources ? ` REBAKE_SOURCES(${sources.size})` : ""}${publish ? "" : " NO-PUBLISH"}`,
 );
 const stats = await runIngest({
   root,
@@ -44,6 +57,7 @@ const stats = await runIngest({
   genreMap,
   reindexFts,
   publish,
+  sources,
   onProgress: (s) =>
     console.log(
       `  ${s.processed} ingested (${s.flat} flat) · ${s.rebuilt} rebuilt · ${s.unchanged} unchanged · ${s.skipped} skipped · ${s.failed} failed · ${(s.ms / 1000).toFixed(0)}s · ${s.total} in catalog`,

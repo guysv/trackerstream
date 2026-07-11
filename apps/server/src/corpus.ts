@@ -68,9 +68,19 @@ function listOuterZips(root: string): string[] {
 // These are not modules — skip them so they never enter the ingest/stream path.
 const SIDECAR = /\.(info|txt|nfo|diz|readme|md|doc|jpg|jpeg|png|gif)$/i;
 
+/** Corpus I/O timers for bake profiling (PROFILE=1). `listMs` is the ONE-TIME recursive tree
+ *  scan (fixed cost, amortized over the whole corpus); `openMs`+`readMs` are the per-module
+ *  zip open + entry decompress (scale with module count). Kept separate so extrapolation to the
+ *  full corpus doesn't multiply the one-time scan. */
+export const corpusStats = { listMs: 0, openMs: 0, readMs: 0 };
+
 export interface WalkOpts {
   formats?: string[]; // lowercase extensions to include (default: all)
   limit?: number; // stop after N modules (0 = no limit)
+  /** Subset re-bake: restrict the walk to exactly these `source` keys. Outer zips that
+   *  contain no wanted source are skipped unopened; non-matching entries inside opened
+   *  zips are skipped before their bytes are read. (Used for a targeted v4 re-bake.) */
+  sources?: Set<string>;
 }
 
 /** Call `cb` for every module in the corpus, sequentially. Returns the count. */
@@ -81,6 +91,11 @@ export async function forEachModule(
 ): Promise<number> {
   const formats = opts.formats?.map((f) => f.toLowerCase());
   const limit = opts.limit ?? 0;
+  // Subset re-bake allowlist: the wanted `source` keys, plus the set of outer-zip rel
+  // paths they live under (source = `${outerRel}!...`) so we skip opening zips entirely
+  // when none of their modules are wanted.
+  const sources = opts.sources;
+  const neededOuter = sources ? new Set([...sources].map((s) => s.slice(0, s.indexOf("!")))) : null;
   // Ops shard knob: SHARD="i/N" processes only the outer zips whose path hashes to
   // shard i of N, letting N worker processes bake disjoint slices of the corpus into
   // the same catalog in parallel. Unset (or N<=1) => process everything, so the
@@ -99,15 +114,21 @@ export async function forEachModule(
     return h % shardN === shardIdx;
   };
   let count = 0;
-  for (const oz of listOuterZips(root)) {
+  const _tl = Date.now();
+  const outerZips = listOuterZips(root);
+  corpusStats.listMs += Date.now() - _tl;
+  for (const oz of outerZips) {
     const outerRel = relative(root, oz);
     if (!inShard(outerRel)) continue;
+    if (neededOuter && !neededOuter.has(outerRel)) continue; // subset: no wanted module here
     let zf: yauzl.ZipFile;
+    const _to = Date.now();
     try {
       zf = await openZip(oz);
     } catch {
       continue;
     }
+    corpusStats.openMs += Date.now() - _to;
     await walkZip(zf, async (entry) => {
       const nm = entry.fileName;
       if (nm.endsWith("/")) return; // directory entry
@@ -116,6 +137,7 @@ export async function forEachModule(
         // file (the 2007 snapshot's bucket zips + our local-upload batches).
         const ext = nm.slice(0, -4).split(".").pop()?.toLowerCase();
         if (formats && (!ext || !formats.includes(ext))) return;
+        let _t = Date.now();
         const innerBuf = await readEntry(zf, entry);
         let izf: yauzl.ZipFile;
         try {
@@ -123,10 +145,14 @@ export async function forEachModule(
         } catch {
           return;
         }
+        corpusStats.readMs += Date.now() - _t;
         await walkZip(izf, async (me) => {
           if (me.fileName.endsWith("/")) return;
           if (SIDECAR.test(me.fileName)) return; // skip .info etc. — not a module
+          if (sources && !sources.has(`${outerRel}!${nm}!${me.fileName}`)) return; // subset gate
+          _t = Date.now();
           const bytes = await readEntry(izf, me);
+          corpusStats.readMs += Date.now() - _t;
           await cb({ source: `${outerRel}!${nm}!${me.fileName}`, name: me.fileName, bytes });
           count++;
         });
@@ -138,7 +164,10 @@ export async function forEachModule(
         if (SIDECAR.test(nm)) return; // skip .info etc. — not a module
         const ext = nm.split(".").pop()?.toLowerCase();
         if (formats && (!ext || !formats.includes(ext))) return;
+        if (sources && !sources.has(`${outerRel}!!${nm}`)) return; // subset gate
+        const _t = Date.now();
         const bytes = await readEntry(zf, entry);
+        corpusStats.readMs += Date.now() - _t;
         await cb({ source: `${outerRel}!!${nm}`, name: nm, bytes });
         count++;
       }
