@@ -14,6 +14,7 @@
   import { initDeepLinks } from "$lib/deeplink";
   import { plIngestLink, plBump } from "$lib/playlists.svelte";
   import { dbg } from "$lib/debug";
+  import { toasts, dismiss } from "$lib/toast.svelte";
   import { keepaliveMaster } from "$lib/p2p";
   import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
   import { ui } from "$lib/ui.svelte";
@@ -211,6 +212,20 @@
   </main>
 
   {#if nowPlaying.error}<div class="toast">{nowPlaying.error}</div>{/if}
+  {#if toasts.length}
+    <div class="toasts" role="alert" aria-live="polite">
+      {#each toasts as t (t.id)}
+        <button
+          type="button"
+          class="toast toast-{t.kind}"
+          onclick={() => dismiss(t.id)}
+          title="dismiss"
+        >
+          {t.message}
+        </button>
+      {/each}
+    </div>
+  {/if}
   <NowPlaying onnext={playNext} onprev={playPrev} />
 
   {#if ui.showHelp}
@@ -302,6 +317,34 @@
     padding: 0.4rem 0.8rem;
     border-radius: 4px;
     font-size: 12px;
+  }
+  /* General toast stack (non-playback notices). Sits above the now-playing bar; newest on top,
+     each click-to-dismiss. Positioned so it doesn't collide with the nowPlaying.error toast. */
+  .toasts {
+    position: absolute;
+    bottom: 96px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 6px;
+    align-items: center;
+    z-index: 20;
+    max-width: 80%;
+  }
+  .toasts .toast {
+    position: static;
+    transform: none;
+    cursor: pointer;
+    max-width: 100%;
+    text-align: center;
+    border: none;
+    font: inherit;
+    font-size: 12px;
+  }
+  .toast-info {
+    background: var(--accent);
+    color: #1a1b26;
   }
   .help-bg {
     position: fixed;

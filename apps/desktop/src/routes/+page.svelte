@@ -12,6 +12,7 @@
   } from "$lib/catalog";
   import { playList } from "$lib/player.svelte";
   import { ui } from "$lib/ui.svelte";
+  import { logError } from "$lib/debug";
 
   // Home is an "Explore" landing (rails + genre/format directories); picking a facet drops
   // into the results table. `browsing` is the mode flag — set by any pick (incl. "all", which
@@ -129,10 +130,10 @@
   onMount(() => {
     getFormats()
       .then((f) => ((formats = f.formats), (total = f.total)))
-      .catch(() => (ui.status = "catalog offline"));
+      .catch((e) => (logError("home:getFormats", e), (ui.status = "catalog offline")));
     getGenres()
       .then((g) => (genres = g.genres))
-      .catch(() => {});
+      .catch((e) => logError("home:getGenres", e)); // background; the genre grid just stays empty
   });
 
   let timer: ReturnType<typeof setTimeout>;
@@ -162,7 +163,8 @@
         rows = result;
         if (!rows.some((x) => x.id === selectedId)) selectedId = rows[0]?.id ?? null;
         ui.status = `${rows.length} result${rows.length === 1 ? "" : "s"}`;
-      } catch {
+      } catch (e) {
+        logError("home:listModules", e, { genre: g, noGenre: ng, format: fmt, sort: s });
         if (myReq === reqSeq) ui.status = "catalog offline";
       }
     }, 0);

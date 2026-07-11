@@ -901,11 +901,19 @@ async fn get_hit_row(rpc: NodeRpc, cid: Cid, id: i64) -> Option<Value> {
         let out = (|| {
             let conn = Connection::open_with_flags_and_vfs(
                 cid.to_string(), OpenFlags::SQLITE_OPEN_READ_ONLY, VFS_NAME,
-            ).ok()?;
+            )
+            .map_err(|e| log::warn!(target: "catalog", "get_hit_row open {cid}: {e}"))
+            .ok()?;
             conn.pragma_update(None, "query_only", true).ok();
             let cols = HIT_COLS.replace("m.", "");
             let sql = format!("SELECT {cols} FROM modules WHERE id = ?1");
-            conn.query_row(&sql, [id], hit_row).optional().ok().flatten()
+            // A DB/VFS/Bitswap read error here would otherwise silently drop the hit from the
+            // results (indistinguishable from "no such row"); log so a network/DB fault is visible.
+            conn.query_row(&sql, [id], hit_row)
+                .optional()
+                .map_err(|e| log::warn!(target: "catalog", "get_hit_row id={id}: {e}"))
+                .ok()
+                .flatten()
         })();
         OPEN_CTX.with(|c| *c.borrow_mut() = None);
         out

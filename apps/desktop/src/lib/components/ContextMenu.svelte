@@ -1,5 +1,6 @@
 <script lang="ts">
   import { menu, closeContextMenu, type MenuItem } from "$lib/contextmenu.svelte";
+  import { logError } from "$lib/debug";
 
   let el: HTMLDivElement | undefined = $state();
 
@@ -34,7 +35,8 @@
       try {
         const resolved = await it.items();
         if (token === subToken) subItems = resolved;
-      } catch {
+      } catch (e) {
+        logError("contextmenu:submenu", e, { label: it.label });
         if (token === subToken) subItems = [];
       } finally {
         if (token === subToken) subLoading = false;

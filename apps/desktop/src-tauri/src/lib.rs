@@ -31,6 +31,36 @@ struct NodeState {
 #[derive(Default)]
 struct Streams(Mutex<HashMap<String, Arc<ipfs::StreamState>>>);
 
+/// Load a JSON map from a durable state file, distinguishing "absent" (first run — silent) from
+/// a read/parse failure (corruption or disk fault — logged, then treated as empty so the app still
+/// starts). Without the log, a corrupt state file was indistinguishable from a clean first run.
+fn load_state_map<T: serde::de::DeserializeOwned + Default>(path: &std::path::Path, what: &str) -> T {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            log::warn!("state: {what} parse failed ({e}); starting empty");
+            T::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => T::default(),
+        Err(e) => {
+            log::warn!("state: {what} read failed: {e}");
+            T::default()
+        }
+    }
+}
+
+/// Write a value to a durable state file, logging (rather than silently dropping) a serialize or
+/// disk-write failure — so a full/read-only disk that's losing held-root / IPNS state is visible.
+fn write_state<T: serde::Serialize>(path: &std::path::Path, value: &T, what: &str) {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(path, bytes) {
+                log::warn!("state: {what} write failed: {e}");
+            }
+        }
+        Err(e) => log::warn!("state: {what} serialize failed: {e}"),
+    }
+}
+
 /// Roots this client holds in its blockstore: `root CID -> fully complete?`. Net-new
 /// bookkeeping persisted to `held_roots.json` (the blockstore has no root index). The Go node
 /// advertises held roots over the presence topic / DHT; this just records what we've fetched.
@@ -42,11 +72,7 @@ pub(crate) struct HeldRoots {
 impl HeldRoots {
     fn load(dir: Option<&std::path::Path>) -> Self {
         let path = dir.map(|d| d.join("held_roots.json"));
-        let map = path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice::<HashMap<String, bool>>(&b).ok())
-            .unwrap_or_default();
+        let map = path.as_ref().map(|p| load_state_map(p, "held_roots")).unwrap_or_default();
         HeldRoots { map: Mutex::new(map), path }
     }
 
@@ -64,9 +90,7 @@ impl HeldRoots {
     fn persist(&self) {
         let Some(path) = &self.path else { return };
         let snapshot = self.map.lock().unwrap().clone();
-        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-            std::fs::write(path, bytes).ok();
-        }
+        write_state(path, &snapshot, "held_roots");
     }
 }
 
@@ -82,11 +106,7 @@ pub(crate) struct IpnsCache {
 impl IpnsCache {
     fn load(dir: Option<&std::path::Path>) -> Self {
         let path = dir.map(|d| d.join("ipns_cache.json"));
-        let map = path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice::<HashMap<String, String>>(&b).ok())
-            .unwrap_or_default();
+        let map = path.as_ref().map(|p| load_state_map(p, "ipns_cache")).unwrap_or_default();
         IpnsCache { map: Mutex::new(map), path }
     }
 
@@ -102,9 +122,7 @@ impl IpnsCache {
     fn persist(&self) {
         let Some(path) = &self.path else { return };
         let snapshot = self.map.lock().unwrap().clone();
-        if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-            std::fs::write(path, bytes).ok();
-        }
+        write_state(path, &snapshot, "ipns_cache");
     }
 }
 

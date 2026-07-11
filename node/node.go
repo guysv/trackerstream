@@ -588,7 +588,11 @@ func (n *Node) provideCatalogSource(c cid.Cid) {
 	if n.pins == nil || n.pins.Has(c) {
 		return
 	}
-	_ = n.pins.Add(context.Background(), c) // KindRoot — "I hold (some of) this catalog"
+	// KindRoot — "I hold (some of) this catalog". Log a datastore-write failure: we'd otherwise
+	// still advertise (below) a root we failed to record, so the pin index silently drifts.
+	if err := n.pins.Add(context.Background(), c); err != nil {
+		n.logf("provideCatalogSource: pin add %s: %v", c, err)
+	}
 	n.provideNow(c)
 }
 
@@ -602,7 +606,9 @@ func (n *Node) provideCatalogPieces(cids []cid.Cid) {
 		if n.pins.Has(c) {
 			continue
 		}
-		_ = n.pins.AddCatalogPiece(context.Background(), c)
+		if err := n.pins.AddCatalogPiece(context.Background(), c); err != nil {
+			n.logf("provideCatalogPieces: pin add %s: %v", c, err)
+		}
 		n.provideNow(c)
 	}
 }

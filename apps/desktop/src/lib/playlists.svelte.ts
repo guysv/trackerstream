@@ -7,6 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getModuleByMd5, type ModuleHit } from "$lib/catalog";
 import { cachedHit, rememberHit, rememberHits } from "$lib/cidCache";
 import { playList, queue, setOnQueueSourceChange } from "$lib/player.svelte";
+import { logWarn } from "$lib/debug";
 
 export interface PlaylistMeta {
   name: string;
@@ -123,8 +124,8 @@ export const isLiked = (md5: string): boolean => liked.ids.has(md5);
 export async function refreshLiked(): Promise<void> {
   try {
     liked.ids = new Set(await plLikedIds());
-  } catch {
-    /* keep the last known set on a transient failure */
+  } catch (e) {
+    logWarn("playlists:refreshLiked", e); // keep the last known set on a transient failure
   }
 }
 
@@ -166,7 +167,9 @@ if (typeof window !== "undefined") {
 // from decay / budget eviction / tombstone deletion so it can't vanish under playback
 // (a transient pin — NOT the held tier; nothing is backed or re-announced). Playing
 // anything else, or clearing the queue, releases it.
-setOnQueueSourceChange(() => void invoke("playlist_pin", { name: null }).catch(() => {}));
+setOnQueueSourceChange(
+  () => void invoke("playlist_pin", { name: null }).catch((e) => logWarn("playlist_pin:release", e)),
+);
 
 // Playlist docs carry no root CIDs (by design — tracks resolve via the catalog only at
 // play time), so playing a playlist resolves entries through `getModule` first. Bounded
@@ -178,7 +181,9 @@ const RESOLVE_CAP = 200;
 // we fall back to the last-known-good hit this md5 resolved to (cidCache.ts) — its CID drives
 // playback and its metadata (format/duration/title) drives the offline display.
 async function resolveItem(i: PlaylistItem): Promise<ModuleHit | null> {
-  const d = await getModuleByMd5(i.md5).catch(() => null); // populates the cache on success
+  // Catalog unreachable / row gone falls back to the cache below — expected offline, so this
+  // is a warn (filtered by TS_LOG), not an error; it fires per unresolved track.
+  const d = await getModuleByMd5(i.md5).catch((e) => (logWarn("playlists:resolveItem", e, { md5: i.md5 }), null));
   if (d?.rootCid) return d;
   return cachedHit(i.md5) ?? null; // catalog unreachable / row gone — use the last hit that worked
 }
@@ -190,10 +195,12 @@ export async function playPlaylist(detail: PlaylistDetail, index = 0): Promise<v
   if (!hits.length) throw new Error("no playable tracks in playlist");
   const at = Math.max(0, hits.findIndex((h) => h.md5 === wantedMd5));
   playList(hits, at); // fires the source-change hook first, releasing any prior pin
-  void invoke("playlist_pin", { name: detail.name }).catch(() => {});
+  void invoke("playlist_pin", { name: detail.name }).catch((e) => logWarn("playlist_pin:set", e));
   // Bump only after the mark lands, so the library re-query reads the fresh
   // last_played_at and the just-played playlist visibly rises to the top of its tier.
-  void invoke("playlist_played", { name: detail.name }).then(plBump).catch(() => {});
+  void invoke("playlist_played", { name: detail.name })
+    .then(plBump)
+    .catch((e) => logWarn("playlist_played", e));
 }
 
 /** Append a track to one of my playlists (no-op if it's already in). */

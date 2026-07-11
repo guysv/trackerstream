@@ -6,7 +6,7 @@ import { BOOTSTRAP_MULTIADDRS } from "@trackerstream/config";
 import { ModPlayer } from "./audio/ModPlayer.svelte";
 import { Fence } from "./audio/fence";
 import { connectPeer, warmRoot, startStream, getSkeleton, getSample, setPlayhead } from "./p2p";
-import { dbg } from "./debug";
+import { dbg, logWarn } from "./debug";
 import { getModuleByMd5, type ModuleHit, type ModuleDetail } from "./catalog";
 
 export const player = new ModPlayer();
@@ -116,14 +116,16 @@ export async function refreshQueueRoots(attempt = 0): Promise<void> {
   const targets = queue.items.filter((it) => it.md5);
   if (!targets.length) return;
   let transient = false;
+  let lastErr: unknown;
   const fresh = new Map<string, ModuleHit>();
   await Promise.all(
     targets.map(async (it) => {
       try {
         const d = (await getModuleByMd5(it.md5)) as ModuleDetail | null;
         if (d?.rootCid) fresh.set(it.md5, toHit(d));
-      } catch {
+      } catch (e) {
         transient = true; // node/catalog not ready yet — keep the stored item, retry below
+        lastErr = e;
       }
     }),
   );
@@ -139,6 +141,7 @@ export async function refreshQueueRoots(attempt = 0): Promise<void> {
   if (changed) saveQueue();
   // Converge as the node warms without needing a manual replay (bounded so we don't spin).
   if (transient && attempt < 5) setTimeout(() => void refreshQueueRoots(attempt + 1), 3000);
+  else if (transient) logWarn("queue:refreshRoots", lastErr); // gave up after the retry budget
 }
 
 // Gapless auto-advance: when a track ends, play the next queued one.
@@ -217,16 +220,19 @@ async function ensureConnected() {
   if (connected) return;
   // Try every bootstrap addr (literal IPs first, then /dns*) until one connects —
   // a failed dial (e.g. an unsupported /dns* transport) just falls through.
+  let lastErr: unknown;
   for (const addr of BOOTSTRAP_MULTIADDRS) {
     try {
       await connectPeer(addr);
       connected = true;
       return;
-    } catch {
-      /* try the next addr */
+    } catch (e) {
+      lastErr = e; // try the next addr
     }
   }
-  /* none connected; will retry on next play (master may be momentarily unreachable) */
+  // None connected; will retry on next play (master may be momentarily unreachable). Log the
+  // last dial error so a total bootstrap failure is visible rather than a silent no-op.
+  logWarn("ensureConnected", lastErr, { addrs: BOOTSTRAP_MULTIADDRS.length });
 }
 
 /**

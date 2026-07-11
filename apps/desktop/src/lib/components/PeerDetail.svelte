@@ -3,6 +3,8 @@
   import { peers, speedHistory, connectedSince, clearSelection } from "$lib/peers.svelte";
   import { peerDetail, peerPlaylists, requestPlaylist, type PeerDetail, type PeerPlaylists } from "$lib/p2p";
   import { fmtBytes } from "$lib/format";
+  import { logWarn } from "$lib/debug";
+  import { reportError } from "$lib/toast.svelte";
 
   let { peerId }: { peerId: string } = $props();
 
@@ -14,8 +16,8 @@
   async function refresh(): Promise<void> {
     try {
       detail = await peerDetail(peerId);
-    } catch {
-      /* keep the last snapshot */
+    } catch (e) {
+      logWarn("peerDetail", e, { peerId }); // keep the last snapshot
     }
   }
   void refresh();
@@ -53,8 +55,8 @@
   async function copyId(): Promise<void> {
     try {
       await navigator.clipboard.writeText(peerId);
-    } catch {
-      /* clipboard unavailable */
+    } catch (e) {
+      reportError("peer:copyId", e, "Couldn't copy peer ID to clipboard");
     }
   }
 
@@ -68,8 +70,9 @@
     plistLoading = true;
     try {
       plist = await peerPlaylists(peerId);
-    } catch {
-      plist = null; // peer gone / timeout — the section shows a retry
+    } catch (e) {
+      logWarn("peerPlaylists", e, { peerId }); // peer gone / timeout — the section shows a retry
+      plist = null;
     } finally {
       plistLoading = false;
     }
@@ -80,8 +83,8 @@
     requested = new Set(requested).add(name);
     try {
       await requestPlaylist(peerId, name);
-    } catch {
-      /* peer gone — the row stays marked; a re-open retries */
+    } catch (e) {
+      logWarn("requestPlaylist", e, { peerId, name }); // peer gone — row stays marked; re-open retries
     }
   }
 </script>

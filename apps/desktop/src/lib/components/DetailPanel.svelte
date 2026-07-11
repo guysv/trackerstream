@@ -14,6 +14,7 @@
   } from "$lib/playlists.svelte";
   import { openContextMenu } from "$lib/contextmenu.svelte";
   import { trackMenuItems } from "$lib/menus";
+  import { logError, logWarn } from "$lib/debug";
 
   // Two ways in: `id` (search/browse rows — a live catalog rowid) or `md5` (playlist
   // rows, which persist only the stable content hash). Prefer id; fall back to md5.
@@ -35,11 +36,11 @@
         // Guard against a racing prop change resolving out of order.
         if (id === curId && md5 === curMd5 && d) detail = d;
       })
-      .catch(() => {});
+      .catch((e) => logWarn("detail:load", e, { id: curId, md5: curMd5 })); // panel just stays empty
   });
 
   async function openPlMenu() {
-    if (!plMenu) myLists = (await plList().catch(() => [])).filter((p) => p.isMine);
+    if (!plMenu) myLists = (await plList().catch((e) => (logError("detail:plList", e), []))).filter((p) => p.isMine);
     plMenu = !plMenu;
   }
 
