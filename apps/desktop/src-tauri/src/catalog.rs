@@ -824,11 +824,9 @@ pub async fn run_fts_only(rpc: NodeRpc, cid: Cid, q: String, limit: i64) -> Resu
             conn.pragma_update(None, "query_only", true).ok();
             conn.pragma_update(None, "cache_size", -65536i64).ok();
             let q = q.trim();
-            let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
-            let matchstr = if explicit {
-                q.to_string()
-            } else {
-                q.split_whitespace().map(|t| format!("\"{t}\"*")).collect::<Vec<_>>().join(" ")
+            let matchstr = match build_matchstr(q) {
+                Some(m) => m,
+                None => return Ok(0),
             };
             let mut stmt = conn
                 .prepare("SELECT rowid FROM modules_fts WHERE modules_fts MATCH ?1 LIMIT ?2")
@@ -864,12 +862,9 @@ async fn fts_rowids(
             conn.pragma_update(None, "query_only", true).ok();
             conn.pragma_update(None, "cache_size", -65536i64).ok();
             let q = q.trim();
-            if q.is_empty() { return Ok(vec![]); }
-            let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
-            let matchstr = if explicit {
-                q.to_string()
-            } else {
-                q.split_whitespace().map(|t| format!("\"{t}\"*")).collect::<Vec<_>>().join(" ")
+            let matchstr = match build_matchstr(q) {
+                Some(m) => m,
+                None => return Ok(vec![]),
             };
             let mut ids = Vec::new();
             if let Some(a) = after {
@@ -997,17 +992,39 @@ fn fts_table(names_only: bool) -> &'static str {
     if names_only { "names_fts" } else { "modules_fts" }
 }
 
+/// Build the FTS5 MATCH string for a user query against the `detail='none'` catalog indexes
+/// (`modules_fts` / `names_fts`). Those indexes DON'T support phrase queries, so we must never
+/// emit one. A single whitespace term like `c20g_j` is TWO `unicode61` tokens (`_`, `.`, `-`, `'`
+/// … are separators), so quoting it whole as `"c20g_j"` is a two-token phrase and FTS5 errors
+/// with "phrase queries are not supported (detail!=full)" — which the search UI surfaces as
+/// "search offline". Instead we split on the SAME boundaries `unicode61` tokenizes on (non
+/// alphanumerics) and emit each sub-token as its own prefix term (`"tok"*`), space-joined =
+/// implicit AND. For normal single-word/multi-word queries this is byte-identical to the old
+/// behavior; it only changes terms that used to fail. A query already using FTS operators
+/// (`"`, `*`, `:`, `^`) is passed through verbatim so power users keep full control. Returns
+/// `None` when nothing tokenizable remains (e.g. the query is all punctuation) — callers should
+/// treat that as an empty result set rather than running `MATCH ''` (which itself errors).
+fn build_matchstr(q: &str) -> Option<String> {
+    if q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^') {
+        return Some(q.to_string()); // explicit FTS syntax — the user drives the query
+    }
+    let terms: Vec<String> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\"{s}\"*"))
+        .collect();
+    if terms.is_empty() { None } else { Some(terms.join(" ")) }
+}
+
 fn search(conn: &Connection, query: &str, limit: i64, after: Option<i64>, names_only: bool) -> rusqlite::Result<Value> {
     let q = query.trim();
     if q.is_empty() {
         return Ok(json!({ "results": [] }));
     }
     let fts = fts_table(names_only);
-    let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
-    let matchstr = if explicit {
-        q.to_string()
-    } else {
-        q.split_whitespace().map(|t| format!("\"{t}\"*")).collect::<Vec<_>>().join(" ")
+    let matchstr = match build_matchstr(q) {
+        Some(m) => m,
+        None => return Ok(json!({ "results": [] })),
     };
     // No relevance ranking: take the first LIMIT matches in FTS rowid (≈ ingest) order, like
     // ModArchive's own search. `ORDER BY bm25` had to score EVERY matching row before LIMIT, and
@@ -1015,7 +1032,6 @@ fn search(conn: &Connection, query: &str, limit: i64, after: Option<i64>, names_
     // ("mario": ~34 MB / 2000+ pages / 90 s cold) cost far more than a broad one. Flat rowid
     // order touches ~280 pages (~4.5 MB) regardless of term frequency. (If top-result relevance
     // matters later, rank a bounded rowid-order window — never the whole match set.)
-    let _ = explicit; // (kept for matchstr prefix-expansion; no longer gates ordering)
     // Keyset pagination: results are ascending FTS rowid, so the next page is simply the
     // matches with rowid > the last id the client holds. Skips straight past what's already
     // shown instead of OFFSET re-scanning it over the VFS.
@@ -1090,11 +1106,9 @@ fn search_stream(
         return Ok(0);
     }
     let fts = fts_table(names_only);
-    let explicit = q.contains('"') || q.contains('*') || q.contains(':') || q.contains('^');
-    let matchstr = if explicit {
-        q.to_string()
-    } else {
-        q.split_whitespace().map(|t| format!("\"{t}\"*")).collect::<Vec<_>>().join(" ")
+    let matchstr = match build_matchstr(q) {
+        Some(m) => m,
+        None => return Ok(0),
     };
     let cursor = after.unwrap_or(0);
     let sql = if after.is_some() {
