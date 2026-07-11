@@ -1,0 +1,106 @@
+# trackerstream desktop release
+#
+# Tag-triggered, UNSIGNED cross-platform build. Tauri cannot cross-compile bundles,
+# so each OS builds on its own runner; the five legs converge into ONE draft GitHub
+# Release keyed by the tag. macOS is ad-hoc codesigned (APPLE_SIGNING_IDENTITY=-) so
+# the app + tsnode sidecar launch on Apple Silicon — Gatekeeper still shows the
+# "unidentified developer" prompt (that only clears with a real Developer ID cert +
+# notarization; see docs/RELEASE.md). Windows still SmartScreen-warns; Linux is clean.
+#
+# The Go `tsnode` sidecar is cross-built per leg by prepare-sidecar.sh, driven by the
+# TS_TARGET_TRIPLE env var below (Go cross-compiles with CGO_ENABLED=0). The libopenmpt
+# WASM is committed (packages/wasm/dist), so no emscripten toolchain is needed here.
+#
+# Cut a release by pushing a tag:  git tag v0.2.0 && git push origin v0.2.0
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Never let two runs of the same tag race on the shared draft Release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # tauri-action creates/uploads to the GitHub Release
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: mac-arm64,   os: macos-latest,     triple: aarch64-apple-darwin,      bundles: dmg }
+          - { name: mac-x64,     os: macos-latest,     triple: x86_64-apple-darwin,       bundles: dmg }
+          - { name: win-x64,     os: windows-latest,   triple: x86_64-pc-windows-msvc,    bundles: nsis }
+          - { name: linux-x64,   os: ubuntu-latest,    triple: x86_64-unknown-linux-gnu,  bundles: "deb,appimage" }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, triple: aarch64-unknown-linux-gnu, bundles: "deb,appimage" }
+    runs-on: ${{ matrix.os }}
+    env:
+      # Drives apps/desktop/src-tauri/scripts/prepare-sidecar.sh: builds the tsnode
+      # sidecar for THIS leg's triple (both the explicit step and the prebuild hook).
+      TS_TARGET_TRIPLE: ${{ matrix.triple }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Tauri v2 webkit/gtk stack (both the x64 and arm64 ubuntu legs).
+      - name: Install Linux system deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf file build-essential curl wget libssl-dev
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.8.0
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"   # matches node/go.mod (go 1.25.7)
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Adds the x86_64 target on the (arm64) mac-x64 leg; a no-op where native.
+          targets: ${{ matrix.triple }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Cross-build the tsnode sidecar for this leg's triple. The tauri prebuild hook
+      # also runs this via TS_TARGET_TRIPLE, but doing it explicitly gives clear logs
+      # and fails fast if the Go build breaks before the (slower) Rust bundle.
+      - name: Build tsnode sidecar
+        run: bash apps/desktop/src-tauri/scripts/prepare-sidecar.sh
+
+      - name: Build + publish bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Ad-hoc sign the .app + nested externalBin sidecar on macOS only. Env-driven
+          # (not tauri.conf.json) so a real "Developer ID Application: …" value can be
+          # swapped in later — the docs/RELEASE.md notarization path — with no code change.
+          APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.os, 'macos') && '-' || '' }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: trackerstream ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: true
+          # --bundles overrides tauri.conf.json's `targets: "all"` at build time:
+          # Windows → NSIS only (no .msi), macOS → dmg only (.app lives inside it).
+          args: --target ${{ matrix.triple }} --bundles ${{ matrix.bundles }}
