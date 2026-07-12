@@ -8,6 +8,8 @@ pub mod catalog;
 pub mod ipfs;
 pub mod ipns;
 pub mod link;
+#[cfg(target_os = "macos")]
+pub mod mediakeys_macos;
 pub mod playlists;
 pub mod rpc;
 pub mod safename;
@@ -531,6 +533,18 @@ async fn get_sample(root: String, index: u32, streams: State<'_, Streams>) -> Re
     Ok(Response::new(data))
 }
 
+/// Publish the current track + play state to the OS "Now Playing" widget so the system routes
+/// hardware media keys and headphone transport buttons back to us (macOS only; a no-op elsewhere,
+/// where the frontend's global-shortcut path handles the keys). Called from the frontend on every
+/// track change and play/pause (src/lib/mediaKeys.ts).
+#[tauri::command]
+fn update_now_playing(app: tauri::AppHandle, title: String, artist: String, playing: bool) {
+    #[cfg(target_os = "macos")]
+    mediakeys_macos::update_now_playing(&app, title, artist, playing);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, title, artist, playing);
+}
+
 /// Reveal the app's log directory (where tauri-plugin-log writes `trackerstream.log`), so a
 /// user can grab the file for a bug report without running the app from a terminal.
 #[tauri::command]
@@ -992,6 +1006,10 @@ pub fn run() {
         }))
         .plugin(log_plugin)
         .plugin(tauri_plugin_opener::init())
+        // Media keys: the plugin only provides the register/unregister bridge; the frontend
+        // (src/lib/mediaKeys.ts) registers MediaPlayPause/Next/Previous and routes each press
+        // into the JS playback controls where all playback state lives.
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // Deep links: trackerstream://share/<code> (E2).
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
@@ -1033,6 +1051,13 @@ pub fn run() {
             app.manage(held);
             app.manage(ipns_cache);
             app.manage(pl);
+
+            // macOS: register MediaPlayer remote commands (hardware media keys + headset
+            // buttons) and the Now Playing widget. Must run on the main thread — the setup
+            // hook is. Other platforms use the frontend global-shortcut path.
+            #[cfg(target_os = "macos")]
+            mediakeys_macos::init(app.handle());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1051,6 +1076,7 @@ pub fn run() {
             get_skeleton,
             get_sample,
             set_playhead,
+            update_now_playing,
             open_logs_dir,
             list_installed_trackers,
             download_and_open,

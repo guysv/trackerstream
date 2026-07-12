@@ -12,6 +12,7 @@
   import { playNext, playPrev, player, nowPlaying, queue, refreshQueueRoots } from "$lib/player.svelte";
   import { peers, startPeerPolling } from "$lib/peers.svelte";
   import { initDeepLinks } from "$lib/deeplink";
+  import { initMediaKeys, syncMediaSession } from "$lib/mediaKeys";
   import { plIngestLink, plBump } from "$lib/playlists.svelte";
   import { dbg } from "$lib/debug";
   import { toasts, dismiss } from "$lib/toast.svelte";
@@ -33,6 +34,13 @@
   let searchEl: HTMLInputElement | undefined = $state();
   $effect(() => {
     ui.searchEl = searchEl;
+  });
+
+  // Keep the OS Now Playing widget in step with what's loaded and whether it's playing. The
+  // reads inside syncMediaSession (nowPlaying.hit, player.playing) make this effect re-run on
+  // every track change and play/pause.
+  $effect(() => {
+    syncMediaSession();
   });
   let qInput = $state("");
   // Sync the box from the URL when arriving on /search via link / back / forward. Only
@@ -143,9 +151,14 @@
     void refreshQueueRoots();
     const stopPeers = startPeerPolling();
     window.addEventListener("keydown", globalKeys);
+    // Hardware media keys + headphone transport → playback controls (macOS via the native
+    // MediaPlayer bridge, Win/Linux via global shortcuts). syncMediaSession (the $effect above)
+    // keeps the OS Now Playing widget in step.
+    const stopMediaKeys = initMediaKeys();
     return () => {
       window.removeEventListener("keydown", globalKeys);
       stopPeers();
+      stopMediaKeys();
     };
   });
 </script>

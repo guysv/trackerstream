@@ -37,6 +37,10 @@ tauri-plugin-opener = "2"
 # upstream (#125); the feature no longer exists, the behavior is the default. See download_and_open.
 # Do NOT enable open's `insecure` feature: it restores the legacy shell-based Windows launcher.
 open = "5.4"
+# Hardware media-key + headset transport-button capture (play/pause, next, previous)
+# registered system-wide, even when unfocused — the actual key→action wiring lives in
+# the frontend (src/lib/mediaKeys.ts) so it can drive the existing JS playback controls.
+tauri-plugin-global-shortcut = "2"
 # Client logging hub: every layer (frontend dbg, Rust backend, tsnode sidecar output) funnels
 # through the `log` facade into a rotating file in the OS app-log dir, so a user can hand us
 # logs without running the app from a terminal. Level via TS_LOG (default info; debug in dev).
@@ -85,4 +89,15 @@ zstd = "0.13"
 # Lossless FLAC decode for v4 sample leaves (decode-only, pure Rust). Encoder side is the bake's
 # pinned libFLAC; this MUST decode its output bit-exactly (see flac.ts + the interop test).
 claxon = "0.4"
+
+# macOS media keys + headphone/AirPods transport, via Apple's MediaPlayer framework
+# (src/mediakeys_macos.rs). Carbon global hotkeys (what tauri-plugin-global-shortcut uses)
+# cannot grab the NSSystemDefined media keys, and no <audio> element means navigator.mediaSession
+# never activates — so on macOS the ONLY way to receive Play/Pause/Next/Prev (keyboard AND
+# headset) is to register MPRemoteCommandCenter handlers and publish MPNowPlayingInfoCenter.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSString", "NSDictionary", "NSValue"] }
+objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "MPRemoteCommandCenter", "MPRemoteCommand", "MPRemoteCommandEvent", "MPNowPlayingInfoCenter", "MPMediaItem"] }
+block2 = "0.6"
 
