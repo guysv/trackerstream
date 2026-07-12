@@ -7,6 +7,10 @@
     "core:default",
     "opener:default",
     "deep-link:default",
-    "log:default"
+    "log:default",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
+    "global-shortcut:allow-unregister-all",
+    "global-shortcut:allow-is-registered"
   ]
 }
