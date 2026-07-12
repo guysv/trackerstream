@@ -26,6 +26,10 @@ export class ModPlayer {
   onBuffering: ((active: boolean) => void) | null = null;
   /** Position tick (drives the closed-loop playhead -> prefetch). */
   onPos: ((pos: Position) => void) | null = null;
+  /** The playhead jumped (user seek). Distinct from onPos, which fires continuously: this is a
+   *  rare, discrete event, so a listener can resync something expensive — the OS "Now Playing"
+   *  scrubber (mediaKeys.ts), which the system otherwise extrapolates from a stale elapsed time. */
+  onSeek: (() => void) | null = null;
   volume = $state(1);
   interpolation = $state(8); // 8-tap sinc
 
@@ -137,11 +141,13 @@ export class ModPlayer {
 
   seekOrderRow(order: number, row: number): void {
     this.send({ type: "seekOrderRow", order, row });
+    this.onSeek?.();
   }
 
   seekSeconds(seconds: number): void {
     dbg("user.seekSeconds", { seconds: +seconds.toFixed(2), fromOrder: this.pos?.order });
     this.send({ type: "seekSeconds", seconds });
+    this.onSeek?.();
   }
 
   selectSubsong(index: number): void {

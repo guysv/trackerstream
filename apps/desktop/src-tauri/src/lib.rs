@@ -536,13 +536,39 @@ async fn get_sample(root: String, index: u32, streams: State<'_, Streams>) -> Re
 /// Publish the current track + play state to the OS "Now Playing" widget so the system routes
 /// hardware media keys and headphone transport buttons back to us (macOS only; a no-op elsewhere,
 /// where the frontend's global-shortcut path handles the keys). Called from the frontend on every
-/// track change and play/pause (src/lib/mediaKeys.ts).
+/// track change, play/pause and seek (src/lib/mediaKeys.ts).
+///
+/// `has_next`/`has_prev` gate the widget's skip buttons, so the OS greys out what we can't service.
 #[tauri::command]
-fn update_now_playing(app: tauri::AppHandle, title: String, artist: String, playing: bool) {
+#[allow(clippy::too_many_arguments)]
+fn update_now_playing(
+    app: tauri::AppHandle,
+    title: String,
+    artist: String,
+    playing: bool,
+    duration: f64,
+    elapsed: f64,
+    has_next: bool,
+    has_prev: bool,
+) {
     #[cfg(target_os = "macos")]
-    mediakeys_macos::update_now_playing(&app, title, artist, playing);
+    mediakeys_macos::update_now_playing(
+        &app, title, artist, playing, duration, elapsed, has_next, has_prev,
+    );
     #[cfg(not(target_os = "macos"))]
-    let _ = (app, title, artist, playing);
+    let _ = (app, title, artist, playing, duration, elapsed, has_next, has_prev);
+}
+
+/// Give the OS "Now Playing" slot back while we have nothing loaded, so an idle trackerstream
+/// doesn't sit in Control Center holding the media keys hostage from the app the user is actually
+/// listening to (macOS only; a no-op elsewhere). Called from the frontend whenever no track is
+/// loaded, and on quit (below).
+#[tauri::command]
+fn clear_now_playing(app: tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    mediakeys_macos::clear_now_playing(&app);
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
 }
 
 /// Reveal the app's log directory (where tauri-plugin-log writes `trackerstream.log`), so a
@@ -993,7 +1019,7 @@ pub fn run() {
         .max_file_size(2_000_000)
         .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
         .build();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // Single-instance MUST be the first plugin registered (Tauri docs): on
         // Win/Linux a deep-link click launches a second process, whose argv URL the
         // "deep-link" feature forwards into onOpenUrl on THIS instance — registered
@@ -1006,12 +1032,19 @@ pub fn run() {
         }))
         .plugin(log_plugin)
         .plugin(tauri_plugin_opener::init())
-        // Media keys: the plugin only provides the register/unregister bridge; the frontend
-        // (src/lib/mediaKeys.ts) registers MediaPlayPause/Next/Previous and routes each press
-        // into the JS playback controls where all playback state lives.
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // Deep links: trackerstream://share/<code> (E2).
-        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_deep_link::init());
+
+    // Media keys on Windows/Linux: the plugin is only the register/unregister bridge; the frontend
+    // (src/lib/mediaKeys.ts) grabs MediaPlayPause/Next/Previous — lazily, once something is
+    // actually playing — and routes each press into the JS playback controls where all playback
+    // state lives. macOS can't capture the media keys this way at all (Carbon hotkeys don't see
+    // NSSystemDefined events) and uses the native MediaPlayer bridge instead, so the plugin isn't
+    // compiled in there — see mediakeys_macos.rs and the platform-scoped capability.
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+
+    builder
         .setup(|app| {
             #[cfg(any(target_os = "linux", windows))]
             {
@@ -1052,9 +1085,10 @@ pub fn run() {
             app.manage(ipns_cache);
             app.manage(pl);
 
-            // macOS: register MediaPlayer remote commands (hardware media keys + headset
-            // buttons) and the Now Playing widget. Must run on the main thread — the setup
-            // hook is. Other platforms use the frontend global-shortcut path.
+            // macOS: install the MediaPlayer remote-command handlers (hardware media keys +
+            // headset buttons). They stay disabled, and we publish no Now Playing entry, until
+            // the user actually plays something — an idle app must not hold the media keys.
+            // Must run on the main thread; the setup hook is. Win/Linux use global shortcuts.
             #[cfg(target_os = "macos")]
             mediakeys_macos::init(app.handle());
 
@@ -1077,6 +1111,7 @@ pub fn run() {
             get_sample,
             set_playhead,
             update_now_playing,
+            clear_now_playing,
             open_logs_dir,
             list_installed_trackers,
             download_and_open,
@@ -1102,6 +1137,15 @@ pub fn run() {
             playlist_pending,
             playlist_backers
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, _event| {
+            // Hand the OS "Now Playing" slot back on quit instead of leaving a ghost entry behind
+            // that still claims the media keys. Exit runs on the main thread, and the event loop
+            // is already winding down, so a run_on_main_thread hop would never be delivered.
+            #[cfg(target_os = "macos")]
+            if matches!(_event, tauri::RunEvent::Exit) {
+                mediakeys_macos::clear_now_playing_blocking();
+            }
+        });
 }
