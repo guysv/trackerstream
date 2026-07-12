@@ -2902,8 +2902,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "open"
-version = "5.3.6"
-source = "git+https://github.com/guysv/open-rs?rev=55f3b2c849e5ca45f62f1622ce72371913e65f13#55f3b2c849e5ca45f62f1622ce72371913e65f13"
+version = "5.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0b3d059e795d52b8a72fef45658620edd4d9c359b338564aa14391ffa511ed5"
 dependencies = [
  "dunce",
  "is-wsl",

@@ -29,12 +29,14 @@ cid = { version = "0.11" }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
-# tauri-plugin-opener launches "Open with" targets via the `open` crate. We depend on it directly
-# ONLY to turn on our `end-of-options` feature (Cargo unifies features, so the plugin's own `open`
-# picks it up): it inserts a `--` before the file path so a module whose name looks like a flag
-# (e.g. `--foo.mod`) can't be parsed as one by the tracker (or by macOS `open`). The [patch] below
-# points `open` at our fork carrying that feature (github.com/guysv/open-rs). See download_and_open.
-open = { version = "5", features = ["end-of-options"] }
+# tauri-plugin-opener launches "Open with" targets via the `open` crate. We never call `open`
+# ourselves — this direct dep exists ONLY as a >=5.4 floor on the plugin's copy (Cargo unifies the
+# two). 5.4 is where upstream made the `--` guard before the launched path unconditional, so a
+# module whose name looks like a flag (e.g. `--foo.mod`) can't be parsed as one by the tracker (or
+# by macOS `open`). Was our own fork + an `end-of-options` feature until Byron/open-rs#124 landed it
+# upstream (#125); the feature no longer exists, the behavior is the default. See download_and_open.
+# Do NOT enable open's `insecure` feature: it restores the legacy shell-based Windows launcher.
+open = "5.4"
 # Client logging hub: every layer (frontend dbg, Rust backend, tsnode sidecar output) funnels
 # through the `log` facade into a rotating file in the OS app-log dir, so a user can hand us
 # logs without running the app from a terminal. Level via TS_LOG (default info; debug in dev).
@@ -83,10 +85,4 @@ zstd = "0.13"
 # Lossless FLAC decode for v4 sample leaves (decode-only, pure Rust). Encoder side is the bake's
 # pinned libFLAC; this MUST decode its output bit-exactly (see flac.ts + the interop test).
 claxon = "0.4"
-
-# Fork of the `open` crate adding the opt-in `end-of-options` feature (a `--` guard before the
-# launched path). Replaces `open` everywhere in the graph, including tauri-plugin-opener's use.
-# Pinned to a commit; bump the rev when the fork moves. Upstream issue: guysv/open-rs#124.
-[patch.crates-io]
-open = { git = "https://github.com/guysv/open-rs", rev = "55f3b2c849e5ca45f62f1622ce72371913e65f13" }
 
