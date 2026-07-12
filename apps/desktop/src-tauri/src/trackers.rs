@@ -54,27 +54,34 @@ const TRACKERS: &[TrackerDef] = &[
     },
 ];
 
-/// One installed tracker handed to the UI. `target` is the resolved `open_with` launch target.
+/// One installed tracker handed to the UI. Deliberately carries NO launch path: the resolved
+/// target is a program the backend will execute, so it never crosses into the webview and can
+/// never come back from it. The UI round-trips the opaque `id`, which `resolve_id` re-resolves
+/// against the static `TRACKERS` registry below. See `download_and_open`.
 #[derive(Serialize)]
 pub struct TrackerInfo {
     pub id: String,
     pub label: String,
-    pub target: String,
 }
 
 /// Detect installed trackers (filesystem probe only, no spawn). Returns the subset the UI should
-/// offer, each with a resolved launch `target`, in registry order.
+/// offer, in registry order.
 pub fn installed() -> Vec<TrackerInfo> {
     TRACKERS
         .iter()
-        .filter_map(|def| {
-            resolve(def).map(|target| TrackerInfo {
-                id: def.id.to_string(),
-                label: def.label.to_string(),
-                target,
-            })
-        })
+        .filter(|def| resolve(def).is_some())
+        .map(|def| TrackerInfo { id: def.id.to_string(), label: def.label.to_string() })
         .collect()
+}
+
+/// Resolve a tracker `id` from the UI to a launch target, or None if the id isn't one we know or
+/// the tracker isn't installed. This is the ONLY way an `open_with` target is produced: the value
+/// handed to `open` is always one WE resolved from the static registry, never a string the
+/// frontend chose. `open` executes that string as a program (`Command::new(app)` on Windows and
+/// Linux, `open -a <app>` on macOS), so accepting an arbitrary one from the webview would make
+/// this command an arbitrary-code-execution primitive for any JS running in it.
+pub fn resolve_id(id: &str) -> Option<String> {
+    TRACKERS.iter().find(|def| def.id == id).and_then(resolve)
 }
 
 /// Probe $PATH for `name` (exact basename), returning the first executable match.
@@ -149,4 +156,56 @@ fn resolve(def: &TrackerDef) -> Option<String> {
         .iter()
         .find_map(|bin| find_on_path(bin))
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Anything not in the static registry must resolve to None — including a real executable path,
+    /// which is exactly what an attacker with webview JS would send if `open_with` were still a
+    /// free-form target. Whether a KNOWN id resolves depends on what's installed on the box, so
+    /// only the rejection half is asserted here.
+    #[test]
+    fn rejects_ids_outside_the_registry() {
+        for id in [
+            "",
+            "unknown",
+            "/bin/sh",
+            "/System/Applications/Calculator.app",
+            "C:\\Windows\\System32\\cmd.exe",
+            "powershell",
+            "schismtracker\0evil",
+            "SchismTracker", // ids are exact + case-sensitive
+        ] {
+            assert!(resolve_id(id).is_none(), "id {id:?} must not resolve");
+        }
+    }
+
+    /// The contract the "Open with" menu relies on: the UI is handed ids by `installed()` and hands
+    /// them straight back, so every id we advertise MUST resolve to a real launch target. If this
+    /// breaks, the menu silently offers trackers that then refuse to launch. Vacuous on a box with
+    /// no tracker installed; on a dev machine with one it exercises the whole id -> target path.
+    #[test]
+    fn every_advertised_id_resolves_to_an_existing_target() {
+        for t in installed() {
+            let target = resolve_id(&t.id)
+                .unwrap_or_else(|| panic!("advertised id {:?} does not resolve", t.id));
+            assert!(
+                Path::new(&target).exists(),
+                "id {:?} resolved to a non-existent target {target:?}",
+                t.id
+            );
+        }
+    }
+
+    /// Every registry id is distinct — `resolve_id` is a lookup by id, so a dupe would shadow.
+    #[test]
+    fn registry_ids_are_unique() {
+        let mut ids: Vec<_> = TRACKERS.iter().map(|d| d.id).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "duplicate tracker id in TRACKERS");
+    }
 }

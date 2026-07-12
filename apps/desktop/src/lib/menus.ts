@@ -37,14 +37,15 @@ export interface TrackCtx {
 
 /** Reassemble `h`'s byte-exact original and open it in an external tracker. The backend fetches
  *  the module's own rootCid, reassembles (v3 or v1, byte-exact), verifies MD5 parity vs the
- *  catalog, saves to ~/Downloads, and launches `t.target` (the resolved per-OS launch target).
+ *  catalog, saves to ~/Downloads, and launches the tracker it resolves from `t.id` (we pass the id,
+ *  never a path — see TrackerInfo).
  *  Fire-and-forget; failures both log and toast, since the user explicitly asked to open the file. */
 async function openWithTracker(h: ModuleHit, t: TrackerInfo): Promise<void> {
   try {
-    const res = await downloadAndOpen({ root: h.rootCid, md5: h.md5, filename: h.filename, openWith: t.target });
+    const res = await downloadAndOpen({ root: h.rootCid, md5: h.md5, filename: h.filename, openWith: t.id });
     if (!res.launched) {
       // The file WAS saved; only the launch failed — say so rather than "failed".
-      logWarn("open-with", res.launch_error ?? "unknown", { app: t.target, saved: res.path });
+      logWarn("open-with", res.launch_error ?? "unknown", { app: t.id, saved: res.path });
       toast(`Saved to ${res.path} but couldn't open ${t.label}`, "info");
     }
   } catch (e) {

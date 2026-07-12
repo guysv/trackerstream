@@ -10,6 +10,7 @@ pub mod ipns;
 pub mod link;
 pub mod playlists;
 pub mod rpc;
+pub mod safename;
 pub mod sidecar;
 pub mod trackers;
 
@@ -572,7 +573,9 @@ fn notify_downloads_stack(_path: &str) {}
 /// Reassemble a module's BYTE-EXACT original from its root CID (v3/v4 streaming root or v1/flat
 /// root — dispatched on manifest version), verify it against the catalog `md5`, write it to the OS
 /// Downloads dir, and open it with an external tracker (schismtracker / milkytracker). The desktop
-/// "Open with" path. `open_with` is the opener target (macOS `open -a <app>`, Linux the binary);
+/// "Open with" path. `open_with` is an opaque tracker ID from `list_installed_trackers`
+/// ("schismtracker" | "milkytracker" | "openmpt"), NOT a path — the backend resolves it against the
+/// static registry, because `open` executes that value as a program (see `trackers::resolve_id`).
 /// None opens with the OS default. The file is saved BEFORE launching, so a missing tracker still
 /// leaves the rebuilt module in Downloads (launched=false + launch_error). See REBUILD.md.
 /// Detect which external trackers are actually installed, so the "Open with" menu offers only
@@ -621,30 +624,65 @@ async fn download_and_open(
         }
     }
 
-    // Write to the OS Downloads dir under the module's own filename (basename only — never let a
-    // catalog filename escape the directory). Overwrites an existing same-name file (same bytes).
+    // Write to the OS Downloads dir. The catalog filename is ingested verbatim from the archive and
+    // the bytes are whatever the DAG held, so the name is sanitized (single component, no ADS
+    // selector, no reserved device name, module extension enforced) before it can name a file —
+    // otherwise a `song.exe` row would drop a runnable executable here. See `safename`.
     let dir = app.path().download_dir().map_err(|e| format!("no Downloads dir: {e}"))?;
-    let base = std::path::Path::new(&filename)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("{root}.mod"));
+    let base = safename::safe_download_name(&filename, &root);
     let out = dir.join(&base);
     std::fs::write(&out, &bytes).map_err(|e| format!("write {}: {e}", out.display()))?;
     let path = out.to_string_lossy().into_owned();
+
+    // Tag it as internet-sourced (Windows Mark-of-the-Web) so Defender/SmartScreen still interpose
+    // if anything ever slips past the extension allowlist. Best-effort. No-op off Windows.
+    mark_of_the_web(&out);
 
     // Register the file with the macOS Dock Downloads stack (bounce + stack entry) now that the
     // bytes are on disk — matches the OS "download finished" affordance. No-op off macOS.
     notify_downloads_stack(&path);
 
+    // Resolve the tracker id to a launch target IN THE BACKEND. `open` executes this string as a
+    // program, so it must come from our static registry — never from the webview. An unknown or
+    // uninstalled id fails closed (no launch, no OS-default fallback); the file is already saved.
+    let with = match open_with.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => match trackers::resolve_id(id) {
+            Some(target) => Some(target),
+            None => {
+                log::warn!("open-with: refusing unknown tracker id {id:?}");
+                let launch_error = Some(format!("unknown or uninstalled tracker: {id}"));
+                return Ok(DownloadResult { path, launched: false, launch_error });
+            }
+        },
+        None => None,
+    };
+
     // Launch the external tracker on the saved file. Download already succeeded, so a launch
     // failure is reported (launched=false) but not fatal.
-    let with = open_with.as_deref().filter(|s| !s.is_empty());
     match tauri_plugin_opener::OpenerExt::opener(&app).open_path(&path, with) {
         Ok(()) => Ok(DownloadResult { path, launched: true, launch_error: None }),
         Err(e) => Ok(DownloadResult { path, launched: false, launch_error: Some(e.to_string()) }),
     }
 }
+
+/// Windows Mark-of-the-Web: browsers tag downloaded files with a `Zone.Identifier` alternate data
+/// stream so SmartScreen/Defender gate them and Office opens them in Protected View. We write bytes
+/// pulled off a P2P network, so we owe the OS the same signal. Best-effort: the stream needs NTFS
+/// (a FAT/exFAT Downloads dir just won't take it), and failing to tag must never fail the download.
+///
+/// Not done on macOS: `com.apple.quarantine` only gates executables/bundles, so it buys nothing for
+/// a `.mod` while making some apps nag "downloaded from the internet" on every "Open with".
+#[cfg(target_os = "windows")]
+fn mark_of_the_web(path: &std::path::Path) {
+    // ZoneId=3 is URLZONE_INTERNET.
+    let stream = format!("{}:Zone.Identifier", path.display());
+    if let Err(e) = std::fs::write(&stream, "[ZoneTransfer]\r\nZoneId=3\r\n") {
+        log::warn!("mark-of-the-web: {} ({e})", path.display());
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn mark_of_the_web(_path: &std::path::Path) {}
 
 #[tauri::command]
 fn set_playhead(root: String, order: u32, streams: State<'_, Streams>) -> Result<(), String> {
