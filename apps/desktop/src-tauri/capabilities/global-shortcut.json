@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "global-shortcut",
+  "description": "Hardware media keys (play/pause, next, previous) on Windows and Linux, where global hotkeys can actually capture them. Scoped to those platforms because macOS routes media keys through the native MediaPlayer bridge (src/mediakeys_macos.rs) and doesn't compile the plugin at all — an unscoped permission would fail the macOS build.",
+  "platforms": ["linux", "windows"],
+  "windows": ["main"],
+  "permissions": [
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
+    "global-shortcut:allow-is-registered"
+  ]
+}

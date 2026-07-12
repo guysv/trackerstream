@@ -101,3 +101,12 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "MPRemoteCommandCenter", "MPRemoteCommand", "MPRemoteCommandEvent", "MPNowPlayingInfoCenter", "MPMediaItem"] }
 block2 = "0.6"
 
+# Hardware media-key + headset transport-button capture (play/pause, next, previous), registered
+# system-wide so it works unfocused. The key→action wiring lives in the frontend
+# (src/lib/mediaKeys.ts), which drives the existing JS playback controls. NOT on macOS: Carbon
+# hotkeys can't see the NSSystemDefined media keys there, so the plugin would be dead weight —
+# macOS uses the native MediaPlayer bridge above instead (capabilities/global-shortcut.json is
+# platform-scoped to match).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+tauri-plugin-global-shortcut = "2"
+
