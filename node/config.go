@@ -110,6 +110,18 @@ func DefaultConfig(role Role, repo string, swarmPort int) Config {
 			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", swarmPort),
 			fmt.Sprintf("/ip6/::/tcp/%d", swarmPort),
 			fmt.Sprintf("/ip6/::/udp/%d/quic-v1", swarmPort),
+			// Browser-dialable. A browser can speak NEITHER TCP nor QUIC, so without this the whole
+			// web client is unreachable. go-libp2p's default transport set already registers WebRTC —
+			// listening is the entire opt-in, there is no new dependency, and it shares the QUIC UDP
+			// socket when both sit on the same port (so the master needs no new firewall rule).
+			//
+			// Enabled for CLIENTS too, not just the seed, and that is the point: a publicly-reachable
+			// desktop becomes a browser-dialable seed for free. The connection is DIRECT, so it is not
+			// flagged Limited and bitswap flows over it — no relay, no STUN, no reservation, no
+			// coturn. It is the cheapest offload tier that exists, and it costs one listen address.
+			// (The NATed majority simply never become reachable, exactly as with QUIC/TCP today.)
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/webrtc-direct", swarmPort),
+			fmt.Sprintf("/ip6/::/udp/%d/webrtc-direct", swarmPort),
 		},
 	}
 }

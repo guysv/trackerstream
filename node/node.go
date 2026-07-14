@@ -179,7 +179,27 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		// The seed's relay is the CLAMPED coordination floor (default 128KB/2min). It faces the
 		// whole swarm, so it must NOT carry bulk — it exists only as the always-reachable DCUtR
 		// rendezvous. The clamp flags relayed conns Limited, which bitswap refuses (by design).
-		opts = append(opts, libp2p.EnableRelayService())
+		//
+		// KEEP THE CLAMP. Browsers now reserve here too — a web peer needs a reservation to be
+		// dialable at all, and the relayed connection is what carries the WebRTC SDP/ICE signalling
+		// for browser<->browser (a few KB, done in seconds). Raising the clamp so "relayed bitswap
+		// would work" is the tempting, wrong move: the Limited flag is precisely what keeps bulk
+		// traffic OFF the master, and lifting it turns the seed into everyone's data pipe.
+		//
+		// The RESERVATION ceilings, though, were sized for a handful of NATed desktops and are now
+		// the cap on concurrent dialable WEB peers. The defaults are actively harmful here:
+		//   - MaxReservations 128:  the whole web audience, on one number.
+		//   - PerIP 8:              a self-DoS. One university/office/CGNAT pool exhausts it and
+		//                           everyone behind it silently becomes undialable.
+		//   - PerASN 32:            entire mobile carriers sit behind a single ASN.
+		// The table itself is trivial (~200B/entry); the real cost is that each reserving browser
+		// holds an open webrtc-direct conn (pion DTLS+SCTP, roughly 100-300KB RSS). 1024 is ~250MB
+		// of pion state before headroom — measure RSS/conn on the box before raising it further.
+		rc := relay.DefaultResources()
+		rc.MaxReservations = 1024
+		rc.MaxReservationsPerIP = 64
+		rc.MaxReservationsPerASN = 512
+		opts = append(opts, libp2p.EnableRelayService(relay.WithResources(rc)))
 	} else {
 		// Clients offer a GENEROUS (infinite-limit) relay — but go-libp2p only STARTS it once
 		// AutoNAT confirms the node is publicly reachable, so the NATed majority never relay and

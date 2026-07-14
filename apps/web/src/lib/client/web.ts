@@ -29,6 +29,7 @@ import { CID } from "multiformats/cid";
 import { resolveIpns } from "../ipns.ts";
 import { startNode, type TsNode } from "../node.ts";
 import { getSample, getSkeleton, startStream } from "../stream.ts";
+import { Provider, warmRoot } from "../offload.ts";
 
 export class WebClient implements NodeClient {
   readonly caps: Capabilities = {
@@ -50,12 +51,14 @@ export class WebClient implements NodeClient {
   /** Fan-out for `playlists:changed`. The desktop gets this from Tauri's event bus; here the gossip
    *  ingest loop emits it directly — same signal, no round-trip. */
   private readonly listeners: Set<() => void>;
+  private readonly provider: Provider;
 
   private constructor(ts: TsNode, cat: CatalogClient, pl: Playlists, listeners: Set<() => void>) {
     this.ts = ts;
     this.cat = cat;
     this.pl = pl;
     this.listeners = listeners;
+    this.provider = new Provider(ts.libp2p, ts.helia);
   }
 
   static async create(): Promise<WebClient> {
@@ -68,8 +71,11 @@ export class WebClient implements NodeClient {
     // The dev override exists because resolving requires reaching a DHT *server*, and in a local
     // rig the only peer a browser can dial is a NATed client-mode node that answers nothing. It is
     // never used in prod, where the master is a DHT server the browser dials directly.
+    // VITE_CATALOG_IPNS points the resolve at a DIFFERENT name (used to exercise the real DHT path
+    // against a local seed); VITE_CATALOG_CID skips resolution entirely. Neither is used in prod.
     const rootCid =
-      (import.meta.env?.VITE_CATALOG_CID as string | undefined) ?? (await resolveIpns(ts.libp2p));
+      (import.meta.env?.VITE_CATALOG_CID as string | undefined) ??
+      (await resolveIpns(ts.libp2p, (import.meta.env?.VITE_CATALOG_IPNS as string | undefined) ?? undefined));
 
     const cat = new CatalogClient(rootCid, {
       // The TSZCAT manifest is the only UnixFS read in the whole catalog path, and it's whole-file.
@@ -157,9 +163,13 @@ export class WebClient implements NodeClient {
     },
     // The browser holds exactly one bootstrap connection and libp2p keeps it; nothing to pin.
     keepaliveMaster: async (): Promise<void> => {},
-    // The desktop's warm_root asks the tracker who holds a root and pre-dials them. Wiring that to
-    // dht.findProviders is Phase 5 (Tier 1 offload); until then Bitswap simply asks the seed.
-    warmRoot: async (): Promise<void> => {},
+    // Tier-1 offload: ask the DHT who holds this root and pre-dial the ones a browser CAN reach
+    // (publicly-reachable desktops now listen on webrtc-direct, and other browsers reachable via
+    // the relay). Bitswap then finds the blocks on an already-connected peer instead of the seed.
+    // Fire-and-forget: playback must never wait on the DHT.
+    warmRoot: async (root: string): Promise<void> => {
+      void warmRoot(this.ts.libp2p, this.ts.helia, root);
+    },
   };
 
   catalog = {
@@ -176,8 +186,12 @@ export class WebClient implements NodeClient {
       const { bytes } = await reassemble(CID.parse(root), this.block, { verify: true });
       return bytes.buffer as ArrayBuffer;
     },
-    startStream: (root: string, onEvent: (e: StreamEvent) => void): Promise<void> =>
-      startStream(root, this.block, onEvent),
+    startStream: async (root: string, onEvent: (e: StreamEvent) => void): Promise<void> => {
+      await startStream(root, this.block, onEvent);
+      // We now hold this module's blocks. Announce it so other browsers can pull it from US — a
+      // peer that never provides is a pure leech, and the mesh has nothing to offload from.
+      void this.provider.provide(root);
+    },
     getSkeleton: async (root: string): Promise<ArrayBuffer> => {
       const b = getSkeleton(root);
       return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;

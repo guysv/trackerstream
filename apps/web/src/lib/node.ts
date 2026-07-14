@@ -13,10 +13,12 @@ import { bitswap } from "@helia/block-brokers";
 import { circuitRelayTransport } from "@libp2p/circuit-relay-v2";
 import { generateKeyPair, privateKeyFromProtobuf, privateKeyToProtobuf } from "@libp2p/crypto/keys";
 import { identify } from "@libp2p/identify";
-import { kadDHT } from "@libp2p/kad-dht";
+import { kadDHT, passthroughMapper } from "@libp2p/kad-dht";
 import { ping } from "@libp2p/ping";
 import { webRTC, webRTCDirect } from "@libp2p/webrtc";
 import { multiaddr } from "@multiformats/multiaddr";
+import { ipnsValidator } from "ipns/validator";
+import { ipnsSelector } from "ipns/selector";
 import { BOOTSTRAP_URL } from "@trackerstream/config";
 import { IDBBlockstore } from "blockstore-idb";
 import { IDBDatastore } from "datastore-idb";
@@ -27,6 +29,9 @@ import { createLibp2p, type Libp2p } from "libp2p";
 /** tsnode namespaces its DHT (node/config.go: DHTPrefix = "/trackerstream"), so a stock kad-dht
  *  would talk to nobody. The prefix is declared IMMORTAL on the Go side — never change it. */
 const DHT_PROTOCOL = "/trackerstream/kad/1.0.0";
+
+/** Advertised in the libp2p UserAgent. Bump with the client, not the wire. */
+const VERSION = "0.1.0";
 
 /** tsnode raises gossipsub's max message size to 2 MiB (node/pubsub.go). js-libp2p defaults to
  *  1 MiB, and a max-size playlist doc would be SILENTLY DROPPED — not an error, just a message that
@@ -81,6 +86,10 @@ export async function startNode(): Promise<TsNode> {
   const [key, boot] = await Promise.all([loadOrCreateKey(), fetchBootstrap()]);
 
   const libp2p = await createLibp2p({
+    // Identify ourselves on the wire the way tsnode does (trackerstream/<ver>/<role>). Without it a
+    // web peer is anonymous, and node/control.go — which classifies peers by their agent string —
+    // cannot tell a trackerstream browser from a stranger.
+    nodeInfo: { name: "trackerstream", version: `${VERSION}/web` },
     // The libp2p ecosystem is mid-migration: @libp2p/peer-id pulls @libp2p/crypto@5.1.x, which
     // depends on @libp2p/interface@3, while libp2p@2.x's own types are built against interface@2.
     // Both are in the tree and the shapes are identical — it is a nominal clash, not a runtime one.
@@ -108,7 +117,22 @@ export async function startNode(): Promise<TsNode> {
     services: {
       identify: identify(),
       ping: ping(), // kad-dht depends on it (peer liveness); also what the peers pane reads for RTT
-      dht: kadDHT({ protocol: DHT_PROTOCOL, clientMode: true }),
+      dht: kadDHT({
+        protocol: DHT_PROTOCOL,
+        clientMode: true,
+        // WITHOUT THESE THE CATALOG NEVER RESOLVES. js-kad-dht ships exactly one default record
+        // validator — `pk` — so an /ipns/... record coming back from a GET_VALUE is rejected INSIDE
+        // kad-dht before the caller ever sees it. The selector is what picks the newest record when
+        // several peers answer (IPNS sequence order). Go's DHT registers the same pair
+        // (dht.NamespacedValidator("ipns", ...) in node/node.go).
+        validators: { ipns: ipnsValidator },
+        selectors: { ipns: ipnsSelector },
+        // js-kad-dht defaults to removePrivateAddressesMapper — sensible hygiene on the PUBLIC
+        // Amino DHT, wrong here. This is a PRIVATE overlay (its own DHT prefix), where peers on
+        // LANs and loopback are legitimate members; stripping their addresses leaves the routing
+        // table with nothing to query and every lookup times out having asked nobody.
+        peerInfoMapper: passthroughMapper,
+      }),
       pubsub: gossipsub({ maxInboundDataLength: MAX_PUBSUB_MSG }),
     },
   });

@@ -5,11 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
-	"time"
 )
 
 const testPeerID = "12D3KooWGb7eHYgZnMFfADEDeS5xDEwEVQKPTGozsKanpDf9XvzL"
@@ -95,62 +93,28 @@ func TestBrowserDialable(t *testing.T) {
 // TestTurnCredential pins the coturn use-auth-secret vector: username = "<unix>:web",
 // credential = base64(HMAC-SHA1(secret, username)). If this ever changes, every browser
 // silently loses its TURN relay — so it is asserted against a literal, not recomputed.
-func TestTurnCredential(t *testing.T) {
-	expiry := time.Unix(1893456000, 0) // 2030-01-01T00:00:00Z
-	user, cred := turnCredential([]byte("s3cr3t"), expiry)
-
-	if want := "1893456000:web"; user != want {
-		t.Errorf("username = %q, want %q", user, want)
+// STUN only, never TURN. TURN would mean running an open relay for the internet and handing every
+// visitor a credential for it; we deliberately don't. This test is the guard against someone
+// "helpfully" adding it back.
+func TestICEServersAreStunOnlyAndNeverTurn(t *testing.T) {
+	s := newServer("http://127.0.0.1:1", "trackerstream.xyz")
+	ice := s.iceServers()
+	if len(ice) != 1 {
+		t.Fatalf("iceServers = %d entries)", len(ice))
 	}
-	// printf %s "1893456000:web" | openssl dgst -sha1 -mac HMAC -macopt key:s3cr3t -binary | base64
-	if want := "FJbFHuQhFstGDQmZS70hYe0Pi8g="; cred != want {
-		t.Errorf("credential = %q, want %q", cred, want)
+	if got, want := ice[0].URLs[0], "stun:trackerstream.xyz:3478"; got != want {
+		t.Errorf("stun url = %q, want %q", got, want)
 	}
-}
-
-func TestICEServers(t *testing.T) {
-	expiry := time.Unix(1893456000, 0)
-
-	t.Run("stun + turn when the secret is present", func(t *testing.T) {
-		s := newServer("http://127.0.0.1:1", "trackerstream.xyz", []byte("s3cr3t"))
-		got := s.iceServers(expiry)
-		want := []iceServer{
-			{URLs: []string{"stun:trackerstream.xyz:3478"}},
-			{
-				URLs:       []string{"turn:trackerstream.xyz:3478?transport=udp"},
-				Username:   "1893456000:web",
-				Credential: "FJbFHuQhFstGDQmZS70hYe0Pi8g=",
-			},
+	for _, e := range ice {
+		for _, u := range e.URLs {
+			if strings.HasPrefix(u, "turn:") || strings.HasPrefix(u, "turns:") {
+				t.Fatalf("a TURN server was advertised (%q) — we do not run an open relay", u)
+			}
 		}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("iceServers()\n got %#v\nwant %#v", got, want)
+		if e.Username != "" || e.Credential != "" {
+			t.Fatal("an ICE credential was handed out; STUN needs none")
 		}
-	})
-
-	// coturn is not on use-auth-secret yet, so a missing/unreadable secret is the CURRENT
-	// prod state — it must degrade to STUN, never fail the endpoint.
-	t.Run("stun-only when the secret file is missing", func(t *testing.T) {
-		missing := filepath.Join(t.TempDir(), "nope.secret")
-		s := newServer("http://127.0.0.1:1", "trackerstream.xyz", readTurnSecret(missing))
-		got := s.iceServers(expiry)
-		want := []iceServer{{URLs: []string{"stun:trackerstream.xyz:3478"}}}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("iceServers()\n got %#v\nwant %#v", got, want)
-		}
-	})
-
-	t.Run("secret file is trimmed", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "turn.secret")
-		if err := os.WriteFile(path, []byte("s3cr3t\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		// The trailing newline `openssl rand -hex 24 >` leaves must not enter the HMAC key,
-		// or every credential we mint is rejected by coturn.
-		s := newServer("http://127.0.0.1:1", "trackerstream.xyz", readTurnSecret(path))
-		if got := s.iceServers(expiry)[1].Credential; got != "FJbFHuQhFstGDQmZS70hYe0Pi8g=" {
-			t.Fatalf("credential = %q — newline leaked into the HMAC key?", got)
-		}
-	})
+	}
 }
 
 func TestBootstrapDoc(t *testing.T) {
@@ -161,8 +125,7 @@ func TestBootstrapDoc(t *testing.T) {
 	}}
 	up := seed.start(t)
 
-	s := newServer(up.URL, "trackerstream.xyz", []byte("s3cr3t"))
-	s.now = func() time.Time { return time.Unix(1893452400, 0) } // expiry = +1h = 1893456000
+	s := newServer(up.URL, "trackerstream.xyz")
 	if err := s.refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -177,8 +140,9 @@ func TestBootstrapDoc(t *testing.T) {
 	if doc.TTL != 60 {
 		t.Errorf("ttl = %d, want 60", doc.TTL)
 	}
-	if len(doc.ICEServers) != 2 || doc.ICEServers[1].Username != "1893456000:web" {
-		t.Errorf("iceServers = %#v", doc.ICEServers)
+	// Exactly one entry, and it is STUN. See TestICEServersAreStunOnlyAndNeverTurn.
+	if len(doc.ICEServers) != 1 || doc.ICEServers[0].URLs[0] != "stun:trackerstream.xyz:3478" {
+		t.Errorf("iceServers = %#v, want a single STUN entry", doc.ICEServers)
 	}
 }
 
@@ -188,7 +152,7 @@ func TestServesCacheWhenUpstreamDown(t *testing.T) {
 	seed := &fakeSeed{addrs: []string{wrtc}}
 	up := seed.start(t)
 
-	s := newServer(up.URL, "trackerstream.xyz", nil)
+	s := newServer(up.URL, "trackerstream.xyz")
 	if err := s.refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -207,12 +171,12 @@ func TestServesCacheWhenUpstreamDown(t *testing.T) {
 // A never-primed cache is the one case that 503s: an empty addr list would be cached by the
 // client for the full TTL, which is strictly worse than telling it to come back.
 func TestUnprimedCacheIs503(t *testing.T) {
-	s := newServer("http://127.0.0.1:1", "trackerstream.xyz", nil)
+	s := newServer("http://127.0.0.1:1", "trackerstream.xyz")
 	get(t, s, http.MethodGet, http.StatusServiceUnavailable)
 }
 
 func TestCORSAndMethods(t *testing.T) {
-	s := newServer("http://127.0.0.1:1", "trackerstream.xyz", nil)
+	s := newServer("http://127.0.0.1:1", "trackerstream.xyz")
 
 	for _, tc := range []struct {
 		method string

@@ -18,19 +18,32 @@ import type { Libp2p } from "libp2p";
  *  ipns-pubsub spec: plain JSON `{name: <base58 PeerId>, record: <base64 IPNS V2 record>}`. */
 export const CATALOG_TOPIC = "/trackerstream/catalog/1.0.0";
 
+/** Bound the resolve. The catalog is the first thing the app needs, so a silent hang here reads to
+ *  the user as "the app is broken", with nothing in the console. */
+const RESOLVE_TIMEOUT_MS = 20_000;
+
 /** Resolve `/ipns/<name>` to a root CID over the custom DHT, verifying the record locally.
  *
  *  The node is an untrusted cache: we verify the signature against the NAME's public key, so no
  *  peer (and no seed) can forge a newer record. Same trust anchor the desktop uses. */
-export async function resolveIpns(libp2p: Libp2p, name = CATALOG_IPNS_KEY): Promise<string> {
+export async function resolveIpns(
+  libp2p: Libp2p,
+  name = CATALOG_IPNS_KEY,
+  timeoutMs = RESOLVE_TIMEOUT_MS,
+): Promise<string> {
   const peerId = peerIdFromString(name);
   const key = multihashToIPNSRoutingKey(peerId.toMultihash());
 
   const dht = (libp2p.services as { dht?: any }).dht;
   if (!dht) throw new Error("ipns: no DHT service");
 
+  // A DHT query with nothing to find does not fail — it walks until it runs out of peers, which for
+  // a browser holding one connection can be a very long time. Without this the app hangs on
+  // "connecting to the swarm" forever instead of telling anyone what went wrong.
+  const signal = AbortSignal.timeout(timeoutMs);
+
   let best: { seq: bigint; value: string } | null = null;
-  for await (const ev of dht.get(key)) {
+  for await (const ev of dht.get(key, { signal })) {
     if (ev.name !== "VALUE") continue;
     try {
       // Signature + EOL. Throws on a forged, expired or malformed record.

@@ -150,12 +150,11 @@ echo "=== [5/8] coturn STUN/TURN ==="
 secret_file=/etc/trackerstream/turn.secret
 mkdir -p /etc/trackerstream
 [ -f "$secret_file" ] || openssl rand -hex 24 > "$secret_file"
-# tsedge mints the browser's ephemeral TURN credentials (HMAC over this secret), and it runs
-# as `trackerstream`, not root — so the secret must be group-readable by it. Kept off world
-# (0640): anyone who can read it can mint unlimited relay credentials. coturn reads its own
-# copy from the rendered /etc/turnserver.conf, so this only widens it for tsedge.
-chown root:trackerstream "$secret_file"
-chmod 640 "$secret_file"
+# Root-only. Nothing but coturn's own rendered /etc/turnserver.conf consumes this: we advertise
+# STUN to browsers and deliberately never TURN, so no other process needs to mint credentials
+# against it and the secret has no reason to leave root.
+chown root:root "$secret_file"
+chmod 600 "$secret_file"
 TURN_SECRET="$(cat "$secret_file")"
 sed -e "s/__PUBLIC_IP__/$PUBLIC_IP/" -e "s/__TURN_SECRET__/$TURN_SECRET/" \
   "$PREFIX/deploy/turnserver.conf" > /etc/turnserver.conf

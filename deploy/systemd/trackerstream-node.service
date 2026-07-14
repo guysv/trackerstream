@@ -25,7 +25,9 @@ Environment=TS_RPC=127.0.0.1:5001
 # there is NO new port and NO new ufw rule (5478/udp is already open — install.sh [7/8]).
 # The certhash in the resulting multiaddr is regenerated on every process start, which is
 # precisely why browsers must discover it at runtime (trackerstream-edge → /bootstrap.json).
-Environment=TS_LISTEN_EXTRA=/ip4/0.0.0.0/udp/5478/webrtc-direct
+#
+# No TS_LISTEN_EXTRA needed: webrtc-direct is now a DEFAULT listen addr for both roles
+# (node/config.go), so that a publicly-reachable desktop client is browser-dialable too.
 ExecStart=/usr/local/bin/tsnode --role server
 Restart=on-failure
 RestartSec=5
