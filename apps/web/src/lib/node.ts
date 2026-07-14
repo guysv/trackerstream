@@ -81,7 +81,11 @@ export async function startNode(): Promise<TsNode> {
   const [key, boot] = await Promise.all([loadOrCreateKey(), fetchBootstrap()]);
 
   const libp2p = await createLibp2p({
-    privateKey: key,
+    // The libp2p ecosystem is mid-migration: @libp2p/peer-id pulls @libp2p/crypto@5.1.x, which
+    // depends on @libp2p/interface@3, while libp2p@2.x's own types are built against interface@2.
+    // Both are in the tree and the shapes are identical — it is a nominal clash, not a runtime one.
+    // Cast once, here, rather than smearing `any` through the key handling.
+    privateKey: key as unknown as NonNullable<Parameters<typeof createLibp2p>[0]>["privateKey"],
     // A browser cannot listen on a socket. The two entries below are for the browser<->browser mesh
     // (a relay reservation makes us dialable; /webrtc is the transport the SDP upgrade lands on) —
     // both are inert until a relay accepts a reservation.

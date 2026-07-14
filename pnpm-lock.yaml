@@ -131,6 +131,9 @@ importers:
       '@trackerstream/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@trackerstream/playlists-web':
+        specifier: workspace:*
+        version: link:../../packages/playlists-web
       '@trackerstream/repack':
         specifier: workspace:*
         version: link:../../packages/repack
@@ -194,6 +197,30 @@ importers:
         version: 13.4.2
 
   packages/config: {}
+
+  packages/playlists-web:
+    dependencies:
+      '@journeyapps/wa-sqlite':
+        specifier: ^1.7.2
+        version: 1.7.2
+      '@libp2p/crypto':
+        specifier: ^5.0.0
+        version: 5.1.21
+      '@libp2p/peer-id':
+        specifier: ^5.0.0
+        version: 5.1.9
+      idb-keyval:
+        specifier: ^6.2.1
+        version: 6.3.0
+      ipns:
+        specifier: ^10.0.0
+        version: 10.1.6
+      libp2p:
+        specifier: ^2.0.0
+        version: 2.10.0
+      multiformats:
+        specifier: ^13.3.1
+        version: 13.4.2
 
   packages/repack:
     dependencies:

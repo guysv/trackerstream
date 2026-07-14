@@ -1,0 +1,20 @@
+{
+  "name": "@trackerstream/playlists-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser playlist authoring: wa-sqlite store, browser-side IPNS signing, and the gossip envelope from node/playlist.go",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*"
+  },
+  "dependencies": {
+    "@journeyapps/wa-sqlite": "^1.7.2",
+    "@libp2p/crypto": "^5.0.0",
+    "@libp2p/peer-id": "^5.0.0",
+    "idb-keyval": "^6.2.1",
+    "ipns": "^10.0.0",
+    "libp2p": "^2.0.0",
+    "multiformats": "^13.3.1"
+  }
+}

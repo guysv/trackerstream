@@ -29,6 +29,7 @@
     "@multiformats/multiaddr": "^12.3.0",
     "@trackerstream/catalog-web": "workspace:*",
     "@trackerstream/config": "workspace:*",
+    "@trackerstream/playlists-web": "workspace:*",
     "@trackerstream/repack": "workspace:*",
     "@trackerstream/ui": "workspace:*",
     "blockstore-idb": "^2.0.0",

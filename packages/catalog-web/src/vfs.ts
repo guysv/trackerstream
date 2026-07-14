@@ -1,3 +1,4 @@
+/// <reference path="./wa-sqlite.d.ts" />
 // A read-only wa-sqlite VFS whose pages come from Bitswap.
 //
 // This is the JS counterpart of catalog.rs's IpfsVfs — and it is *simpler* than the Rust, because

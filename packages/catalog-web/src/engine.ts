@@ -1,3 +1,4 @@
+/// <reference path="./wa-sqlite.d.ts" />
 // The catalog query engine: opens the Bitswap-backed SQLite DB and answers the same six ops the
 // Rust `dispatch` does (search | list | get | get_by_md5 | formats | genres), so the UI's request
 // shapes are unchanged between shells.

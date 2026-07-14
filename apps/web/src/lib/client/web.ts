@@ -3,6 +3,7 @@
 // Mirror image of apps/desktop/src/lib/client/tauri.ts. Same interface, same UI above it — the only
 // difference is that this one IS the node rather than talking to one.
 import { CatalogClient } from "@trackerstream/catalog-web";
+import { Playlists } from "@trackerstream/playlists-web";
 import type {
   Capabilities,
   CatalogSearchOpts,
@@ -29,50 +30,6 @@ import { resolveIpns } from "../ipns.ts";
 import { startNode, type TsNode } from "../node.ts";
 import { getSample, getSkeleton, startStream } from "../stream.ts";
 
-/** Not yet implemented in the browser (Phase 4: the playlists.rs port). Every playlist method
- *  returns an EMPTY, well-formed answer rather than throwing — the UI's playlist views then render
- *  their "nothing here" state instead of an error, which is the correct degradation and also
- *  exactly what a brand-new desktop install looks like. */
-const NO_PLAYLISTS = {
-  search: async (): Promise<PlaylistMeta[]> => [],
-  list: async (): Promise<PlaylistMeta[]> => [],
-  hold: async (): Promise<void> => {},
-  get: async (): Promise<PlaylistDetail | null> => null,
-  create: async (): Promise<PlaylistMeta> => {
-    throw new Error("playlists are not available in the web client yet");
-  },
-  update: async (): Promise<void> => {
-    throw new Error("playlists are not available in the web client yet");
-  },
-  remove: async (): Promise<void> => {},
-  publish: async (): Promise<void> => {},
-  unpublish: async (): Promise<void> => {},
-  syncStatus: async (): Promise<PlaylistSyncStatus> => ({
-    total: 0,
-    mine: 0,
-    held: 0,
-    seen: 0,
-    dormant: 0,
-    bytes: 0,
-    budget: 0,
-  }),
-  likeToggle: async (): Promise<boolean> => false,
-  likedIds: async (): Promise<string[]> => [],
-  likedName: async (): Promise<string> => "",
-  ingestLink: async (): Promise<LinkStatus> => {
-    throw new Error("playlists are not available in the web client yet");
-  },
-  copyLink: async (): Promise<string> => {
-    throw new Error("playlists are not available in the web client yet");
-  },
-  pending: async (): Promise<string[]> => [],
-  backers: async (): Promise<Record<string, number>> => ({}),
-  pin: async (): Promise<void> => {},
-  played: async (): Promise<void> => {},
-  ofPeer: async (): Promise<PeerPlaylists> => ({ supported: false, playlists: [] }),
-  request: async (): Promise<number> => 0,
-};
-
 export class WebClient implements NodeClient {
   readonly caps: Capabilities = {
     // A browser cannot execute a program. Saving still works — reassembly is byte-exact, so we hand
@@ -87,10 +44,19 @@ export class WebClient implements NodeClient {
     peerPlaylists: false,
   };
 
-  private constructor(
-    private readonly ts: TsNode,
-    private readonly cat: CatalogClient,
-  ) {}
+  private readonly ts: TsNode;
+  private readonly cat: CatalogClient;
+  private readonly pl: Playlists;
+  /** Fan-out for `playlists:changed`. The desktop gets this from Tauri's event bus; here the gossip
+   *  ingest loop emits it directly — same signal, no round-trip. */
+  private readonly listeners: Set<() => void>;
+
+  private constructor(ts: TsNode, cat: CatalogClient, pl: Playlists, listeners: Set<() => void>) {
+    this.ts = ts;
+    this.cat = cat;
+    this.pl = pl;
+    this.listeners = listeners;
+  }
 
   static async create(): Promise<WebClient> {
     const ts = await startNode();
@@ -119,13 +85,19 @@ export class WebClient implements NodeClient {
         return out;
       },
       // Every catalog PAGE is its own raw block — a plain Bitswap fetch, no UnixFS, no ranged reads.
-      getBlock: (cid) => ts.helia.blockstore.get(cid),
+      getBlock: async (cid) => ts.helia.blockstore.get(cid),
     });
 
-    return new WebClient(ts, cat);
+    // The listener set exists BEFORE Playlists so its onChange can close over it — the store needs a
+    // way to signal the UI, and the UI subscribes through the client that owns the store.
+    const listeners = new Set<() => void>();
+    const pl = await Playlists.create(ts.libp2p, () => {
+      for (const cb of listeners) cb();
+    });
+    return new WebClient(ts, cat, pl, listeners);
   }
 
-  private block = (cid: CID): Promise<Uint8Array> => this.ts.helia.blockstore.get(cid);
+  private block = async (cid: CID): Promise<Uint8Array> => this.ts.helia.blockstore.get(cid);
 
   node = {
     info: async (): Promise<NodeInfo> => ({
@@ -230,7 +202,36 @@ export class WebClient implements NodeClient {
     },
   };
 
-  playlists = NO_PLAYLISTS;
+  playlists = {
+    search: (q: string): Promise<PlaylistMeta[]> => this.pl.search(q) as Promise<PlaylistMeta[]>,
+    list: (_scope: PlaylistScope): Promise<PlaylistMeta[]> => this.pl.list() as Promise<PlaylistMeta[]>,
+    hold: (name: string, held: boolean): Promise<void> => this.pl.hold(name, held),
+    get: (name: string): Promise<PlaylistDetail | null> => this.pl.get(name) as Promise<PlaylistDetail | null>,
+    create: (title: string, tracks: TrackTuple[]): Promise<PlaylistMeta> =>
+      this.pl.create(title, tracks) as Promise<PlaylistMeta>,
+    update: (name: string, title: string, tracks: TrackTuple[]): Promise<void> =>
+      this.pl.update(name, title, tracks),
+    remove: (name: string): Promise<void> => this.pl.remove(name),
+    publish: (name: string): Promise<void> => this.pl.publish(name),
+    unpublish: (name: string): Promise<void> => this.pl.unpublish(name),
+    syncStatus: (): Promise<PlaylistSyncStatus> => this.pl.syncStatus(),
+    likeToggle: (track: TrackTuple): Promise<boolean> => this.pl.likeToggle(track),
+    likedIds: (): Promise<string[]> => this.pl.likedIds(),
+    likedName: (): Promise<string> => this.pl.likedName(),
+    ingestLink: (url: string): Promise<LinkStatus> => this.pl.ingestLink(url),
+    copyLink: (name: string): Promise<string> => this.pl.copyLink(name),
+    pending: (): Promise<string[]> => this.pl.pendingNames(),
+    // Beacon COUNTING (24h window, distinct origins) is not implemented yet; a browser leaf also
+    // sees fewer origins than a desktop. Report 0 rather than a wrong number — 0 already means
+    // "no beacon heard", which is normal for the first hour after startup.
+    backers: async (): Promise<Record<string, number>> => ({}),
+    // Play-time pin: the browser store has no decay/eviction racing playback (enforceBudget only
+    // touches the seen tier, and a playing playlist is in the library), so there is nothing to pin.
+    pin: async (): Promise<void> => {},
+    played: (name: string): Promise<void> => this.pl.played(name),
+    ofPeer: async (): Promise<PeerPlaylists> => ({ supported: false, playlists: [] }),
+    request: async (): Promise<number> => 0,
+  };
 
   platform = {
     log: (level: "debug" | "warn" | "error", ...args: unknown[]): void => {
@@ -282,8 +283,11 @@ export class WebClient implements NodeClient {
   };
 
   events = {
-    // Nothing writes playlists behind the UI's back yet (Phase 4 wires this to the gossipsub ingest
-    // loop, which is the browser's equivalent of the desktop's sync loop).
-    on: (): Unsub => () => {},
+    // The browser's equivalent of the desktop's sync loop: gossip ingest fires this the instant the
+    // network moves a playlist under us.
+    on: (_event: "playlists:changed", cb: () => void): Unsub => {
+      this.listeners.add(cb);
+      return () => this.listeners.delete(cb);
+    },
   };
 }

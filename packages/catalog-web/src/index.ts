@@ -63,7 +63,11 @@ export class CatalogClient {
         try {
           const cid = CIDParser.parse(m.cid);
           const bytes = m.kind === "root" ? await this.src.readRoot(cid) : await this.src.getBlock(cid);
-          this.post({ t: "fetched", id: m.id, bytes }, [bytes.buffer as ArrayBuffer]);
+          // Structured-CLONE, never transfer. These bytes are Helia's — the blockstore hands out its
+          // own cached buffer, and transferring it detaches the copy Helia still holds, so the next
+          // read of that block throws "ArrayBuffer is already detached". The clone costs a memcpy;
+          // the transfer costs correctness.
+          this.post({ t: "fetched", id: m.id, bytes });
         } catch (e) {
           this.post({ t: "fetched", id: m.id, error: e instanceof Error ? e.message : String(e) });
         }
