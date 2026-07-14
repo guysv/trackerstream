@@ -1,0 +1,16 @@
+{
+  "name": "@trackerstream/catalog-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser catalog: a wa-sqlite VFS whose pages are Bitswap blocks, plus the prefetch scheduler ported from catalog.rs",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*"
+  },
+  "dependencies": {
+    "@journeyapps/wa-sqlite": "^1.7.2",
+    "fzstd": "^0.1.1",
+    "multiformats": "^13.3.1"
+  }
+}

@@ -2,4 +2,10 @@ packages:
   - "packages/*"
   - "apps/*"
 allowBuilds:
+  # Native WebRTC bindings. @libp2p/webrtc pulls these in for its NODE.JS path; the web client only
+  # ever runs in a browser, which has WebRTC natively — so the native build is dead weight.
+  '@ipshipyard/node-datachannel': false
+  # Ships prebuilt .wasm/.mjs pairs. Its build script only regenerates them from source (needs
+  # emscripten); we use the shipped artifacts, which is also what pins FTS5 into the build.
+  '@journeyapps/wa-sqlite': false
   esbuild: true
