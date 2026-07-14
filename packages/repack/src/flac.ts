@@ -17,6 +17,8 @@
 //
 // DETERMINISM + claxon-compat are asserted by test/v4-roundtrip.ts (two bakes -> identical roots) and
 // the Rust flac_decode_matches_bake interop test (fixtures via test/gen-flac-fixtures.ts).
+import { decodeFlacStream } from "./flac-decoder.ts";
+
 /** Pinned encoder identity — bump only with a full corpus re-bake (every FLAC leaf CID changes). */
 export const FLAC_CODEC = 1; // SampleV4.encCodec value for FLAC-compressed leaves
 export const FLAC_RAW = 0; // encCodec value for uncompressed (planar native) leaves
@@ -25,29 +27,30 @@ const COMPRESSION = 8; // libFLAC preset (0..8); 8 = best, free at bake time
 /** Cumulative encode wall-time + call count (for bake profiling; PROFILE=1 in the ingest). */
 export const flacStats = { ms: 0, calls: 0, bytesIn: 0 };
 
-// libflacjs is CommonJS + async wasm/asm init. Load once, reuse the ready module for every encode.
+// libflacjs is CommonJS + async wasm/asm init. Load once, reuse the ready module for every call.
 let Flac: any = null;
 let Encoder: any = null;
-let Decoder: any = null;
 
-/** Load + ready the libFLAC module. Idempotent; MUST be awaited before flacEncode/flacDecode
- *  (buildDagV4/reassembleV4 do this at their entry). */
+/** Load + ready libFLAC *including the encoder*. Bake-only (buildDagV4 does this at its entry).
+ *  Clients must use initFlacDecoder — see below. */
 export async function initFlac(): Promise<void> {
   await initFlacDecoder();
   if (Encoder) return;
+  // Node-only: libflacjs/lib/* is UMD that bundlers cannot link (see flac-decoder.ts). Only the
+  // bake reaches this, and the bake only ever runs in Node.
   Encoder = interop(await import("libflacjs/lib/encoder.js")).Encoder;
 }
 
-/** Decode-only init. Split out because ONLY the bake encodes: a client (desktop or browser) just
- *  decodes v4 leaves. Keeping the encoder off this path means a browser bundle never pulls in
- *  libflacjs/lib/encoder.js at all. */
+/** Decode-only init — the CLIENT path (desktop and browser). Split from initFlac because only the
+ *  bake encodes, and libflacjs's `lib/` wrappers are unbundleable UMD: keeping them off this path
+ *  is what lets a browser bundle contain a working FLAC decoder at all. */
 export async function initFlacDecoder(): Promise<void> {
   if (Flac) return;
-  // Dynamic import, NOT createRequire: this module has to load in a browser bundle too. Specifiers
-  // MUST stay literal — a variable specifier is opaque to bundlers, which then leave the bare name
-  // for the browser to resolve, and it can't.
-  const F = interop(await import("libflacjs/dist/libflac.js")); // asm.js (pure JS)
-  Decoder = interop(await import("libflacjs/lib/decoder.js")).Decoder;
+  // Dynamic import, NOT createRequire: this module has to load in a browser bundle too. The
+  // specifier MUST stay literal — a variable specifier is opaque to bundlers, which then leave the
+  // bare name for the browser to resolve, and it can't. `dist/libflac.js` is plain asm.js and
+  // bundles cleanly; we drive its raw C-API ourselves via decodeFlacStream.
+  const F = interop(await import("libflacjs/dist/libflac.js"));
   await new Promise<void>((res) => {
     if (F.isReady && F.isReady()) return res();
     F.on("ready", () => res());
@@ -119,30 +122,24 @@ export function flacEncode(planarPcm: Uint8Array, channels: number, bitDepth: nu
  *  (exact, since the value fits in `bitDepth` bits), then concatenate channels into native planar. */
 export function flacDecode(flacBytes: Uint8Array, _channels: number, bitDepth: number): Uint8Array {
   ready();
-  const dec = new Decoder(Flac, {});
-  try {
-    dec.decode(flacBytes);
-    const chans: Uint8Array[] = dec.getSamples(false);
-    const bps = bitDepth === 16 ? 2 : 1;
-    const frames = dec.metadata?.total_samples || (chans[0] ? chans[0].length / 2 : 0);
-    const decW = frames ? chans[0].length / frames : bps; // decoder bytes-per-sample (16-bit => 2)
-    const parts = chans.map((ch) => {
-      if (decW === bps) return ch;
-      const n = ch.length / decW;
-      const o = new Uint8Array(n * bps);
-      for (let f = 0; f < n; f++) for (let b = 0; b < bps; b++) o[f * bps + b] = ch[f * decW + b]; // low LE bytes
-      return o;
-    });
-    let total = 0;
-    for (const p of parts) total += p.length;
-    const out = new Uint8Array(total);
-    let w = 0;
-    for (const p of parts) {
-      out.set(p, w);
-      w += p.length;
-    }
-    return out;
-  } finally {
-    dec.destroy();
+  const { channels: chans, totalSamples } = decodeFlacStream(Flac, flacBytes);
+  const bps = bitDepth === 16 ? 2 : 1;
+  const frames = totalSamples || (chans[0] ? chans[0].length / 2 : 0);
+  const decW = frames ? chans[0].length / frames : bps; // decoder bytes-per-sample (16-bit => 2)
+  const parts = chans.map((ch) => {
+    if (decW === bps) return ch;
+    const n = ch.length / decW;
+    const o = new Uint8Array(n * bps);
+    for (let f = 0; f < n; f++) for (let b = 0; b < bps; b++) o[f * bps + b] = ch[f * decW + b]; // low LE bytes
+    return o;
+  });
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let w = 0;
+  for (const p of parts) {
+    out.set(p, w);
+    w += p.length;
   }
+  return out;
 }
