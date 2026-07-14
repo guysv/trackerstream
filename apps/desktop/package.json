@@ -4,16 +4,16 @@
   "description": "trackerstream desktop client (Tauri + Svelte)",
   "type": "module",
   "scripts": {
-    "build:worklet": "node scripts/build-worklet.mjs",
-    "predev": "pnpm prepare:sidecar && node scripts/build-worklet.mjs",
+    "build:worklet": "node ../../packages/ui/scripts/build-worklet.mjs static/player.worklet.js",
+    "predev": "pnpm prepare:sidecar && pnpm build:worklet",
     "dev": "node scripts/dev.mjs",
     "dev:locked": "node scripts/dev-locked.mjs",
-    "prebuild": "pnpm prepare:sidecar && node scripts/build-worklet.mjs",
+    "prebuild": "pnpm prepare:sidecar && pnpm build:worklet",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-    "test": "node scripts/build-worklet.mjs && node test/fence-test.mjs && node test/worklet-harness.mjs",
+    "test": "pnpm --filter @trackerstream/ui test",
     "tauri": "tauri",
     "prepare:sidecar": "bash src-tauri/scripts/prepare-sidecar.sh"
   },
@@ -25,7 +25,8 @@
     "@tauri-apps/plugin-log": "^2.8.0",
     "@tauri-apps/plugin-opener": "^2",
     "@trackerstream/config": "workspace:*",
-    "@trackerstream/wasm": "workspace:*"
+    "@trackerstream/wasm": "workspace:*",
+    "@trackerstream/ui": "workspace:*"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",

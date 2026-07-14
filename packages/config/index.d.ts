@@ -6,6 +6,8 @@ export const API_BASE_URL: string;
 export const LIBP2P_SWARM_PORT: number;
 export const MASTER_PEER_ID: string;
 export const BOOTSTRAP_MULTIADDRS: string[];
+/** Browser bootstrap discovery (see index.js): fetch on boot AND re-fetch on any dial failure. */
+export const BOOTSTRAP_URL: string;
 export const STUN_PORT: number;
 export const STUN_ENDPOINT: string;
 export const CATALOG_IPNS_KEY: string;

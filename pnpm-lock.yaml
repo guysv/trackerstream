@@ -28,6 +28,9 @@ importers:
       '@trackerstream/config':
         specifier: workspace:*
         version: link:../../packages/config
+      '@trackerstream/ui':
+        specifier: workspace:*
+        version: link:../../packages/ui
       '@trackerstream/wasm':
         specifier: workspace:*
         version: link:../../packages/wasm
@@ -91,6 +94,22 @@ importers:
       multiformats:
         specifier: ^13.3.1
         version: 13.4.2
+
+  packages/ui:
+    dependencies:
+      '@trackerstream/config':
+        specifier: workspace:*
+        version: link:../config
+      '@trackerstream/wasm':
+        specifier: workspace:*
+        version: link:../wasm
+      svelte:
+        specifier: ^5.0.0
+        version: 5.56.3
+    devDependencies:
+      esbuild:
+        specifier: ^0.24.0
+        version: 0.24.2
 
   packages/wasm: {}
 

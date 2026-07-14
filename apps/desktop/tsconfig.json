@@ -9,7 +9,12 @@
     "skipLibCheck": true,
     "sourceMap": true,
     "strict": true,
-    "moduleResolution": "bundler"
+    "moduleResolution": "bundler",
+    // @trackerstream/ui is consumed as SOURCE (both shells are Vite + SvelteKit, so its .svelte
+    // files and $app/* imports must be compiled by the app, not pre-bundled). Its internal imports
+    // carry explicit .ts extensions — the same convention @trackerstream/repack uses — which the
+    // bundler resolves fine but tsc needs told about.
+    "allowImportingTsExtensions": true
   }
   // Path aliases are handled by https://svelte.dev/docs/kit/configuration#alias
   // except $lib which is handled by https://svelte.dev/docs/kit/configuration#files

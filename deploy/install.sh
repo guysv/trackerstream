@@ -50,23 +50,28 @@ if [ "$(ipfs version -n 2>/dev/null || true)" != "$KUBO_VERSION" ]; then
 fi
 echo "ipfs $(ipfs version -n)  (warm-standby; the live master is tsnode)"
 
-echo "=== [2b/8] tsnode (custom go-libp2p+boxo node) ==="
-# Prefer the prebuilt static binary shipped in the artifact (deploy/build-tsnode.sh);
+echo "=== [2b/8] tsnode + tsedge (custom go-libp2p+boxo node, browser bootstrap endpoint) ==="
+# Prefer the prebuilt static binaries shipped in the artifact (deploy/build-tsnode.sh);
 # fall back to building from source if a Go toolchain is present. The cutover
-# (deploy/cutover-tsnode.sh) wires it as the live master; install.sh only places it.
-TSNODE_BIN="$(dirname "$0")/dist/tsnode-linux-amd64"
-if [ -f "$TSNODE_BIN" ]; then
-  install -m755 "$TSNODE_BIN" /usr/local/bin/tsnode
-elif command -v go >/dev/null; then
-  # Stamp the version (node/config.go Version) for the UserAgent + RPC /version; --always
-  # falls back to a commit hash, "dev" only if git is unavailable.
-  _ver="$(git -C "$(dirname "$0")/.." describe --tags --always 2>/dev/null || echo dev)"
-  ( cd "$(dirname "$0")/../node" && go build -trimpath \
-      -ldflags "-s -w -X github.com/trackerstream/tsnode.Version=$_ver" -o /usr/local/bin/tsnode ./cmd/tsnode )
-else
-  echo "WARN: no deploy/dist/tsnode-linux-amd64 and no Go toolchain — run deploy/build-tsnode.sh first" >&2
-fi
-command -v tsnode >/dev/null && echo "tsnode installed at $(command -v tsnode)"
+# (deploy/cutover-tsnode.sh) wires tsnode as the live master; install.sh only places it.
+# tsedge (node/cmd/tsedge) is the stateless public /bootstrap.json service — same module,
+# same version stamp, but its own binary so the public-facing process holds no datastore.
+_ver="$(git -C "$(dirname "$0")/.." describe --tags --always 2>/dev/null || echo dev)"
+for _cmd in tsnode tsedge; do
+  _bin="$(dirname "$0")/dist/${_cmd}-linux-amd64"
+  if [ -f "$_bin" ]; then
+    install -m755 "$_bin" "/usr/local/bin/$_cmd"
+  elif command -v go >/dev/null; then
+    # Stamp the version for the UserAgent + RPC /version (node/config.go Version; tsedge's
+    # own main.Version). --always falls back to a commit hash, "dev" only without git.
+    ( cd "$(dirname "$0")/../node" && go build -trimpath \
+        -ldflags "-s -w -X github.com/trackerstream/tsnode.Version=$_ver -X main.Version=$_ver" \
+        -o "/usr/local/bin/$_cmd" "./cmd/$_cmd" )
+  else
+    echo "WARN: no deploy/dist/${_cmd}-linux-amd64 and no Go toolchain — run deploy/build-tsnode.sh first" >&2
+  fi
+  command -v "$_cmd" >/dev/null && echo "$_cmd installed at $(command -v "$_cmd")"
+done
 
 echo "=== [3/8] install server tree -> /opt/trackerstream ==="
 if [ "$PREFIX" != "/opt/trackerstream" ]; then
@@ -144,7 +149,13 @@ echo "kubo configured (DHT server, provider=roots, relay v2 handshake-only, stor
 echo "=== [5/8] coturn STUN/TURN ==="
 secret_file=/etc/trackerstream/turn.secret
 mkdir -p /etc/trackerstream
-[ -f "$secret_file" ] || { openssl rand -hex 24 > "$secret_file"; chmod 600 "$secret_file"; }
+[ -f "$secret_file" ] || openssl rand -hex 24 > "$secret_file"
+# tsedge mints the browser's ephemeral TURN credentials (HMAC over this secret), and it runs
+# as `trackerstream`, not root — so the secret must be group-readable by it. Kept off world
+# (0640): anyone who can read it can mint unlimited relay credentials. coturn reads its own
+# copy from the rendered /etc/turnserver.conf, so this only widens it for tsedge.
+chown root:trackerstream "$secret_file"
+chmod 640 "$secret_file"
 TURN_SECRET="$(cat "$secret_file")"
 sed -e "s/__PUBLIC_IP__/$PUBLIC_IP/" -e "s/__TURN_SECRET__/$TURN_SECRET/" \
   "$PREFIX/deploy/turnserver.conf" > /etc/turnserver.conf
@@ -163,6 +174,10 @@ systemctl restart systemd-journald
 systemctl daemon-reload
 systemctl enable --now trackerstream-ipfs.service
 systemctl enable --now trackerstream-ingest.timer
+# Browser bootstrap endpoint (/bootstrap.json via Caddy). Requires=trackerstream-node, so it
+# is a no-op on a box still running the kubo warm-standby as master — enable it anyway; it
+# starts with the node at cutover.
+systemctl enable --now trackerstream-edge.service || true
 # Scheduled ops (D3): daily backup + ~1-min node/status metrics export.
 systemctl enable --now trackerstream-backup.timer
 systemctl enable --now trackerstream-metrics.timer

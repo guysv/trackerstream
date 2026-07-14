@@ -1,11 +1,16 @@
-# trackerstream TLS endpoint (static).
+# trackerstream TLS endpoint (near-static).
 #
-# The Node.js control-plane API was retired with the Go cutover: catalog/search and
-# IPNS distribution moved entirely into libp2p (custom DHT + gossipsub on tsnode), and
-# clients no longer make any HTTPS request to the box. Caddy is kept ONLY to hold a
-# valid cert + a 200 on :443 for the domain (uptime probes, ACME renewal) — there is no
-# backend to proxy anymore. coturn/STUN (:3478) and the libp2p swarm (:4001) are direct,
-# not behind Caddy.
+# The Node.js control-plane API was retired with the Go cutover: catalog/search and IPNS
+# distribution moved entirely into libp2p (custom DHT + gossipsub on tsnode), and the DESKTOP
+# client still makes no HTTPS request to the box — it bootstraps from the multiaddrs baked
+# into packages/config.
+#
+# The web client cannot: go-libp2p regenerates its WebRTC TLS cert on every process start, so
+# the /certhash/... in the master's browser-dialable multiaddr changes on every seed restart.
+# A browser therefore has to LOOK UP the live addr at page load — that, and nothing else, is
+# what the one proxied route below (/bootstrap.json -> tsedge) exists for. Everything else
+# here is still static. coturn/STUN (:3478) and the libp2p swarm (:5478) remain direct, not
+# behind Caddy.
 #
 # This is a TEMPLATE: deploy/setup-tls.sh renders ${TS_DOMAIN} (envsubst) to the
 # literal hostname into /etc/caddy/Caddyfile before starting Caddy. To run by hand:
@@ -31,6 +36,16 @@ ${TS_DOMAIN} {
 		root * /var/www/trackerstream
 		rewrite * /p.html
 		file_server
+	}
+
+	# Browser bootstrap (tsedge, :5090). The ONE dynamic route: the master's live
+	# webrtc-direct multiaddr + ephemeral TURN credentials, re-fetched by every web client on
+	# every page load (and again on any dial failure — a seed restart rotates the certhash
+	# mid-TTL). Deliberately NOT proxied to tsnode's RPC: that surface is loopback-only by
+	# design (unauthenticated block/put + pin/rm + name/publish), so it must never be exposed.
+	# tsedge is a stateless read-only projection of it.
+	handle /bootstrap.json {
+		reverse_proxy 127.0.0.1:5090
 	}
 
 	handle {

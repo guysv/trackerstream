@@ -54,8 +54,29 @@ export const BOOTSTRAP_MULTIADDRS = MASTER_PEER_ID
     ]
   : [];
 
+// Browser bootstrap endpoint (tsedge, proxied by Caddy — deploy/systemd/trackerstream-edge.service).
+//
+// The BOOTSTRAP_MULTIADDRS above are baked into the desktop build and stay valid forever,
+// because TCP and QUIC identify the master by its stable PeerId alone. A browser gets
+// neither transport: js-libp2p can only dial the master over webrtc-direct, whose multiaddr
+// embeds a /certhash/<hash> of the node's WebRTC TLS certificate — and go-libp2p regenerates
+// that certificate on EVERY process start. The correct multiaddr is therefore not knowable at
+// build time: it changes each time the seed restarts.
+//
+// So a browser client MUST:
+//   1. fetch this URL on boot, before it dials anything, and
+//   2. RE-fetch it whenever a dial fails — a restart rotates the certhash mid-TTL, which
+//      makes a previously-good addr permanently undialable. Retrying the cached addr is
+//      guaranteed to fail; only a re-fetch recovers.
+//
+// Response: {peerId, addrs[] (webrtc-direct, public, /p2p-suffixed), iceServers[], ttl}.
+// iceServers carries ephemeral (HMAC, ~1h) TURN credentials — never a static one.
+export const BOOTSTRAP_URL = `https://${MASTER_HOST}/bootstrap.json`;
+
 // STUN/TURN endpoint for NAT traversal (coturn; circuit-relay v2 + DCUtR are the
 // primary path, this is the symmetric-NAT fallback). Hostname-based for durability.
+// Browsers do NOT use this constant — they take the iceServers array from BOOTSTRAP_URL,
+// because a browser needs credentials, not just a hostname.
 export const STUN_PORT = 3478;
 export const STUN_ENDPOINT = `${MASTER_HOST}:${STUN_PORT}`;
 

@@ -19,6 +19,13 @@ Environment=TS_REPO=/srv/trackerstream/tsnode
 Environment=TS_SWARM_PORT=5478
 # Kubo-compatible RPC on the same loopback addr the ingest + API expect (KUBO_API).
 Environment=TS_RPC=127.0.0.1:5001
+# Browser-dialable transport. A browser cannot speak TCP or QUIC to us, so without this the
+# web client has no way in at all; webrtc-direct is the one transport js-libp2p can dial
+# without a signalling server. It multiplexes onto the QUIC UDP socket we already bind, so
+# there is NO new port and NO new ufw rule (5478/udp is already open — install.sh [7/8]).
+# The certhash in the resulting multiaddr is regenerated on every process start, which is
+# precisely why browsers must discover it at runtime (trackerstream-edge → /bootstrap.json).
+Environment=TS_LISTEN_EXTRA=/ip4/0.0.0.0/udp/5478/webrtc-direct
 ExecStart=/usr/local/bin/tsnode --role server
 Restart=on-failure
 RestartSec=5

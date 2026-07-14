@@ -1,0 +1,49 @@
+[Unit]
+Description=trackerstream browser bootstrap endpoint (tsedge) — /bootstrap.json for the web client
+# Requires= (not just Wants=): tsedge has nothing to serve without the node's loopback RPC,
+# and its whole job is re-publishing that node's live webrtc-direct certhash. If the node is
+# stopped deliberately, the edge should go with it.
+After=trackerstream-node.service
+Requires=trackerstream-node.service
+
+[Service]
+Type=simple
+User=trackerstream
+Group=trackerstream
+# Upstream = the node's loopback RPC (TS_RPC in trackerstream-node.service). Keep in sync.
+Environment=TS_RPC=127.0.0.1:5001
+# Loopback-only: Caddy terminates TLS and reverse-proxies /bootstrap.json here. Nothing
+# should reach this port from outside the box, so there is no ufw rule for it.
+Environment=TSEDGE_LISTEN=127.0.0.1:5090
+Environment=TS_TURN_HOST=trackerstream.xyz
+ExecStart=/usr/local/bin/tsedge
+# Restart=always (the node unit uses on-failure): tsedge is stateless and holds nothing, so
+# there is no such thing as a "clean" exit worth respecting — if it is not serving, browsers
+# cannot bootstrap at all. Always bring it back.
+Restart=always
+RestartSec=5
+
+# Sandboxing. The node unit cannot take most of this (it owns the datastore and needs the
+# write paths); tsedge reads ONE file, opens ONE loopback socket, and keeps no state — so it
+# runs with the filesystem read-only and no ability to gain privilege. This is the payoff for
+# splitting it out of the node: the public-facing process is the one with nothing to lose.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# The coturn use-auth-secret shared secret (install.sh [5/8] makes it group-readable by
+# trackerstream). Unreadable = tsedge degrades to STUN-only rather than failing.
+ReadOnlyPaths=/etc/trackerstream
+
+[Install]
+WantedBy=multi-user.target
