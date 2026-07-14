@@ -34,6 +34,7 @@ func main() {
 	rpcAddr := flag.String("rpc", envOr("TS_RPC", "127.0.0.1:5099"), "kubo-compatible RPC listen addr")
 	bootstrap := flag.String("bootstrap", os.Getenv("TS_BOOTSTRAP"), "comma-separated bootstrap multiaddrs")
 	noNATPortMap := flag.Bool("no-natportmap", envOrBool("TS_NO_NATPORTMAP", false), "disable client UPnP/NAT-PMP port mapping (fall back to relay+DCUtR)")
+	listenExtra := flag.String("listen-extra", os.Getenv("TS_LISTEN_EXTRA"), "comma-separated extra listen multiaddrs, appended to the role defaults (e.g. /ip4/0.0.0.0/udp/5478/webrtc-direct)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -41,6 +42,14 @@ func main() {
 
 	cfg := tsnode.DefaultConfig(tsnode.Role(*role), *repo, *swarmPort)
 	cfg.DisableNATPortMap = *noNATPortMap
+	// Browser-dialable transports (ws / webtransport / webrtc-direct) are already registered by
+	// go-libp2p's default transport set — we simply never listened on one. Appending an addr here
+	// is the whole opt-in; webrtc-direct shares the QUIC UDP port when one is already open.
+	for _, s := range strings.Split(*listenExtra, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			cfg.ListenAddrs = append(cfg.ListenAddrs, s)
+		}
+	}
 	if *bootstrap != "" {
 		for _, s := range strings.Split(*bootstrap, ",") {
 			if s = strings.TrimSpace(s); s != "" {

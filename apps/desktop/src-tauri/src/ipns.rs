@@ -181,4 +181,43 @@ mod tests {
             .expect("Go-signed IPNS record must verify under the Rust path");
         assert_eq!(cid.to_string(), FIXTURE_CID);
     }
+
+    // The browser web client signs its OWN IPNS records (it has no Go keystore to delegate to),
+    // so JS-signed records must verify here exactly as Go-signed ones do — otherwise a playlist
+    // published from a browser is invisible to every desktop.
+    //
+    // Reads the SAME frozen vector as node/ipns_jsinterop_test.go, so the Go and Rust verifiers
+    // cannot silently drift apart on what a browser is allowed to emit.
+    #[test]
+    fn verifies_a_record_signed_by_the_js_web_client() {
+        const FIXTURE: &str = include_str!("../../../../node/testdata/ipns_js_record.json");
+        let fx: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture is json");
+        let name = fx["name"].as_str().expect("fixture.name");
+        let record_b64 = fx["recordB64"].as_str().expect("fixture.recordB64");
+        let want_seq = fx["sequence"].as_u64().expect("fixture.sequence");
+        let want_value = fx["value"].as_str().expect("fixture.value");
+
+        let (cid, seq) = verify_b64_seq(name, record_b64)
+            .expect("JS-signed IPNS record must verify under the Rust path");
+        assert_eq!(seq, want_seq, "sequence must survive the JS -> Rust boundary");
+        // The JS signer writes the `/ipfs/<cid>` path form (what Go's signIPNS emits and what
+        // prod records carry), so this also pins that rust_ipns unwraps the path, not just a
+        // bare CID string.
+        assert_eq!(format!("/ipfs/{cid}"), want_value);
+    }
+
+    // A JS-signed record must not validate under someone else's name — the property the
+    // untrusted gossip topic depends on once browsers can publish onto it.
+    #[test]
+    fn rejects_a_js_record_under_the_wrong_name() {
+        const FIXTURE: &str = include_str!("../../../../node/testdata/ipns_js_record.json");
+        let fx: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture is json");
+        let record_b64 = fx["recordB64"].as_str().expect("fixture.recordB64");
+        // The prod catalog publisher — a real name, but not this record's signer.
+        const OTHER: &str = "12D3KooWDb53qFZvANj5kDCr3riMhT2HJG32i5xqFKhvBtzh7wPC";
+        assert!(
+            verify_b64(OTHER, record_b64).is_err(),
+            "a JS-signed record verified under the WRONG name — the signature check is not binding"
+        );
+    }
 }

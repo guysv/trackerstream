@@ -17,10 +17,6 @@
 //
 // DETERMINISM + claxon-compat are asserted by test/v4-roundtrip.ts (two bakes -> identical roots) and
 // the Rust flac_decode_matches_bake interop test (fixtures via test/gen-flac-fixtures.ts).
-import { createRequire } from "node:module";
-
-const require = createRequire(import.meta.url);
-
 /** Pinned encoder identity — bump only with a full corpus re-bake (every FLAC leaf CID changes). */
 export const FLAC_CODEC = 1; // SampleV4.encCodec value for FLAC-compressed leaves
 export const FLAC_RAW = 0; // encCodec value for uncompressed (planar native) leaves
@@ -37,15 +33,32 @@ let Decoder: any = null;
 /** Load + ready the libFLAC module. Idempotent; MUST be awaited before flacEncode/flacDecode
  *  (buildDagV4/reassembleV4 do this at their entry). */
 export async function initFlac(): Promise<void> {
+  await initFlacDecoder();
+  if (Encoder) return;
+  Encoder = interop(await import("libflacjs/lib/encoder.js")).Encoder;
+}
+
+/** Decode-only init. Split out because ONLY the bake encodes: a client (desktop or browser) just
+ *  decodes v4 leaves. Keeping the encoder off this path means a browser bundle never pulls in
+ *  libflacjs/lib/encoder.js at all. */
+export async function initFlacDecoder(): Promise<void> {
   if (Flac) return;
-  const F = require("libflacjs/dist/libflac.js"); // asm.js (pure JS)
-  Encoder = require("libflacjs/lib/encoder.js").Encoder;
-  Decoder = require("libflacjs/lib/decoder.js").Decoder;
+  // Dynamic import, NOT createRequire: this module has to load in a browser bundle too. Specifiers
+  // MUST stay literal — a variable specifier is opaque to bundlers, which then leave the bare name
+  // for the browser to resolve, and it can't.
+  const F = interop(await import("libflacjs/dist/libflac.js")); // asm.js (pure JS)
+  Decoder = interop(await import("libflacjs/lib/decoder.js")).Decoder;
   await new Promise<void>((res) => {
     if (F.isReady && F.isReady()) return res();
     F.on("ready", () => res());
   });
   Flac = F;
+}
+
+// libflacjs is CJS, so the namespace carries module.exports on `.default` under both Node-ESM and a
+// bundler's interop; fall back to the namespace itself for interop shims that re-export directly.
+function interop(ns: any): any {
+  return ns?.default ?? ns;
 }
 
 function ready(): void {

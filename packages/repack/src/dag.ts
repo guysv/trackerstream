@@ -18,7 +18,7 @@ import * as dagCbor from "@ipld/dag-cbor";
 import { cdcChunks, DEFAULT_CDC, type CdcConfig } from "./cdc.ts";
 import { sampleRegions, sampleSlots, type Format } from "./parse.ts";
 import { computeSeekTables } from "./seek.ts";
-import { flacEncode, flacDecode, FLAC_CODEC, FLAC_RAW, initFlac } from "./flac.ts";
+import { flacEncode, flacDecode, FLAC_CODEC, FLAC_RAW, initFlac, initFlacDecoder } from "./flac.ts";
 
 const RAW_CODE = 0x55;
 const DAG_CBOR_CODE = 0x71;
@@ -1061,7 +1061,7 @@ export async function reassembleV4(
   get: BlockGetter,
   opts: { verify?: boolean } = {},
 ): Promise<{ bytes: Uint8Array; manifest: ManifestV4 }> {
-  await initFlac();
+  await initFlacDecoder(); // reassembly only ever decodes — don't drag the encoder into a client bundle
   const verify = opts.verify ?? true;
   const manifest = dagCbor.decode<ManifestV4>(await fetchVerified(root, get, verify));
   if (manifest.v !== MANIFEST_V4) throw new Error(`not a v4 manifest (v=${manifest.v})`);
