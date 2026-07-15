@@ -10,14 +10,20 @@
 // half: a browser that never `provide`s what it holds is invisible as a source, so the mesh has
 // nothing to offload FROM.
 //
-// Note the hard limit behind all of this: go-libp2p has no private-to-private WebRTC transport, so a
-// browser can never reach a NATed desktop — only a publicly-reachable one. See the plan.
+// TIER 3 — NATed desktops, over private-to-private WebRTC (/p2p-circuit/webrtc): the tsnode now runs
+// the webrtcprivate transport (node.go), so a browser signals SDP across the seed's relay and
+// hole-punches to a DIRECT datachannel with a desktop that has no browser-dialable address of its
+// own. This is what lifts the old "a browser can never reach a NATed desktop" limit.
 import type { Helia } from "helia";
 import type { Libp2p } from "libp2p";
 import { CID } from "multiformats/cid";
 
-/** A browser cannot dial TCP or QUIC. Anything else in a provider's address list is noise to us. */
-const dialable = (addr: string): boolean => /\/(webrtc-direct|webrtc|wss|tls\/ws|ws)(\/|$)/.test(addr);
+/** A browser cannot dial TCP or QUIC. Anything else in a provider's address list is noise to us.
+ *  The `webrtc` branch matches BOTH a direct `/webrtc-direct` (public desktop, Tier 1) and the
+ *  `/webrtc` inside a `/p2p-circuit/webrtc/…` relayed address (NATed desktop, Tier 3) — libp2p picks
+ *  the direct one when both are on offer, and falls to the circuit path otherwise. */
+const dialable = (addr: string): boolean =>
+  /\/(webrtc-direct|p2p-circuit\/webrtc|webrtc|wss|tls\/ws|ws)(\/|$)/.test(addr);
 
 /** How long to hunt for providers before giving up and letting bitswap ask the seed anyway. This is
  *  a best-effort warm, not a dependency: playback must never wait on the DHT. */
@@ -46,7 +52,8 @@ export async function warmRoot(libp2p: Libp2p, helia: Helia, root: string): Prom
       const id = prov.id.toString();
       if (id === libp2p.peerId.toString() || dialed.has(id)) continue;
       const addrs = prov.multiaddrs.filter((m) => dialable(m.toString()));
-      if (!addrs.length) continue; // a NATed desktop — unreachable from a browser, by construction
+      if (!addrs.length) continue; // no browser-reachable address at all (only a bare TCP/QUIC desktop
+      // with neither a public webrtc-direct nor a /p2p-circuit/webrtc relay address)
       dialed.add(id);
       // Don't await: one slow provider must not hold up the others, and nothing downstream needs
       // the connection to exist — bitswap will use it if it lands in time.
