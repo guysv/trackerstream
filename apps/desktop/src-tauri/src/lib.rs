@@ -250,6 +250,12 @@ fn classify_transport(addrs: &[String]) -> (bool, String) {
     }
     let direct: Vec<&String> = addrs.iter().filter(|a| !a.contains("/p2p-circuit")).collect();
     match direct.first() {
+        // Order matters: "/webrtc-direct" also contains "/webrtc", so match it first. A bare
+        // "/webrtc" here is a hole-punched private-to-private WebRTC conn (webrtcprivate) — it is
+        // DIRECT, so it must not read as relayed (the "/p2p-circuit" signalling conn is filtered out
+        // above, leaving this direct addr, which is why all_relayed is false).
+        Some(a) if a.contains("/webrtc-direct") => (false, "webrtc-direct".into()),
+        Some(a) if a.contains("/webrtc") => (false, "webrtc".into()),
         Some(a) if a.contains("/quic") => (false, "quic".into()),
         Some(a) if a.contains("/tcp") => (false, "tcp".into()),
         Some(_) => (false, "direct".into()),
