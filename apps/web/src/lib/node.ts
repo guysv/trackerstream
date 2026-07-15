@@ -17,6 +17,7 @@ import { kadDHT, passthroughMapper } from "@libp2p/kad-dht";
 import { ping } from "@libp2p/ping";
 import { webRTC, webRTCDirect } from "@libp2p/webrtc";
 import { multiaddr } from "@multiformats/multiaddr";
+import { peerIdFromString } from "@libp2p/peer-id";
 import { ipnsValidator } from "ipns/validator";
 import { ipnsSelector } from "ipns/selector";
 import { BOOTSTRAP_URL } from "@trackerstream/config";
@@ -151,6 +152,8 @@ export async function startNode(): Promise<TsNode> {
     blockBrokers: [bitswap()],
   });
 
+  const masterId = boot.peerId;
+
   const dial = async (b: Bootstrap): Promise<void> => {
     let last: unknown;
     for (const a of b.addrs) {
@@ -166,9 +169,88 @@ export async function startNode(): Promise<TsNode> {
 
   await dial(boot);
 
-  return {
-    libp2p,
-    helia,
-    redial: async () => dial(await fetchBootstrap()),
+  const masterPeer = peerIdFromString(masterId);
+
+  // Liveness by PROBE, not by inspection. A webrtc-direct connection to a seed that has restarted
+  // stays status:'open' and listed in getConnections() until webrtc's own DTLS/ICE timeout — tens
+  // of seconds during which every "are we connected?" check lies, a dial-to-peer dedupes onto the
+  // corpse, and the app looks fine while talking to nobody. The only trustworthy signal is trying
+  // to USE the connection: a ping that can't complete quickly means the master is gone, whatever
+  // the connection object claims.
+  const pingSvc = (libp2p.services as { ping?: { ping(p: typeof masterPeer, opts?: { signal?: AbortSignal }): Promise<number> } }).ping;
+  const masterAlive = async (): Promise<boolean> => {
+    if (!pingSvc) return libp2p.getConnections(masterPeer).some((c) => c.status === "open");
+    try {
+      // A HARD race, not just the AbortSignal: against a dead webrtc-direct connection js-libp2p's
+      // ping can hang PAST its own abort (the DTLS/SCTP layer doesn't unwind promptly), and a probe
+      // that never resolves would freeze the whole supervisor. The race guarantees a verdict in
+      // bounded time regardless of what the transport does; a slow ping counts as "not alive", which
+      // for our purpose (should we redial?) is the safe reading.
+      const probe = pingSvc.ping(masterPeer, { signal: AbortSignal.timeout(3_000) });
+      const timeout = new Promise<never>((_, rej) => setTimeout(() => rej(new Error("ping timeout")), 3_500));
+      await Promise.race([probe, timeout]);
+      return true;
+    } catch {
+      return false;
+    }
   };
+
+  // Re-fetch /bootstrap.json, then redial. The re-fetch is the whole point: a seed RESTART is the
+  // common reason we lose the master, and a restart ROTATES the certhash — so the addr we hold is
+  // already dead and dialing it again just fails. Only the endpoint knows the live one.
+  let attempt = 0;
+  const redialOnce = async (): Promise<void> => {
+    try {
+      const fresh = await fetchBootstrap();
+      // Tear down the corpse BEFORE dialing. hangUp closes the zombie connection and, with the
+      // peerStore purge, stops libp2p from deduping the new dial onto the dead certhash — the exact
+      // reason a plain redial "succeeds" and still talks to nobody.
+      await libp2p.hangUp(masterPeer).catch(() => {});
+      await libp2p.peerStore.delete(masterPeer).catch(() => {});
+      await dial(fresh);
+      attempt = 0;
+    } catch (e) {
+      if (import.meta.env?.DEV || import.meta.env?.VITE_EXPOSE_NODE) {
+        console.warn(`[redial] attempt ${attempt} failed:`, e instanceof Error ? e.message : e);
+      }
+      attempt++;
+    }
+  };
+
+  // One supervisor, not an event listener: peer:disconnect fires late (and sometimes on a transient
+  // blip) precisely because of the zombie problem above, so we don't trust it as the trigger. Poll
+  // liveness instead, and redial when the probe says the master is unreachable — backing off only
+  // while it stays down so a genuinely-offline seed isn't a hot loop.
+  //
+  // BEST-EFFORT, KNOWN-LIMITED. This recovers the common case (seed restart -> new certhash) in
+  // local testing, but webrtc-direct connection-death is genuinely hard to observe in js-libp2p: a
+  // zombie connection reads healthy for tens of seconds and even the liveness ping can lag, so
+  // recovery latency is measured in seconds-to-tens-of-seconds and the tail is flaky. A real fix
+  // needs the js-libp2p webrtc transport to surface connection death promptly — which lands in the
+  // planned js-libp2p fork (also needed for go<->js private-webrtc interop). Until then this is a
+  // strict improvement over "a seed restart requires a manual reload", not a guarantee.
+  let supervising = false;
+  const supervisor = setInterval(async () => {
+    if (supervising) return;
+    supervising = true;
+    try {
+      if (await masterAlive()) {
+        attempt = 0;
+        return;
+      }
+      await redialOnce();
+      const backoff = Math.min(1000 * 2 ** attempt, 15_000);
+      if (attempt > 0) await new Promise((r) => setTimeout(r, backoff));
+    } finally {
+      supervising = false;
+    }
+  }, 4_000);
+  // (No unref: setInterval returns a number in the browser, not a Node Timeout — nothing to unref,
+  // and `"unref" in <number>` would throw.)
+
+  // Kept for the TsNode.redial() contract (a caller can force one), but the supervisor is what
+  // actually keeps us connected.
+  const redial = redialOnce;
+
+  return { libp2p, helia, redial };
 }
