@@ -35,6 +35,7 @@ func main() {
 	bootstrap := flag.String("bootstrap", os.Getenv("TS_BOOTSTRAP"), "comma-separated bootstrap multiaddrs")
 	noNATPortMap := flag.Bool("no-natportmap", envOrBool("TS_NO_NATPORTMAP", false), "disable client UPnP/NAT-PMP port mapping (fall back to relay+DCUtR)")
 	listenExtra := flag.String("listen-extra", os.Getenv("TS_LISTEN_EXTRA"), "comma-separated extra listen multiaddrs, appended to the role defaults (e.g. /ip4/0.0.0.0/udp/5478/webrtc-direct)")
+	stun := flag.String("stun", os.Getenv("TS_STUN_SERVERS"), "comma-separated STUN servers for private-to-private WebRTC (overrides the role default; an explicit empty value disables the webrtcprivate transport). Unset keeps the client default.")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -42,6 +43,22 @@ func main() {
 
 	cfg := tsnode.DefaultConfig(tsnode.Role(*role), *repo, *swarmPort)
 	cfg.DisableNATPortMap = *noNATPortMap
+	// Only override the role's STUN default when --stun or TS_STUN_SERVERS was actually provided;
+	// an explicit (even empty) value replaces the default, so `--stun=` disables the transport.
+	stunSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "stun" {
+			stunSet = true
+		}
+	})
+	if _, envSet := os.LookupEnv("TS_STUN_SERVERS"); stunSet || envSet {
+		cfg.STUNServers = nil
+		for _, s := range strings.Split(*stun, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				cfg.STUNServers = append(cfg.STUNServers, s)
+			}
+		}
+	}
 	// Browser-dialable transports (ws / webtransport / webrtc-direct) are already registered by
 	// go-libp2p's default transport set — we simply never listened on one. Appending an addr here
 	// is the whole opt-in; webrtc-direct shares the QUIC UDP port when one is already open.

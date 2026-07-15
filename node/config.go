@@ -96,6 +96,13 @@ type Config struct {
 	// relay+DCUtR for NAT traversal, exactly as it did before that feature landed.
 	// Server-irrelevant (the master never maps). Off by default (mapping stays enabled).
 	DisableNATPortMap bool
+	// STUNServers are the ICE STUN servers the private-to-private WebRTC transport
+	// (webrtcprivate) uses to gather server-reflexive candidates when a browser dials a
+	// NATed desktop over /p2p-circuit/webrtc. STUN only — never TURN (see deploy/turnserver.conf):
+	// STUN tells a peer its own public address for a DIRECT connection; it relays no media.
+	// Empty disables the transport. Client-relevant only (the master is reached over webrtc-direct
+	// directly and never needs to be dialled over a relay).
+	STUNServers []string
 }
 
 // DefaultConfig builds a config for a role. swarmPort 0 = OS-assigned (ephemeral);
@@ -123,5 +130,19 @@ func DefaultConfig(role Role, repo string, swarmPort int) Config {
 			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/webrtc-direct", swarmPort),
 			fmt.Sprintf("/ip6/::/udp/%d/webrtc-direct", swarmPort),
 		},
+		// Only the client (a potentially-NATed desktop) listens for private-to-private WebRTC
+		// dials from browsers; the master is reached directly. STUN-only, no TURN.
+		STUNServers: stunServersFor(role),
 	}
+}
+
+// stunServersFor returns the default ICE STUN servers for a role. Clients need STUN to gather
+// server-reflexive candidates for private-to-private WebRTC; the server does not. Overridable at
+// deploy via the --stun flag / TS_STUN_SERVERS env (cmd/tsnode/main.go); an explicit empty value
+// disables the webrtcprivate transport.
+func stunServersFor(role Role) []string {
+	if role == RoleServer {
+		return nil
+	}
+	return []string{"stun:trackerstream.xyz:3478"}
 }

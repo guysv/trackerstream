@@ -35,7 +35,9 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
+	webrtcprivate "github.com/libp2p/go-libp2p/p2p/transport/webrtcprivate"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/pion/webrtc/v4"
 )
 
 // Node is the assembled trackerstream node: a go-libp2p host with a custom-prefix
@@ -216,6 +218,15 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 			self, _ := peer.IDFromPrivateKey(priv)
 			opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(donorPeerSource(&idht, self, bootstrap)))
 		}
+		// Make a NATed client discoverable over private-to-private WebRTC: rewrite the advertised
+		// addrs so each AutoRelay "/p2p-circuit" reservation also surfaces as "…/p2p-circuit/webrtc"
+		// (the address a browser dials to hole-punch to us). Without this go-libp2p advertises only a
+		// bare, undialable "/webrtc" and never combines it with the reservation. Gated on the
+		// webrtcprivate transport being enabled; self-gates to Private reachability (circuit addrs
+		// only exist then). See webrtcCircuitAddrsFactory.
+		if len(cfg.STUNServers) > 0 {
+			opts = append(opts, libp2p.AddrsFactory(webrtcCircuitAddrsFactory))
+		}
 		// UPnP / NAT-PMP: opportunistically map the swarm ports on a UPnP-capable home
 		// router so a NATed client becomes directly reachable — no relay/DCUtR needed.
 		// When it succeeds AutoNAT flips to Public, which cascades: DHT self-promotion
@@ -251,6 +262,22 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("libp2p host: %w", err)
+	}
+
+	// Private-to-private WebRTC (webrtcprivate): lets a browser dial THIS node over
+	// /p2p-circuit/webrtc when it's NATed and thus not browser-dialable directly. The transport
+	// listens on /webrtc (over the existing AutoRelay reservation) and hole-punches to a DIRECT
+	// datachannel for bitswap. Gated on STUN being configured, which stunServersFor restricts to
+	// the client role — the master is reached over webrtc-direct and never needs this. gater=nil:
+	// we run no connection gater (the overlay is private by DHT-prefix, not by dial filtering).
+	if len(cfg.STUNServers) > 0 {
+		ice := make([]webrtc.ICEServer, 0, len(cfg.STUNServers))
+		for _, s := range cfg.STUNServers {
+			ice = append(ice, webrtc.ICEServer{URLs: []string{s}})
+		}
+		if _, err := webrtcprivate.AddTransport(h, nil, ice); err != nil {
+			return nil, fmt.Errorf("webrtcprivate transport: %w", err)
+		}
 	}
 
 	bstore := blockstore.NewBlockstore(datastore)
@@ -750,6 +777,51 @@ func loadOrCreateKey(repo string) (crypto.PrivKey, error) {
 		return nil, err
 	}
 	return priv, os.WriteFile(path, data, 0o600)
+}
+
+// webrtcCircuitAddrsFactory rewrites the host's advertised addresses so a NATed client is
+// discoverable over private-to-private WebRTC. go-libp2p advertises the webrtcprivate listener as a
+// bare, undialable "/webrtc" and never combines it with the AutoRelay "/p2p-circuit" reservation
+// addresses. This factory (a) drops the bare "/webrtc" — nothing can dial it — and (b) for every
+// address ending in "/p2p-circuit", additionally advertises "…/p2p-circuit/webrtc", which is what a
+// browser dials to hole-punch to us (webrtcprivate CanDial requires circuit + webrtc). The address
+// manager only surfaces "/p2p-circuit" addrs while reachability is Private, so this self-gates to
+// genuinely-NATed desktops; a publicly-reachable one keeps only its direct webrtc-direct address.
+func webrtcCircuitAddrsFactory(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+	out := make([]multiaddr.Multiaddr, 0, len(addrs)+1)
+	seen := make(map[string]struct{}, len(addrs)+1)
+	add := func(a multiaddr.Multiaddr) {
+		s := a.String()
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		out = append(out, a)
+	}
+	for _, a := range addrs {
+		if isBareWebRTCAddr(a) {
+			continue
+		}
+		add(a)
+		if endsInCircuit(a) {
+			add(a.Encapsulate(webrtcprivate.WebRTCAddr))
+		}
+	}
+	return out
+}
+
+// isBareWebRTCAddr reports whether a is the lone "/webrtc" listener address (undialable without a
+// relay prefix, so we never advertise it).
+func isBareWebRTCAddr(a multiaddr.Multiaddr) bool {
+	ps := a.Protocols()
+	return len(ps) == 1 && ps[0].Code == multiaddr.P_WEBRTC
+}
+
+// endsInCircuit reports whether a's last component is "/p2p-circuit" (an AutoRelay reservation
+// address, before any transport is encapsulated onto it).
+func endsInCircuit(a multiaddr.Multiaddr) bool {
+	ps := a.Protocols()
+	return len(ps) > 0 && ps[len(ps)-1].Code == multiaddr.P_CIRCUIT
 }
 
 // serverResourceManager builds a resource manager with raised System/Transient/Peer conn +

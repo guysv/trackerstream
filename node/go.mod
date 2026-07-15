@@ -19,6 +19,7 @@ require (
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/multiformats/go-multistream v0.6.1
+	github.com/pion/webrtc/v4 v4.1.2
 	golang.org/x/time v0.12.0
 )
 
@@ -116,7 +117,6 @@ require (
 	github.com/pion/transport/v3 v3.0.7 // indirect
 	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/pion/turn/v4 v4.0.2 // indirect
-	github.com/pion/webrtc/v4 v4.1.2 // indirect
 	github.com/polydawn/refmt v0.90.0 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
@@ -162,4 +162,4 @@ require (
 // to go-libp2p v0.48.0's embedded packages.
 exclude github.com/libp2p/go-libp2p/core v0.43.0-rc2
 
-replace github.com/libp2p/go-libp2p => github.com/guysv/go-libp2p v0.0.0-20260630232212-5dba8cc89b88
+replace github.com/libp2p/go-libp2p => github.com/guysv/go-libp2p v0.0.0-20260715193606-b7e244a639a7
