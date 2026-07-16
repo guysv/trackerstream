@@ -229,7 +229,7 @@ export class WebClient implements NodeClient {
 
   playlists = {
     search: (q: string): Promise<PlaylistMeta[]> => this.pl.search(q) as Promise<PlaylistMeta[]>,
-    list: (_scope: PlaylistScope): Promise<PlaylistMeta[]> => this.pl.list() as Promise<PlaylistMeta[]>,
+    list: (scope: PlaylistScope): Promise<PlaylistMeta[]> => this.pl.list(scope) as Promise<PlaylistMeta[]>,
     hold: (name: string, held: boolean): Promise<void> => this.pl.hold(name, held),
     get: (name: string): Promise<PlaylistDetail | null> => this.pl.get(name) as Promise<PlaylistDetail | null>,
     create: (title: string, tracks: TrackTuple[]): Promise<PlaylistMeta> =>

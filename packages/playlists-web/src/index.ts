@@ -231,8 +231,14 @@ export class Playlists {
 
   // ---- the NodeClient.playlists surface ----
 
-  async list(): Promise<Meta[]> {
-    return (await this.store.list()).map(metaOf);
+  /** Scope mirrors the desktop's playlist_list: "library" = what you back (mine ∪ held), "seen" = the
+   *  gossip-cached discover tier (neither mine nor held), "all" = everything. Without this the Library
+   *  tab would show playlists the network merely gossiped to us — they are NOT ours (is_mine=0). */
+  async list(scope: "library" | "seen" | "all" = "all"): Promise<Meta[]> {
+    const rows = (await this.store.list()).map(metaOf);
+    if (scope === "library") return rows.filter((m) => m.isMine || m.held);
+    if (scope === "seen") return rows.filter((m) => !m.isMine && !m.held);
+    return rows;
   }
 
   async search(q: string): Promise<Meta[]> {
