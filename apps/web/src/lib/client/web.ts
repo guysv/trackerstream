@@ -25,11 +25,12 @@ import type {
   Unsub,
 } from "@trackerstream/ui/client";
 import { unixfs } from "@helia/unixfs";
+import { peerIdFromString } from "@libp2p/peer-id";
 import { CID } from "multiformats/cid";
 import { resolveIpns } from "../ipns.ts";
 import { startNode, type TsNode } from "../node.ts";
 import { getSample, getSkeleton, startStream } from "../stream.ts";
-import { Provider, warmRoot } from "../offload.ts";
+import { Provider, dialable, warmRoot } from "../offload.ts";
 
 export class WebClient implements NodeClient {
   readonly caps: Capabilities = {
@@ -40,9 +41,10 @@ export class WebClient implements NodeClient {
     // navigator.mediaSession routes hardware media keys to the audio-playing tab. What we cannot do
     // is grab them system-wide while another app is focused — a weaker capability, not a missing one.
     globalMediaKeys: false,
-    // Needs a relay reservation to be dialable (Phase 5), and the master doesn't serve playlist-list
-    // anyway (client-only by design), so an empty answer here is CORRECT, not broken.
-    peerPlaylists: false,
+    // The browser now reserves on the master (see node.ts), so it is dialable AND serves
+    // "/trackerstream/playlist-list/1.0.0" like a desktop — it both answers and asks. (The seed still
+    // doesn't serve it by design; that peer just returns supported:false, which is a normal answer.)
+    peerPlaylists: true,
   };
 
   private readonly ts: TsNode;
@@ -124,8 +126,10 @@ export class WebClient implements NodeClient {
           connected: true,
           role: "other" as const,
         })),
-        // A browser is never publicly dialable.
-        reachable: false,
+        // Dialable once a relay reservation lands: getMultiaddrs() then carries a "…/p2p-circuit/webrtc"
+        // that other peers can reach us on (see node.ts). Before that it holds no dialable addr and this
+        // is false — honestly derived, not hardcoded.
+        reachable: this.ts.libp2p.getMultiaddrs().some((m) => dialable(m.toString())),
       };
     },
     peerDetail: async (id: string): Promise<PeerDetail> => {
@@ -235,16 +239,20 @@ export class WebClient implements NodeClient {
     ingestLink: (url: string): Promise<LinkStatus> => this.pl.ingestLink(url),
     copyLink: (name: string): Promise<string> => this.pl.copyLink(name),
     pending: (): Promise<string[]> => this.pl.pendingNames(),
-    // Beacon COUNTING (24h window, distinct origins) is not implemented yet; a browser leaf also
-    // sees fewer origins than a desktop. Report 0 rather than a wrong number — 0 already means
-    // "no beacon heard", which is normal for the first hour after startup.
-    backers: async (): Promise<Record<string, number>> => ({}),
+    // Distinct-origin backer counts over a 24h window, tallied from inbound beacons (the browser now
+    // counts, not just emits). A web leaf still sees fewer origins than a desktop; 0 means "no beacon
+    // heard", normal for the first hour after startup.
+    backers: (names: string[]): Promise<Record<string, number>> => this.pl.backers(names),
     // Play-time pin: the browser store has no decay/eviction racing playback (enforceBudget only
     // touches the seen tier, and a playing playlist is in the library), so there is nothing to pin.
     pin: async (): Promise<void> => {},
     played: (name: string): Promise<void> => this.pl.played(name),
-    ofPeer: async (): Promise<PeerPlaylists> => ({ supported: false, playlists: [] }),
-    request: async (): Promise<number> => 0,
+    ofPeer: async (id: string): Promise<PeerPlaylists> => {
+      const r = await this.pl.peerPlaylists(peerIdFromString(id), []);
+      return { supported: r.supported, playlists: r.playlists };
+    },
+    request: async (id: string, name: string): Promise<number> =>
+      (await this.pl.peerPlaylists(peerIdFromString(id), [name])).reannounced,
   };
 
   platform = {

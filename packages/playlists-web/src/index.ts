@@ -6,14 +6,30 @@
 // ever dials the author. That is what makes a browser (which cannot be dialled) a first-class
 // publisher rather than a second-class reader.
 import { peerIdFromString } from "@libp2p/peer-id";
+import type { PeerId, Stream } from "@libp2p/interface";
 import type { Libp2p } from "libp2p";
+import { lpStream } from "it-length-prefixed-stream";
 import { createIPNSRecord, marshalIPNSRecord, unmarshalIPNSRecord } from "./ipns-compat.ts";
 import { BEACON_TOPIC, PLAYLIST_TOPIC, decodePlaylistMsg, encodePlaylistMsg, validatePlaylistMsg, UnknownWireVersion } from "./wire.ts";
 import { DOC_VERSION, LIFETIME_MS, RENEW_MARGIN_SECS, docCid, encodeDoc, validateDoc, type PlaylistDoc, type TrackRef } from "./doc.ts";
 import { PlaylistStore, nowSecs, type Row } from "./store.ts";
 import { createKey, deleteKey, exportKeys, importKeys, loadKey, requestPersistence, type PlaylistKey } from "./keys.ts";
-import { encodeBeacon, nameHash8 } from "./beacon.ts";
+import { BeaconLedger, beaconHashHex, decodeBeacon, encodeBeacon, nameHash8 } from "./beacon.ts";
 import { buildLink, decodeEnvelope, parseLink } from "./link.ts";
+import {
+  decodeReq,
+  decodeResp,
+  encodeReq,
+  encodeResp,
+  PeerRateLimiter,
+  PL_MAX_ENTRIES,
+  PL_RESP_MAX,
+  PL_TITLE_MAX,
+  PL_WANT_MAX,
+  PLAYLIST_LIST_PROTOCOL,
+  ReannounceCooldown,
+  type PlaylistListEntry,
+} from "./playlistlist.ts";
 
 export { exportKeys, importKeys, requestPersistence } from "./keys.ts";
 export { buildLink, parseLink } from "./link.ts";
@@ -45,6 +61,17 @@ export interface Meta {
 
 export interface Detail extends Meta {
   items: { md5: string; modName: string; title: string }[];
+}
+
+/** One peer's disclosed playlist joined with our local library state. Structurally the UI's
+ *  PeerPlaylistEntry — duplicated (not imported) so this package stays UI-agnostic, as Meta is. */
+export interface PeerEntry {
+  name: string;
+  seq: number;
+  title: string;
+  have: boolean;
+  held: boolean;
+  mine: boolean;
 }
 
 function metaOf(r: Row): Meta {
@@ -84,6 +111,11 @@ export class Playlists {
    *  mesh just carried (node/playlist.go's playlistAnnounceWindow). */
   private lastSeen = new Map<string, number>();
   private pending = new Set<string>();
+  /** Serving-side guards for playlist-list (per-peer request bucket + per-name reannounce cooldown),
+   *  and the beacon backer ledger. All bounded — see playlistlist.ts / beacon.ts. */
+  private plRate = new PeerRateLimiter();
+  private plCooldown = new ReannounceCooldown();
+  private beacons = new BeaconLedger();
 
   static async create(libp2p: Libp2p, onChange: () => void): Promise<Playlists> {
     const p = new Playlists();
@@ -102,6 +134,7 @@ export class Playlists {
   stop(): void {
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
+    void this.libp2p.unhandle(PLAYLIST_LIST_PROTOCOL).catch(() => {});
   }
 
   private get pubsub(): any {
@@ -124,12 +157,31 @@ export class Playlists {
         return e instanceof UnknownWireVersion ? "ignore" : "reject";
       }
     });
-    ps.addEventListener("message", (ev: { detail: { topic: string; data: Uint8Array } }) => {
-      if (ev.detail.topic !== PLAYLIST_TOPIC) return;
-      void this.ingestWire(ev.detail.data).catch(() => {});
-    });
+    ps.addEventListener(
+      "message",
+      (ev: { detail: { topic: string; data: Uint8Array; from?: { toString(): string } } }) => {
+        if (ev.detail.topic === PLAYLIST_TOPIC) {
+          void this.ingestWire(ev.detail.data).catch(() => {});
+        } else if (ev.detail.topic === BEACON_TOPIC) {
+          // Count the beacon toward backer popularity. `from` is the StrictSign-authenticated origin
+          // (gossipsub verifies the signature before we ever see it), the same identity Go authenticates
+          // via GetFrom(); an unsigned message has no countable origin and is skipped.
+          this.recordBeacon(ev.detail.from?.toString(), ev.detail.data);
+        }
+      }
+    );
     ps.subscribe(PLAYLIST_TOPIC);
     ps.subscribe(BEACON_TOPIC);
+
+    // Serve peer-playlist disclosure — the browser's FIRST inbound libp2p stream handler. A reserved
+    // (dialable) web peer now answers "what playlists do you hold?" exactly like a desktop tsnode does.
+    await this.libp2p.handle(
+      PLAYLIST_LIST_PROTOCOL,
+      ({ stream, connection }: { stream: Stream; connection: { remotePeer: PeerId } }) => {
+        void this.handlePlaylistList(stream, connection.remotePeer);
+      },
+      { maxInboundStreams: 32, maxOutboundStreams: 64 }
+    );
   }
 
   /** Ingest a gossiped envelope. Re-verifies from scratch: the topic validator may have run on a
@@ -411,11 +463,112 @@ export class Playlists {
   /** "I hold these" — truncated name hashes, hourly. Cheap, and it makes web peers contribute to
    *  the backer counts desktop users see. */
   private async beaconOnce(): Promise<void> {
-    const rows = await this.store.list();
-    const mine = rows.filter((r) => (r.is_mine && r.published) || r.held);
+    const mine = await this.disclosureRows();
     if (!mine.length) return;
     const hashes = await Promise.all(mine.map((r) => nameHash8(r.name)));
     await this.pubsub.publish(BEACON_TOPIC, encodeBeacon(hashes)).catch(() => {});
+  }
+
+  // ---- peer-playlist disclosure (playlist-list) + beacon counting ----
+
+  /** The disclosure set: held ∪ published-mine, minus tombstones — what we re-announce, what we beacon,
+   *  and what we disclose on a playlist-list request. One definition so the three can never diverge. */
+  private async disclosureRows(): Promise<Row[]> {
+    return (await this.store.list()).filter((r) => !r.tombstoned && ((!!r.is_mine && !!r.published) || !!r.held));
+  }
+
+  /** Serve one playlist-list request: read the JSON request frame, force-reannounce the allowed
+   *  in-manifest `want` names (suppression-bypassing, cooldown-bounded), reply with the disclosure set.
+   *  A port of node/playlistlist.go's handlePlaylistList. */
+  private async handlePlaylistList(stream: Stream, remotePeer: PeerId): Promise<void> {
+    const now = nowSecs();
+    try {
+      if (!this.plRate.allow(remotePeer.toString(), now)) {
+        stream.abort(new Error("playlist-list: rate limited"));
+        return;
+      }
+      // maxDataLength bounds reads for the whole duplex; PL_RESP_MAX (256K) is the larger side. A
+      // request is additionally clamped at the JSON layer (want ≤ 64), so this is just an abuse ceiling.
+      const lp = lpStream(stream, { maxDataLength: PL_RESP_MAX });
+      const reqFrame = await lp.read();
+      const { want } = decodeReq(reqFrame.subarray());
+      const manifest = await this.disclosureRows();
+      const byName = new Map(manifest.map((r) => [r.name, r]));
+      let reannounced = 0;
+      for (const name of want) {
+        const row = byName.get(name); // only manifest names are servable — never a general re-gossip oracle
+        if (!row?.record_b64) continue;
+        if (!this.plCooldown.allow(name, now)) continue;
+        // Re-gossip the stored record+doc VERBATIM (never re-serialize: a future field we don't
+        // understand would drop and the doc would stop hashing to its record's CID).
+        await this.gossip(name, unb64(row.record_b64), new TextEncoder().encode(row.doc_json));
+        reannounced++;
+      }
+      const entries: PlaylistListEntry[] = manifest.slice(0, PL_MAX_ENTRIES).map((r) => ({
+        Name: r.name,
+        Seq: r.seq,
+        Title: (r.title ?? "").slice(0, PL_TITLE_MAX),
+      }));
+      await lp.write(encodeResp(entries, reannounced));
+      await stream.close();
+    } catch {
+      stream.abort(new Error("playlist-list: serve failed"));
+    }
+  }
+
+  /** Ask one connected peer for its disclosure set (optionally requesting a re-announce of `want`
+   *  names), joined with our local library state. `supported:false` (an old build or the seed) is a
+   *  normal answer, not an error. Mirrors node/playlistlist.go's PeerPlaylists. */
+  async peerPlaylists(
+    peerId: PeerId,
+    want: string[]
+  ): Promise<{ supported: boolean; playlists: PeerEntry[]; reannounced: number }> {
+    let stream: Stream;
+    try {
+      stream = await this.libp2p.dialProtocol(peerId, PLAYLIST_LIST_PROTOCOL);
+    } catch (e) {
+      if ((e as { name?: string })?.name === "UnsupportedProtocolError") {
+        return { supported: false, playlists: [], reannounced: 0 };
+      }
+      throw e;
+    }
+    let resp: { playlists: PlaylistListEntry[]; reannounced: number };
+    try {
+      const lp = lpStream(stream, { maxDataLength: PL_RESP_MAX });
+      await lp.write(encodeReq(want.slice(0, PL_WANT_MAX)));
+      const frame = await lp.read();
+      resp = decodeResp(frame.subarray());
+      await stream.close();
+    } catch (e) {
+      stream.abort(e instanceof Error ? e : new Error(String(e)));
+      throw e;
+    }
+    const local = new Map((await this.store.list()).map((r) => [r.name, r]));
+    const playlists: PeerEntry[] = resp.playlists.map((e) => {
+      const l = local.get(e.Name);
+      return { name: e.Name, seq: e.Seq, title: e.Title, have: !!l, held: !!l?.held, mine: !!l?.is_mine };
+    });
+    return { supported: true, playlists, reannounced: resp.reannounced };
+  }
+
+  /** Count an inbound beacon toward backer popularity, keyed by its authenticated origin. */
+  private recordBeacon(origin: string | undefined, data: Uint8Array): void {
+    if (!origin) return; // no authenticated origin (unsigned) — nothing countable, matches Go
+    let hashes: Uint8Array[];
+    try {
+      hashes = decodeBeacon(data);
+    } catch {
+      return; // unknown version or malformed — ignore (the signature was already verified by gossipsub)
+    }
+    this.beacons.record(origin, hashes, nowSecs());
+  }
+
+  /** Distinct-origin backer counts over the 24h window, per playlist name. */
+  async backers(names: string[]): Promise<Record<string, number>> {
+    const now = nowSecs();
+    const out: Record<string, number> = {};
+    for (const name of names) out[name] = this.beacons.count(beaconHashHex(await nameHash8(name)), now);
+    return out;
   }
 }
 

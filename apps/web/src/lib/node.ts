@@ -86,6 +86,20 @@ export interface TsNode {
 export async function startNode(): Promise<TsNode> {
   const [key, boot] = await Promise.all([loadOrCreateKey(), fetchBootstrap()]);
 
+  // Reserve a circuit slot on the master so this browser is DIALABLE (…/p2p-circuit/webrtc) and can
+  // SERVE blocks to other peers instead of only leeching — parity with a NATed desktop. Two triggers,
+  // deliberately overlapping:
+  //   - each of the master's live addrs + "/p2p-circuit" makes the circuit-relay listener reserve on
+  //     it DETERMINISTICALLY at startup (the CircuitListen path opens/reuses the master connection and
+  //     sends RESERVE — boot.addrs already carry /p2p/<masterId>, which the matcher requires). No
+  //     reliance on relay discovery finding the master on its own.
+  //   - bare "/p2p-circuit" keeps discovery running so the reservation RE-ESTABLISHES on reconnect
+  //     after the master's per-restart certhash rotation: the certhash-bearing configured addrs above
+  //     are stale by then, but the discovery topology re-fires on the supervisor's fresh connection.
+  // "/webrtc" is where the private-to-private SDP upgrade lands once a reservation exists; @libp2p/webrtc's
+  // listener turns each reserved "…/p2p-circuit" into the dialable "…/p2p-circuit/webrtc" we advertise.
+  const listenAddrs = [...boot.addrs.map((a) => `${a}/p2p-circuit`), "/p2p-circuit", "/webrtc"];
+
   const libp2p = await createLibp2p({
     // Identify ourselves on the wire the way tsnode does (trackerstream/<ver>/<role>). Without it a
     // web peer is anonymous, and node/control.go — which classifies peers by their agent string —
@@ -96,10 +110,10 @@ export async function startNode(): Promise<TsNode> {
     // Both are in the tree and the shapes are identical — it is a nominal clash, not a runtime one.
     // Cast once, here, rather than smearing `any` through the key handling.
     privateKey: key as unknown as NonNullable<Parameters<typeof createLibp2p>[0]>["privateKey"],
-    // A browser cannot listen on a socket. The two entries below are for the browser<->browser mesh
-    // (a relay reservation makes us dialable; /webrtc is the transport the SDP upgrade lands on) —
-    // both are inert until a relay accepts a reservation.
-    addresses: { listen: ["/p2p-circuit", "/webrtc"] },
+    // A browser cannot listen on a socket; it becomes reachable ONLY by reserving on a relay. See
+    // listenAddrs above — the master's addrs make the reservation deterministic, and a dialer then
+    // reaches us over "…/p2p-circuit/webrtc" (relayed SDP + hole-punch to a direct datachannel).
+    addresses: { listen: listenAddrs },
     transports: [
       webRTCDirect(), // -> the master and any public seed. No STUN/TURN: the certhash IS the handshake.
       // -> other browsers. SDP is signalled over the circuit relay; ICE uses the seed's coturn,

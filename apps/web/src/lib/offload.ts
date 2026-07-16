@@ -21,8 +21,12 @@ import { CID } from "multiformats/cid";
 /** A browser cannot dial TCP or QUIC. Anything else in a provider's address list is noise to us.
  *  The `webrtc` branch matches BOTH a direct `/webrtc-direct` (public desktop, Tier 1) and the
  *  `/webrtc` inside a `/p2p-circuit/webrtc/…` relayed address (NATed desktop, Tier 3) — libp2p picks
- *  the direct one when both are on offer, and falls to the circuit path otherwise. */
-const dialable = (addr: string): boolean =>
+ *  the direct one when both are on offer, and falls to the circuit path otherwise.
+ *
+ *  Exported because it is also the "am I dialable?" test the node applies to its OWN addresses: once a
+ *  relay reservation lands, `getMultiaddrs()` grows a `…/p2p-circuit/webrtc` that matches here, which
+ *  is what flips this browser from leech to server (see node.ts, web.ts `reachable`). */
+export const dialable = (addr: string): boolean =>
   /\/(webrtc-direct|p2p-circuit\/webrtc|webrtc|wss|tls\/ws|ws)(\/|$)/.test(addr);
 
 /** How long to hunt for providers before giving up and letting bitswap ask the seed anyway. This is

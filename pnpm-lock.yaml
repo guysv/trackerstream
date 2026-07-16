@@ -206,6 +206,9 @@ importers:
       '@libp2p/crypto':
         specifier: ^5.0.0
         version: 5.1.21
+      '@libp2p/interface':
+        specifier: ^2.0.0
+        version: 2.11.0
       '@libp2p/peer-id':
         specifier: ^5.0.0
         version: 5.1.9
@@ -215,6 +218,9 @@ importers:
       ipns:
         specifier: ^10.0.0
         version: 10.1.6
+      it-length-prefixed-stream:
+        specifier: ^2.0.6
+        version: 2.0.6
       libp2p:
         specifier: ^2.0.0
         version: 2.10.0
