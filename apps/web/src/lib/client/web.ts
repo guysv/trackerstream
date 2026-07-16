@@ -133,10 +133,14 @@ export class WebClient implements NodeClient {
             role: id === MASTER_PEER_ID ? ("master" as const) : ("other" as const),
           };
         }),
-        // Dialable once a relay reservation lands: getMultiaddrs() then carries a "…/p2p-circuit/webrtc"
-        // that other peers can reach us on (see node.ts). Before that it holds no dialable addr and this
-        // is false — honestly derived, not hardcoded.
-        reachable: this.ts.libp2p.getMultiaddrs().some((m) => dialable(m.toString())),
+        // `reachable` is the AutoNAT PUBLIC/private verdict (true=public, false=private, null=undecided)
+        // — the desktop reports the raw AutoNAT status here. A browser is NEVER public: it has no
+        // socket, so it's dialable only via a relay reservation (…/p2p-circuit/webrtc) + WebRTC
+        // hole-punch — which is exactly the "private" case (relay/DCUtR only), the same verdict a NATed
+        // desktop reports even while it serves. So never emit `true` (the old `.some(dialable)` did, and
+        // the badge rendered an impossible "public"). Reserved -> false (private, serving via relay);
+        // not-yet-reserved -> null (still establishing a reservation), which shows "checking…".
+        reachable: this.ts.libp2p.getMultiaddrs().some((m) => dialable(m.toString())) ? false : null,
       };
     },
     peerDetail: async (id: string): Promise<PeerDetail> => {
