@@ -26,6 +26,7 @@ import type {
 } from "@trackerstream/ui/client";
 import { unixfs } from "@helia/unixfs";
 import { peerIdFromString } from "@libp2p/peer-id";
+import { MASTER_PEER_ID } from "@trackerstream/config";
 import { CID } from "multiformats/cid";
 import { resolveIpns } from "../ipns.ts";
 import { startNode, type TsNode } from "../node.ts";
@@ -119,13 +120,19 @@ export class WebClient implements NodeClient {
         // Helia's bitswap does not expose a per-peer byte ledger the way boxo does, so we cannot
         // reproduce the desktop's up/down attribution yet. Report the connections honestly with
         // zeroed counters rather than inventing numbers.
-        peers: conns.map((c) => ({
-          id: c.remotePeer.toString(),
-          down: 0,
-          up: 0,
-          connected: true,
-          role: "other" as const,
-        })),
+        peers: conns.map((c) => {
+          const id = c.remotePeer.toString();
+          return {
+            id,
+            down: 0,
+            up: 0,
+            connected: true,
+            // Label the seed the same way the desktop does (id === master). Without this the master —
+            // which every browser holds a persistent webrtc-direct connection to — shows as a generic
+            // "other" peer, i.e. unrecognised.
+            role: id === MASTER_PEER_ID ? ("master" as const) : ("other" as const),
+          };
+        }),
         // Dialable once a relay reservation lands: getMultiaddrs() then carries a "…/p2p-circuit/webrtc"
         // that other peers can reach us on (see node.ts). Before that it holds no dialable addr and this
         // is false — honestly derived, not hardcoded.
@@ -138,7 +145,7 @@ export class WebClient implements NodeClient {
       return {
         id,
         connected: conns.length > 0,
-        role: "other",
+        role: id === MASTER_PEER_ID ? "master" : "other",
         warm_reason: [],
         down: 0,
         up: 0,
