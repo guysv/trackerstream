@@ -78,6 +78,12 @@ export const downloadAndOpen = (args: {
     .then(() => ({ path: args.filename, launched: false, launch_error: null }));
 };
 
+/** Reassemble a module's byte-exact original and hand it to the user WITHOUT launching anything —
+ *  the web "Download" action (desktop uses "Open with" instead). Saves everywhere: a Blob download
+ *  in the browser, ~/Downloads on desktop. */
+export const downloadModule = (args: { root: string; md5: string; filename: string }): Promise<void> =>
+  client().media.saveModule(args);
+
 /** Begin a v2+ stream; `onEvent` ticks skeleton -> sample… -> complete. */
 export const startStream = (root: string, onEvent: (e: StreamEvent) => void): Promise<void> =>
   client().media.startStream(root, onEvent);

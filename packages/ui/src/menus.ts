@@ -5,7 +5,8 @@
 
 import type { MenuItem } from "./contextmenu.svelte";
 import type { ModuleHit } from "./catalog";
-import { downloadAndOpen, listInstalledTrackers, type TrackerInfo } from "./p2p";
+import { downloadAndOpen, downloadModule, listInstalledTrackers, type TrackerInfo } from "./p2p";
+import { can } from "./client/index.ts";
 import { enqueue, playList } from "./player.svelte";
 import {
   plState,
@@ -50,6 +51,16 @@ async function openWithTracker(h: ModuleHit, t: TrackerInfo): Promise<void> {
     }
   } catch (e) {
     reportError("open-with", e, `Couldn't open ${h.filename} with ${t.label}`);
+  }
+}
+
+/** Reassemble `h`'s byte-exact original and download it (no tracker launch) — the web action, since
+ *  a browser can't execute an external program. Fire-and-forget; failures log and toast. */
+async function downloadTrack(h: ModuleHit): Promise<void> {
+  try {
+    await downloadModule({ root: h.rootCid, md5: h.md5, filename: h.filename });
+  } catch (e) {
+    reportError("download", e, `Couldn't download ${h.filename}`);
   }
 }
 
@@ -122,11 +133,11 @@ export function trackMenuItems(h: ModuleHit, ctx: TrackCtx = {}): MenuItem[] {
   }
   items.push(
     { kind: "separator" },
-    {
-      kind: "submenu",
-      label: "Open with",
-      items: () => openWithItems(h),
-    },
+    // Desktop launches an external tracker ("Open with"); the browser can only save the file, so it
+    // offers a plain "Download" that reassembles the byte-exact original and hands it over.
+    can("openInTracker")
+      ? { kind: "submenu", label: "Open with", items: () => openWithItems(h) }
+      : { kind: "action", label: "Download", icon: "↓", onSelect: () => void downloadTrack(h) },
     {
       kind: "action",
       label: "Copy CID",
