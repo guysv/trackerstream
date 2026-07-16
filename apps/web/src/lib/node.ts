@@ -27,6 +27,7 @@ import { createHelia, type Helia } from "helia";
 import { libp2pRouting } from "@helia/routers";
 import { CATALOG_TOPIC } from "./ipns.ts";
 import { startDonorDiscovery } from "./offload.ts";
+import { BandwidthTracker, bandwidthMetrics } from "./bandwidth.ts";
 import { get as idbGet, set as idbSet } from "idb-keyval";
 import { createLibp2p, type Libp2p } from "libp2p";
 
@@ -81,6 +82,9 @@ export async function fetchBootstrap(): Promise<Bootstrap> {
 export interface TsNode {
   libp2p: Libp2p;
   helia: Helia;
+  /** Per-peer up/down byte counter (peers-pane attribution), parity with the desktop's go-libp2p
+   *  BandwidthCounter. Read by web.ts peers()/peerDetail(). */
+  bandwidth: BandwidthTracker;
   /** Re-fetch /bootstrap.json and redial. Call on any dial failure — the certhash has probably
    *  rotated under us. */
   redial(): Promise<void>;
@@ -88,6 +92,10 @@ export interface TsNode {
 
 export async function startNode(): Promise<TsNode> {
   const [key, boot] = await Promise.all([loadOrCreateKey(), fetchBootstrap()]);
+
+  // Per-peer bandwidth: supply a metrics component so libp2p's byte hooks (which it already calls but
+  // that no-op without one) tally up/down per peer. All-protocol, matching the desktop counter.
+  const bandwidth = new BandwidthTracker();
 
   // Reserve a circuit slot on the master so this browser is DIALABLE (…/p2p-circuit/webrtc) and can
   // SERVE blocks to other peers instead of only leeching — parity with a NATed desktop. Two triggers,
@@ -104,6 +112,9 @@ export async function startNode(): Promise<TsNode> {
   const listenAddrs = [...boot.addrs.map((a) => `${a}/p2p-circuit`), "/p2p-circuit", "/webrtc"];
 
   const libp2p = await createLibp2p({
+    // Per-peer byte accounting (see bandwidth.ts). A `(components) => Metrics` factory; ours needs no
+    // components. Without this the trackProtocolStream/trackMultiaddrConnection hooks are no-ops.
+    metrics: bandwidthMetrics(bandwidth),
     // Identify ourselves on the wire the way tsnode does (trackerstream/<ver>/<role>). Without it a
     // web peer is anonymous, and node/control.go — which classifies peers by their agent string —
     // cannot tell a trackerstream browser from a stranger.
@@ -293,5 +304,5 @@ export async function startNode(): Promise<TsNode> {
   }
   startDonorDiscovery(libp2p);
 
-  return { libp2p, helia, redial };
+  return { libp2p, helia, bandwidth, redial };
 }

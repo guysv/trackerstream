@@ -117,15 +117,15 @@ export class WebClient implements NodeClient {
       const conns = this.ts.libp2p.getConnections();
       return {
         connected: conns.length,
-        // Helia's bitswap does not expose a per-peer byte ledger the way boxo does, so we cannot
-        // reproduce the desktop's up/down attribution yet. Report the connections honestly with
-        // zeroed counters rather than inventing numbers.
+        // Per-peer up/down from the BandwidthTracker metrics component (bandwidth.ts) — all-protocol
+        // byte attribution, parity with the desktop's go-libp2p BandwidthCounter.
         peers: conns.map((c) => {
           const id = c.remotePeer.toString();
+          const { down, up } = this.ts.bandwidth.get(id);
           return {
             id,
-            down: 0,
-            up: 0,
+            down,
+            up,
             connected: true,
             // Label the seed the same way the desktop does (id === master). Without this the master —
             // which every browser holds a persistent webrtc-direct connection to — shows as a generic
@@ -142,13 +142,14 @@ export class WebClient implements NodeClient {
     peerDetail: async (id: string): Promise<PeerDetail> => {
       const conns = this.ts.libp2p.getConnections().filter((c) => c.remotePeer.toString() === id);
       const c = conns[0];
+      const { down, up } = this.ts.bandwidth.get(id);
       return {
         id,
         connected: conns.length > 0,
         role: id === MASTER_PEER_ID ? "master" : "other",
         warm_reason: [],
-        down: 0,
-        up: 0,
+        down,
+        up,
         addrs: conns.map((x) => x.remoteAddr.toString()),
         relayed: c ? c.remoteAddr.toString().includes("/p2p-circuit") : false,
         transport: c?.remoteAddr.toString().includes("webrtc-direct") ? "webrtc-direct" : "webrtc",
