@@ -25,6 +25,8 @@ import { IDBBlockstore } from "blockstore-idb";
 import { IDBDatastore } from "datastore-idb";
 import { createHelia, type Helia } from "helia";
 import { libp2pRouting } from "@helia/routers";
+import { CATALOG_TOPIC } from "./ipns.ts";
+import { startDonorDiscovery } from "./offload.ts";
 import { get as idbGet, set as idbSet } from "idb-keyval";
 import { createLibp2p, type Libp2p } from "libp2p";
 
@@ -273,6 +275,23 @@ export async function startNode(): Promise<TsNode> {
   // Kept for the TsNode.redial() contract (a caller can force one), but the supervisor is what
   // actually keeps us connected.
   const redial = redialOnce;
+
+  // Mesh membership — parity with a NATed desktop (minus DCUtR, which needs a UDP/TCP socket the
+  // browser doesn't have). Two pieces:
+  //  1. Join the catalog gossipsub topic. It is the ONE topic every node is in, so subscribing puts us
+  //     in the universal mesh and relays catalog records the way a desktop does — where before the
+  //     browser touched the catalog only via a one-shot DHT resolve at boot and stayed out of the mesh.
+  //     (We don't re-point the already-resolved catalog on updates yet; that is a separate change.)
+  //  2. Eagerly connect to the network's public donors (see startDonorDiscovery / node/fwd.go). Without
+  //     it the browser is a lone leaf on the master; with it it pre-connects to the stable public peers
+  //     that are also the best offload sources — the same findProviders(donorRendezvous)→dial loop a
+  //     desktop's AutoRelay peer source runs.
+  try {
+    (libp2p.services as { pubsub?: { subscribe(t: string): void } }).pubsub?.subscribe(CATALOG_TOPIC);
+  } catch {
+    /* pubsub unexpectedly absent — non-fatal, the DHT resolve path still works */
+  }
+  startDonorDiscovery(libp2p);
 
   return { libp2p, helia, redial };
 }

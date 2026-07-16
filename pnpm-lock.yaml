@@ -113,6 +113,9 @@ importers:
       '@libp2p/identify':
         specifier: ^3.0.0
         version: 3.0.39
+      '@libp2p/interface':
+        specifier: ^2.11.0
+        version: 2.11.0
       '@libp2p/kad-dht':
         specifier: ^15.0.0
         version: 15.1.11
