@@ -24,6 +24,7 @@ import { BOOTSTRAP_URL } from "@trackerstream/config";
 import { IDBBlockstore } from "blockstore-idb";
 import { IDBDatastore } from "datastore-idb";
 import { createHelia, type Helia } from "helia";
+import { libp2pRouting } from "@helia/routers";
 import { get as idbGet, set as idbSet } from "idb-keyval";
 import { createLibp2p, type Libp2p } from "libp2p";
 
@@ -164,6 +165,13 @@ export async function startNode(): Promise<TsNode> {
     // Bitswap ONLY. No trustless-gateway fallback on purpose: if this works, it worked over libp2p,
     // and a silent HTTP fallback would hide a broken data plane behind a working-looking UI.
     blockBrokers: [bitswap()],
+    // Route ONLY over our custom libp2p DHT. Helia otherwise defaults `routers` to
+    // [libp2pRouting, httpGatewayRouting()], and httpGatewayRouting() points at public gateways
+    // (https://4everland.io by default) that answer findProviders for EVERY cid with a bogus
+    // HTTP-gateway "provider" and don't honour the abort signal — which both poisoned discovery on
+    // this private overlay with junk records and made findProviders hang. We have no gateway block
+    // broker to consume those providers anyway, so the HTTP router is pure noise. Drop it.
+    routers: [libp2pRouting(libp2p)],
   });
 
   const masterId = boot.peerId;

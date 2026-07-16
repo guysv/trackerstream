@@ -41,7 +41,7 @@ const MAX_DIALS = 4;
  * the blocks on an already-connected peer instead of asking the seed. Failing is fine — the seed is
  * always there.
  */
-export async function warmRoot(libp2p: Libp2p, helia: Helia, root: string): Promise<void> {
+export async function warmRoot(libp2p: Libp2p, root: string): Promise<void> {
   let cid: CID;
   try {
     cid = CID.parse(root);
@@ -51,7 +51,12 @@ export async function warmRoot(libp2p: Libp2p, helia: Helia, root: string): Prom
   const signal = AbortSignal.timeout(FIND_TIMEOUT_MS);
   const dialed = new Set<string>();
   try {
-    for await (const prov of helia.routing.findProviders(cid, { signal })) {
+    // libp2p.contentRouting, NOT helia.routing: Helia's Routing.findProviders merges the router
+    // output with a PERPETUAL FIND_PEER address-refresh queue generator that never ends and ignores
+    // our AbortSignal, so the loop hangs forever after the DHT query completes (verified). We run a
+    // single router (the custom DHT) anyway, so that merge layer is pure overhead — go straight to
+    // the libp2p layer, which terminates on the signal and returns providers with their addresses.
+    for await (const prov of libp2p.contentRouting.findProviders(cid, { signal })) {
       if (dialed.size >= MAX_DIALS) break;
       const id = prov.id.toString();
       if (id === libp2p.peerId.toString() || dialed.has(id)) continue;

@@ -172,7 +172,7 @@ export class WebClient implements NodeClient {
     // the relay). Bitswap then finds the blocks on an already-connected peer instead of the seed.
     // Fire-and-forget: playback must never wait on the DHT.
     warmRoot: async (root: string): Promise<void> => {
-      void warmRoot(this.ts.libp2p, this.ts.helia, root);
+      void warmRoot(this.ts.libp2p, root);
     },
   };
 
