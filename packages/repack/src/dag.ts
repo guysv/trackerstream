@@ -19,6 +19,10 @@ import { cdcChunks, DEFAULT_CDC, type CdcConfig } from "./cdc.ts";
 import { sampleRegions, sampleSlots, type Format } from "./parse.ts";
 import { computeSeekTables } from "./seek.ts";
 import { flacEncode, flacDecode, FLAC_CODEC, FLAC_RAW, initFlac, initFlacDecoder } from "./flac.ts";
+// Re-exported so the streaming decode path (apps/web stream.ts) can ready the decoder before it
+// touches a FLAC-coded v4 sample, exactly as reassembleV4 does — decodeV4Sample is sync and throws
+// if the module was never inited.
+export { initFlacDecoder, FLAC_CODEC } from "./flac.ts";
 
 const RAW_CODE = 0x55;
 const DAG_CBOR_CODE = 0x71;

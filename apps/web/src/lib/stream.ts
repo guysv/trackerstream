@@ -8,6 +8,8 @@ import {
   applyEnc,
   assembleSkeletonV2,
   decodeV4Sample,
+  FLAC_CODEC,
+  initFlacDecoder,
   reassemble,
   type PlanV2,
   type SampleV4,
@@ -101,6 +103,12 @@ export async function startStream(
   const index = manifest.index ?? dagCbor.decode<any>(await fetchVerified(manifest.indexRoot, get));
   const samples: SampleV4[] = index.samples;
   const plan: PlanV2 = index.plan;
+
+  // Ready the FLAC decoder BEFORE any sample decodes — decodeV4Sample is sync and throws if the
+  // libflac module was never loaded. reassembleV4 does the same up front; the streaming path had
+  // silently skipped it, so a v4 module with FLAC-coded samples died on play with "call initFlac()".
+  // Gated on actually having a FLAC leaf so a raw-PCM module never drags the wasm load. Idempotent.
+  if (samples.some((s) => s.encCodec === FLAC_CODEC)) await initFlacDecoder();
 
   // Skeleton: fetch the content chunks and re-inflate the zero runs from the layout recipe. The
   // zeros — the bulk of a compressed IT's skeleton — were never transferred.
