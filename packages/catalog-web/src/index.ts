@@ -11,6 +11,13 @@ export type { CatalogStats } from "./engine.ts";
 export { buildMatchstr } from "./search.ts";
 export { isTszcat, parseTszcat } from "./tszcat.ts";
 
+// DEV-only fetch-latency accounting (per query): counts, summed/max ms, bytes. Reset on each `done`.
+const DBG = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV);
+let _fc = 0;
+let _fb = 0;
+let _fms = 0;
+let _fmax = 0;
+
 export interface CatalogSources {
   /** Whole-file read of the TSZCAT manifest (the only UnixFS read in the catalog path). */
   readRoot(cid: CID): Promise<Uint8Array>;
@@ -62,7 +69,15 @@ export class CatalogClient {
         // block fails its query instead of killing the worker.
         try {
           const cid = CIDParser.parse(m.cid);
+          const _t = DBG ? performance.now() : 0;
           const bytes = m.kind === "root" ? await this.src.readRoot(cid) : await this.src.getBlock(cid);
+          if (DBG) {
+            const dt = performance.now() - _t;
+            _fc++;
+            _fb += bytes.length;
+            _fms += dt;
+            if (dt > _fmax) _fmax = dt;
+          }
           // Structured-CLONE, never transfer. These bytes are Helia's — the blockstore hands out its
           // own cached buffer, and transferring it detaches the copy Helia still holds, so the next
           // read of that block throws "ArrayBuffer is already detached". The clone costs a memcpy;
@@ -78,6 +93,14 @@ export class CatalogClient {
         return;
       case "done": {
         this.lastStats = m.stats;
+        if (DBG) {
+          const s = m.stats;
+          console.info(
+            `[catalog] query done: blocks=${s.blocks} waves=${s.waves} wire=${Math.round(s.wireBytes / 1024)}KB | ` +
+              `helia fetch: n=${_fc} sum=${Math.round(_fms)}ms max=${Math.round(_fmax)}ms avg=${_fc ? Math.round(_fms / _fc) : 0}ms bytes=${Math.round(_fb / 1024)}KB`,
+          );
+          _fc = _fb = _fms = _fmax = 0;
+        }
         const c = this.calls.get(m.id);
         this.calls.delete(m.id);
         c?.resolve(m.value);

@@ -30,6 +30,7 @@ import { MASTER_PEER_ID } from "@trackerstream/config";
 import { CID } from "multiformats/cid";
 import { resolveIpns } from "../ipns.ts";
 import { startNode, type TsNode } from "../node.ts";
+import { get as idbGet, set as idbSet } from "idb-keyval";
 import { getSample, getSkeleton, startStream } from "../stream.ts";
 import { Provider, dialable, warmRoot } from "../offload.ts";
 
@@ -65,7 +66,18 @@ export class WebClient implements NodeClient {
   }
 
   static async create(): Promise<WebClient> {
+    const mark = (import.meta.env?.DEV || import.meta.env?.VITE_EXPOSE_NODE) ? (() => {
+      const t0 = performance.now();
+      let last = t0;
+      return (label: string) => {
+        const now = performance.now();
+        console.info(`[boot] ${label}: +${Math.round(now - last)}ms (total ${Math.round(now - t0)}ms)`);
+        last = now;
+      };
+    })() : (_: string) => {};
+
     const ts = await startNode();
+    mark("startNode (fetchBootstrap + dial seed)");
     const fs = unixfs(ts.helia);
 
     // Resolve the catalog's IPNS name over the custom DHT, verifying the record locally — the node
@@ -76,9 +88,36 @@ export class WebClient implements NodeClient {
     // never used in prod, where the master is a DHT server the browser dials directly.
     // VITE_CATALOG_IPNS points the resolve at a DIFFERENT name (used to exercise the real DHT path
     // against a local seed); VITE_CATALOG_CID skips resolution entirely. Neither is used in prod.
-    const rootCid =
-      (import.meta.env?.VITE_CATALOG_CID as string | undefined) ??
-      (await resolveIpns(ts.libp2p, (import.meta.env?.VITE_CATALOG_IPNS as string | undefined) ?? undefined));
+    const ipnsName = (import.meta.env?.VITE_CATALOG_IPNS as string | undefined) ?? undefined;
+    const resolve = () => resolveIpns(ts.libp2p, ipnsName);
+
+    // BOOT-LATENCY: the DHT resolve is SLOW on a fresh browser — the master isn't in kad-dht's
+    // routing table yet (~5s warmup) and the single GET_VALUE round-trip to it can take ~8s, so a
+    // cold resolve blocks "connecting to the swarm" for 10s+. But the catalog root is
+    // content-addressed and only changes on ingest (~daily), so a returning tab should never wait on
+    // it. Persist the last resolved root and reuse it INSTANTLY on refresh; refresh it in the
+    // background for next boot. A day-stale root is harmless (old roots stay fetchable, and Bitswap
+    // serves the same pages); only the very first visit — or a dev CID override — pays the DHT cost.
+    const CATALOG_ROOT_KEY = "ts:catalog-root";
+    const override = import.meta.env?.VITE_CATALOG_CID as string | undefined;
+    let rootCid: string;
+    if (override) {
+      rootCid = override;
+    } else {
+      const cached = await idbGet<string>(CATALOG_ROOT_KEY);
+      if (cached) {
+        rootCid = cached;
+        // Background refresh: update the cache (and thus next boot) if the published root moved.
+        // Non-blocking; we don't re-point this session (day-stale is fine). Best-effort.
+        void resolve()
+          .then((fresh) => (fresh !== cached ? idbSet(CATALOG_ROOT_KEY, fresh) : undefined))
+          .catch(() => {});
+      } else {
+        rootCid = await resolve(); // first visit only — the one time we eat the DHT latency
+        await idbSet(CATALOG_ROOT_KEY, rootCid).catch(() => {});
+      }
+    }
+    mark("catalog root (cached=instant; cold=direct-ask ~150ms)");
 
     const cat = new CatalogClient(rootCid, {
       // The TSZCAT manifest is the only UnixFS read in the whole catalog path, and it's whole-file.
@@ -103,6 +142,7 @@ export class WebClient implements NodeClient {
     const pl = await Playlists.create(ts.libp2p, () => {
       for (const cb of listeners) cb();
     });
+    mark("Playlists.create (store + subscribe)");
     return new WebClient(ts, cat, pl, listeners);
   }
 
