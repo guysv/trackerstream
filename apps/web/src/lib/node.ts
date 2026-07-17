@@ -10,6 +10,7 @@ import { gossipsub } from "@chainsafe/libp2p-gossipsub";
 import { noise } from "@chainsafe/libp2p-noise";
 import { yamux } from "@chainsafe/libp2p-yamux";
 import { bitswap } from "@helia/block-brokers";
+import type { BitswapLike } from "./blockfetch.ts";
 import { circuitRelayTransport } from "@libp2p/circuit-relay-v2";
 import { generateKeyPair, privateKeyFromProtobuf, privateKeyToProtobuf } from "@libp2p/crypto/keys";
 import { identify } from "@libp2p/identify";
@@ -82,6 +83,13 @@ export async function fetchBootstrap(): Promise<Bootstrap> {
 export interface TsNode {
   libp2p: Libp2p;
   helia: Helia;
+  /** The live @helia/bitswap instance (reached through the block broker). Exposed so the media block
+   *  path can drive bitswap's SINGLE-PEER want primitives directly (seed-offloading fetch, see
+   *  blockfetch.ts) instead of the default broadcast-to-everyone `blockstore.get`. */
+  bitswap: BitswapLike;
+  /** The seed's PeerId (from /bootstrap.json). The one peer the offload fetch never asks for bytes
+   *  while a donor holds the block. */
+  masterId: string;
   /** Per-peer up/down byte counter (peers-pane attribution), parity with the desktop's go-libp2p
    *  BandwidthCounter. Read by web.ts peers()/peerDetail(). */
   bandwidth: BandwidthTracker;
@@ -171,13 +179,27 @@ export async function startNode(): Promise<TsNode> {
   const datastore = new IDBDatastore("ts-data");
   await Promise.all([blockstore.open(), datastore.open()]);
 
+  // Wrap the bitswap block-broker factory so we keep a reference to the Bitswap instance it builds.
+  // The broker's public `.bitswap` field is the only handle to the single-peer want primitives
+  // (wantSessionPresence/wantSessionBlock) the seed-offloading media fetch needs (see blockfetch.ts);
+  // Helia never surfaces it otherwise. Pure factory composition — no reach into Helia internals.
+  let bitswapRef: BitswapLike | undefined;
+  const captureBitswap = () => {
+    const make = bitswap();
+    return (components: Parameters<ReturnType<typeof bitswap>>[0]) => {
+      const broker = make(components);
+      bitswapRef = (broker as unknown as { bitswap: BitswapLike }).bitswap;
+      return broker;
+    };
+  };
+
   const helia = await createHelia({
     libp2p,
     blockstore,
     datastore,
     // Bitswap ONLY. No trustless-gateway fallback on purpose: if this works, it worked over libp2p,
     // and a silent HTTP fallback would hide a broken data plane behind a working-looking UI.
-    blockBrokers: [bitswap()],
+    blockBrokers: [captureBitswap()],
     // Route ONLY over our custom libp2p DHT. Helia otherwise defaults `routers` to
     // [libp2pRouting, httpGatewayRouting()], and httpGatewayRouting() points at public gateways
     // (https://4everland.io by default) that answer findProviders for EVERY cid with a bogus
@@ -304,5 +326,6 @@ export async function startNode(): Promise<TsNode> {
   }
   startDonorDiscovery(libp2p);
 
-  return { libp2p, helia, bandwidth, redial };
+  if (bitswapRef == null) throw new Error("bitswap broker was never constructed"); // createHelia always builds it
+  return { libp2p, helia, bitswap: bitswapRef, masterId, bandwidth, redial };
 }

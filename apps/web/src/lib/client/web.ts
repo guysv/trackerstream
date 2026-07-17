@@ -34,6 +34,7 @@ import { startWarmBundle } from "../warmbundle.ts";
 import { get as idbGet, set as idbSet } from "idb-keyval";
 import { getSample, getSkeleton, startStream } from "../stream.ts";
 import { Provider, dialable, warmRoot } from "../offload.ts";
+import { makeOffloadFetch } from "../blockfetch.ts";
 
 export class WebClient implements NodeClient {
   readonly caps: Capabilities = {
@@ -64,6 +65,11 @@ export class WebClient implements NodeClient {
     this.pl = pl;
     this.listeners = listeners;
     this.provider = new Provider(ts.libp2p, ts.helia);
+    // Media blocks go through the seed-offloading fetch (WANT-HAVE donors -> targeted WANT-BLOCK ->
+    // seed fallback, see blockfetch.ts), NOT the default broadcast-to-everyone blockstore.get that
+    // makes the seed serve a duplicate of every block. The catalog path stays on blockstore.get: its
+    // pages live on the seed and donors never hold them, so a WANT-HAVE round-trip there is pure cost.
+    this.block = makeOffloadFetch({ helia: ts.helia, bitswap: ts.bitswap, masterId: ts.masterId });
   }
 
   static async create(): Promise<WebClient> {
@@ -160,7 +166,9 @@ export class WebClient implements NodeClient {
     return new WebClient(ts, cat, pl, listeners);
   }
 
-  private block = async (cid: CID): Promise<Uint8Array> => this.ts.helia.blockstore.get(cid);
+  /** Media block fetch — set in the constructor to the seed-offloading fetcher (blockfetch.ts).
+   *  Used by fetchModule / startStream / saveModule; the catalog uses its own getBlock. */
+  private readonly block: (cid: CID) => Promise<Uint8Array>;
 
   node = {
     info: async (): Promise<NodeInfo> => ({
