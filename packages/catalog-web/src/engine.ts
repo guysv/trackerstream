@@ -162,6 +162,17 @@ export class CatalogEngine {
       case "get_by_md5":
         return this.detail("m.md5 = ?", [String(req.md5)]);
       case "formats": {
+        // Precomputed counts (meta.format_counts, written by the bake's refreshMeta) — ONE page,
+        // not a GROUP BY over 170k rows. The GROUP BY scans the whole format index (~136 pages =
+        // ~136 serialized Bitswap round-trips over the WAN ≈ 30s cold), and it runs on the home
+        // page's first paint, so it WAS the "catalog took forever to load". genres already does
+        // this; formats didn't. Fall back to the scan only for an older catalog with no meta row.
+        const meta = await this.rows("SELECT value FROM meta WHERE key = 'format_counts'");
+        const raw = meta[0]?.[0];
+        if (raw != null) {
+          const counts = JSON.parse(String(raw)) as { format: string; count: number }[];
+          return { formats: counts, total: counts.reduce((a, c) => a + c.count, 0) };
+        }
         const rows = await this.rows(
           "SELECT format, count(*) AS n FROM modules GROUP BY format ORDER BY n DESC",
         );
