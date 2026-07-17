@@ -518,7 +518,7 @@ async function publishCatalog(rpc: KuboRpc, opts: IngestOpts): Promise<void> {
       // HARD CUT: the per-page-zstd (TSZCAT) manifest IS the published catalog, under the main
       // `catalog` key — ~2.2x fewer page bytes over the Bitswap VFS. The client VFS auto-detects
       // raw-SQLite vs TSZCAT by the root magic, so no key/config change is needed to read it.
-      await publishZstdCatalog(rpc, snapshot, CATALOG_KEY_NAME);
+      await publishZstdCatalog(rpc, snapshot, CATALOG_KEY_NAME, opts.kuboApi);
     } else {
       const cid = await rpc.addFile(snapshot, {
         chunker: CATALOG_CHUNKER,
@@ -563,7 +563,7 @@ const TSZCAT_LEVEL = 19; // one-time offline compression; client decode is fast 
  *  the published root. The client fetches the manifest once then `block/get`s + decompresses each
  *  page it reads — so lazy paging is preserved while the wire carries ~2.2x fewer page bytes. Page
  *  blocks are pinned (in parallel batches) so repo GC can't drop them. */
-async function publishZstdCatalog(rpc: KuboRpc, snapshot: string, keyName: string): Promise<void> {
+async function publishZstdCatalog(rpc: KuboRpc, snapshot: string, keyName: string, kuboApi?: string): Promise<void> {
   const raw = readFileSync(snapshot);
   if (raw.length % TSZCAT_PAGE !== 0) throw new Error(`snapshot not page-aligned: ${raw.length}`);
   const n = raw.length / TSZCAT_PAGE;
@@ -608,6 +608,20 @@ async function publishZstdCatalog(rpc: KuboRpc, snapshot: string, keyName: strin
     );
     if (keyName === CATALOG_KEY_NAME && CATALOG_IPNS_KEY && CATALOG_IPNS_KEY !== peerId) {
       console.error(`  !! config CATALOG_IPNS_KEY (${CATALOG_IPNS_KEY}) != master key (${peerId})`);
+    }
+    // Regenerate the web client's warm bundle for THIS root and drop it in the Caddy web root, so a
+    // fresh browser's first search pre-loads the hot FTS pages over HTTP (apps/web warmbundle.ts).
+    // Best-effort: a failure (no web root, wa-sqlite hiccup) must never fail a publish, and a stale
+    // bundle is a safe client-side no-op (the loader checks the root). Only for the live catalog key.
+    if (keyName === CATALOG_KEY_NAME && kuboApi) {
+      const dir = process.env.WARM_BUNDLE_DIR ?? "/var/www/trackerstream";
+      try {
+        const { generateWarmBundle } = await import("./gen-warm-bundle.ts");
+        const pages = await generateWarmBundle(kuboApi, manCid.toString(), dir);
+        console.log(`catalog warm bundle: ${pages} pages -> ${dir}/catalog-warm.{bin,json}`);
+      } catch (e) {
+        console.error(`  !! warm bundle generation skipped: ${e instanceof Error ? e.message : e}`);
+      }
     }
   } finally {
     try {

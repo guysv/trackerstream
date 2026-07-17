@@ -37,6 +37,13 @@ export function resetStats(): void {
   Object.assign(stats, { wireBytes: 0, plainBytes: 0, blocks: 0, waves: 0, cacheHits: 0 });
 }
 
+/** Empty the shared page cache. NOT used by the app (content-addressed entries never go stale); it
+ *  exists so the warm-bundle generator can run each canonical query truly COLD and thus capture that
+ *  query's FULL page set, not just the pages a prior query in the workload hadn't already cached. */
+export function clearPageCache(): void {
+  pageCache.clear();
+}
+
 /** Tick-LRU over (catalog root, page index). Global, because every query opens its own connection
  *  and they should all share the pages someone already paid for. */
 class PageCache {
@@ -59,6 +66,10 @@ class PageCache {
       if (oldest === undefined) break;
       this.map.delete(oldest);
     }
+  }
+
+  clear(): void {
+    this.map.clear();
   }
 }
 

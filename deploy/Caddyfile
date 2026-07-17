@@ -48,6 +48,18 @@ ${TS_DOMAIN} {
 		reverse_proxy 127.0.0.1:5090
 	}
 
+	# Catalog warm bundle (static, regenerated per bake by apps/server/src/gen-warm-bundle.ts).
+	# The web client fetches /catalog-warm.json at boot and, if its root matches the resolved
+	# catalog, pre-loads the hot FTS pages from /catalog-warm.bin over HTTP — so a fresh browser
+	# profile's first search skips ~26 serialized cold Bitswap reads. Just files; a stale/missing
+	# bundle is a safe no-op on the client. CORS-open so a web client on any origin can fetch it.
+	handle /catalog-warm.* {
+		root * /var/www/trackerstream
+		header Access-Control-Allow-Origin "*"
+		header Cache-Control "public, max-age=300"
+		file_server
+	}
+
 	handle {
 		respond /healthz "ok" 200
 		respond "trackerstream" 200

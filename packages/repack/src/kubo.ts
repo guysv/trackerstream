@@ -67,6 +67,13 @@ export class KuboRpc {
     return new Uint8Array(await res.arrayBuffer());
   }
 
+  /** Read a UnixFS file's bytes whole (the catalog manifest is a UnixFS file, so `blockGet` on the
+   *  root would return the dag-pb node, not the data). */
+  async cat(cid: CID): Promise<Uint8Array> {
+    const res = await this.post(`cat?arg=${cid.toString()}`);
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
   /** Add a whole file as a UnixFS DAG (the catalog publish path, R1). For stable
    *  cross-rebake block reuse the catalog is added page-aligned + raw-leaves so each
    *  SQLite page = one fixed block (lab: 92–96% reuse on an incremental rebake).

@@ -23,6 +23,10 @@ export default defineConfig(({ command }) => ({
       fs: { allow: ["../.."] },
       proxy: {
         "/bootstrap.json": { target: "https://trackerstream.xyz", changeOrigin: true, secure: true },
+        "/catalog-warm.json": { target: "https://trackerstream.xyz", changeOrigin: true, secure: true },
+        "/catalog-warm.bin": { target: "https://trackerstream.xyz", changeOrigin: true, secure: true },
+        // The warm bundle is served by prod Caddy (static, per-bake). Proxy it same-origin in dev so
+        // a locally-run web client pre-loads the hot catalog pages exactly as a deployed one would.
       },
     },
   }),

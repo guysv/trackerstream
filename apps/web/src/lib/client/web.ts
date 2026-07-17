@@ -30,6 +30,7 @@ import { MASTER_PEER_ID } from "@trackerstream/config";
 import { CID } from "multiformats/cid";
 import { resolveIpns } from "../ipns.ts";
 import { startNode, type TsNode } from "../node.ts";
+import { startWarmBundle } from "../warmbundle.ts";
 import { get as idbGet, set as idbSet } from "idb-keyval";
 import { getSample, getSkeleton, startStream } from "../stream.ts";
 import { Provider, dialable, warmRoot } from "../offload.ts";
@@ -119,6 +120,14 @@ export class WebClient implements NodeClient {
     }
     mark("catalog root (cached=instant; cold=direct-ask ~150ms)");
 
+    // Pre-load the catalog's hot FTS pages over HTTP (see warmbundle.ts) so a fresh profile's first
+    // search skips the ~26 serialized cold Bitswap reads. Awaits only the tiny manifest; the blob
+    // loads in the background. A page the bundle carries then waits for that load instead of a slow
+    // cold Bitswap fetch — pages it doesn't carry never wait, so the home page (meta rows) is
+    // unaffected. Best-effort: no bundle / wrong root / any failure => today's cold cost.
+    const warmBundleUrl = (import.meta.env?.VITE_WARM_BUNDLE_URL as string | undefined) ?? "/catalog-warm.json";
+    const warm = await startWarmBundle(ts.helia, rootCid, warmBundleUrl).catch(() => null);
+
     const cat = new CatalogClient(rootCid, {
       // The TSZCAT manifest is the only UnixFS read in the whole catalog path, and it's whole-file.
       readRoot: async (cid) => {
@@ -133,7 +142,12 @@ export class WebClient implements NodeClient {
         return out;
       },
       // Every catalog PAGE is its own raw block — a plain Bitswap fetch, no UnixFS, no ranged reads.
-      getBlock: async (cid) => ts.helia.blockstore.get(cid),
+      // If the warm bundle carries this page, wait for its (HTTP, no-contention) load rather than
+      // racing it with a cold Bitswap fetch; once loaded the block is resident, so this is a cache hit.
+      getBlock: async (cid) => {
+        if (warm?.has(cid)) await warm.ready;
+        return ts.helia.blockstore.get(cid);
+      },
     });
 
     // The listener set exists BEFORE Playlists so its onChange can close over it — the store needs a
