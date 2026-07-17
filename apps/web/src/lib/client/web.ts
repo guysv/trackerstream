@@ -176,25 +176,25 @@ export class WebClient implements NodeClient {
       listening: this.ts.libp2p.getMultiaddrs().map((a) => a.toString()),
     }),
     peers: async (): Promise<PeerStats> => {
-      const conns = this.ts.libp2p.getConnections();
+      // getConnections() returns one entry PER CONNECTION, and the browser can hold several to a
+      // single peer — a transient relay/signaling conn beside the hole-punched direct one, or a
+      // zombie master conn mid-redial. Emitting a row per connection then yields DUPLICATE peer ids,
+      // which collides the peers list's keyed {#each … (p.id)} (Svelte each_key_duplicate) and breaks
+      // row-click reconciliation — the "peer pane sometimes won't open" bug, browser-only because the
+      // desktop reports per-peer from Rust. Dedupe to ONE row per peer; per-peer up/down comes from
+      // the BandwidthTracker (bandwidth.ts) keyed by peer id, not per connection, so nothing to sum.
+      const byPeer = new Map<string, { id: string; down: number; up: number; connected: true; role: "master" | "other" }>();
+      for (const c of this.ts.libp2p.getConnections()) {
+        const id = c.remotePeer.toString();
+        if (byPeer.has(id)) continue;
+        const { down, up } = this.ts.bandwidth.get(id);
+        // Label the seed the same way the desktop does (id === master); otherwise the master — which
+        // every browser holds a persistent webrtc-direct connection to — shows as a generic "other".
+        byPeer.set(id, { id, down, up, connected: true, role: id === MASTER_PEER_ID ? "master" : "other" });
+      }
       return {
-        connected: conns.length,
-        // Per-peer up/down from the BandwidthTracker metrics component (bandwidth.ts) — all-protocol
-        // byte attribution, parity with the desktop's go-libp2p BandwidthCounter.
-        peers: conns.map((c) => {
-          const id = c.remotePeer.toString();
-          const { down, up } = this.ts.bandwidth.get(id);
-          return {
-            id,
-            down,
-            up,
-            connected: true,
-            // Label the seed the same way the desktop does (id === master). Without this the master —
-            // which every browser holds a persistent webrtc-direct connection to — shows as a generic
-            // "other" peer, i.e. unrecognised.
-            role: id === MASTER_PEER_ID ? ("master" as const) : ("other" as const),
-          };
-        }),
+        connected: byPeer.size,
+        peers: [...byPeer.values()],
         // `reachable` is the AutoNAT PUBLIC/private verdict (true=public, false=private, null=undecided)
         // — the desktop reports the raw AutoNAT status here. A browser is NEVER public: it has no
         // socket, so it's dialable only via a relay reservation (…/p2p-circuit/webrtc) + WebRTC
@@ -207,7 +207,15 @@ export class WebClient implements NodeClient {
     },
     peerDetail: async (id: string): Promise<PeerDetail> => {
       const conns = this.ts.libp2p.getConnections().filter((c) => c.remotePeer.toString() === id);
-      const c = conns[0];
+      // "relayed" must come from libp2p's own `limits` flag, NOT the remoteAddr string. A private-webrtc
+      // conn that hole-punched to a DIRECT datachannel keeps its `…/p2p-circuit/webrtc` DIAL multiaddr as
+      // remoteAddr (the browser can't observe the negotiated ICE candidate the way go can), so matching
+      // "/p2p-circuit" flags a genuine direct offload as "relayed via master" — false. `limits` is set
+      // ONLY on Limited (actually-relayed) conns and is undefined once direct (it's also the exact flag
+      // bitswap gates on, so a conn carrying blocks is provably not Limited). A peer is relayed only if we
+      // hold NO direct conn to it — prefer a direct conn for the displayed transport/addr too.
+      const direct = conns.find((x) => x.limits == null);
+      const c = direct ?? conns[0];
       const { down, up } = this.ts.bandwidth.get(id);
       return {
         id,
@@ -217,7 +225,7 @@ export class WebClient implements NodeClient {
         down,
         up,
         addrs: conns.map((x) => x.remoteAddr.toString()),
-        relayed: c ? c.remoteAddr.toString().includes("/p2p-circuit") : false,
+        relayed: conns.length > 0 && direct == null,
         transport: c?.remoteAddr.toString().includes("webrtc-direct") ? "webrtc-direct" : "webrtc",
         agent: null,
         protocols: [],

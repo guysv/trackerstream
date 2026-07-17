@@ -21,6 +21,13 @@ import type { Libp2p } from "libp2p";
 import { CID } from "multiformats/cid";
 import { sha256 } from "multiformats/hashes/sha2";
 
+/** DEV-only offload tracing — how the browser tries to reach donors (findProviders results, their
+ *  addrs, dial outcomes). Gated so it never reaches the product build (matches web.ts's `mark`). */
+const OFFLOAD_DEBUG = Boolean(import.meta.env?.DEV || import.meta.env?.VITE_EXPOSE_NODE);
+const dlog = (...a: unknown[]): void => {
+  if (OFFLOAD_DEBUG) console.info("[offload]", ...a);
+};
+
 /** libp2p refuses to dial an encryption-skipping transport (webrtc-direct) address that lacks a peer
  *  id — "outbound connection that skipped encryption must have a peer id". DHT provider records carry
  *  bare `…/webrtc-direct/certhash/…` with NO `/p2p`, so we must encapsulate the provider's id before
@@ -46,11 +53,14 @@ async function dialPeerAddrs(libp2p: Libp2p, peer: PeerId, addrs: Multiaddr[]): 
   for (const addr of addrs) {
     if (libp2p.getConnections(peer).length > 0) return true; // already connected (this or a concurrent path)
     try {
+      dlog(`dial ${addr.toString()}`);
       await libp2p.dial(addr, { signal: AbortSignal.timeout(PER_ADDR_DIAL_MS) });
+      dlog(`dial OK ${addr.toString()}`);
       return true;
-    } catch {
+    } catch (e) {
       // A failed webrtc-direct dial leaves a half-open PeerConnection / dial-backoff that makes the
       // NEXT addr time out too; tear it down so the next attempt starts clean.
+      dlog(`dial FAIL ${addr.toString()}: ${e instanceof Error ? e.message : String(e)}`);
       await libp2p.hangUp(peer).catch(() => {});
     }
   }
@@ -89,6 +99,8 @@ export async function warmRoot(libp2p: Libp2p, root: string): Promise<void> {
   }
   const signal = AbortSignal.timeout(FIND_TIMEOUT_MS);
   const dialed = new Set<string>();
+  let seen = 0;
+  dlog(`warmRoot ${root}: findProviders…`);
   try {
     // libp2p.contentRouting, NOT helia.routing: Helia's Routing.findProviders merges the router
     // output with a PERPETUAL FIND_PEER address-refresh queue generator that never ends and ignores
@@ -96,20 +108,30 @@ export async function warmRoot(libp2p: Libp2p, root: string): Promise<void> {
     // single router (the custom DHT) anyway, so that merge layer is pure overhead — go straight to
     // the libp2p layer, which terminates on the signal and returns providers with their addresses.
     for await (const prov of libp2p.contentRouting.findProviders(cid, { signal })) {
+      seen++;
       if (dialed.size >= MAX_DIALS) break;
       const id = prov.id.toString();
       if (id === libp2p.peerId.toString() || dialed.has(id)) continue;
+      // Log ALL advertised addrs (not just the dialable ones) so a provider that offers only
+      // undialable addrs — e.g. a NATed desktop with no /p2p-circuit/webrtc because its relay
+      // reservation never landed — is visibly distinct from one we chose not to dial.
+      dlog(`provider ${id.slice(-8)} addrs=[${prov.multiaddrs.map((m) => m.toString()).join(", ") || "<none>"}]`);
       const addrs = prov.multiaddrs.filter((m) => dialable(m.toString())).map((m) => withPeerId(m, id));
-      if (!addrs.length) continue; // no browser-reachable address at all (only a bare TCP/QUIC desktop
-      // with neither a public webrtc-direct nor a /p2p-circuit/webrtc relay address)
+      if (!addrs.length) {
+        dlog(`provider ${id.slice(-8)}: no browser-dialable addr — skipping`);
+        continue; // no browser-reachable address at all (only a bare TCP/QUIC desktop
+        // with neither a public webrtc-direct nor a /p2p-circuit/webrtc relay address)
+      }
       dialed.add(id);
       // Don't await: one slow provider must not hold up the others, and nothing downstream needs the
       // connection to exist — bitswap will use it if it lands in time. Per-addr dialing (not the raw
       // addr array) because a plain dial(addrs) hangs on the provider's unreachable addresses.
       void dialPeerAddrs(libp2p, prov.id, addrs).catch(() => {});
     }
-  } catch {
+    dlog(`warmRoot ${root}: ${seen} provider(s) seen, ${dialed.size} dialed`);
+  } catch (e) {
     /* no providers, or the DHT timed out — bitswap falls back to the seed */
+    dlog(`warmRoot ${root}: findProviders ended (${seen} seen): ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
