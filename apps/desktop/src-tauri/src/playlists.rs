@@ -40,6 +40,9 @@ const LIKED_TITLE: &str = "Liked Tracks";
 const RENEW_MARGIN_SECS: i64 = 24 * 3600;
 /// A name-only deep link stops waiting for gossip after this (≈ one announce cycle).
 const PENDING_EXPIRY_SECS: i64 = 15 * 60;
+/// Don't re-pull a peer's full disclosure set more often than this. A pull is two stream round-trips;
+/// this dedupes reconnect churn while still re-pulling a peer that comes back after a real absence.
+const PULL_COOLDOWN_SECS: i64 = 5 * 60;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -750,6 +753,16 @@ impl Playlists {
         .unwrap_or((false, false, false))
     }
 
+    /// The seq we hold for `name`, or None if we hold no copy — the `want`-filter for a peer pull. */
+    fn local_seq(&self, name: &str) -> Option<u64> {
+        let db = self.db.lock().unwrap();
+        db.query_row("SELECT seq FROM playlists WHERE name=?1", params![name], |r| r.get::<_, i64>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .map(|s| s as u64)
+    }
+
     pub fn get(&self, name: &str) -> Result<Option<PlaylistDetail>> {
         let db = self.db.lock().unwrap();
         let row = db
@@ -867,6 +880,55 @@ impl Playlists {
                 }
                 Err(e) => log::debug!(target: "playlist", "want {} at {}: {e}", name, p.peer),
             }
+        }
+    }
+
+    /// Proactive discovery pull: ask a just-met peer for its WHOLE disclosure set and force-reannounce
+    /// anything we lack or that it holds a newer seq of. Gossipsub never replays history to us and a
+    /// holder only re-announces on its ~15-min cycle, so without this a freshly-met peer's playlists
+    /// take minutes to surface; the reannounced docs ride gossip into the normal sync loop, into
+    /// Discover. Mirrors the browser's pullFromPeer. The seed discloses nothing (records-only), so its
+    /// caller skips it; any other unsupported/old peer answers supported=false — a normal no-op.
+    async fn pull_from_peer(&self, peer_id: &str) {
+        let (entries, _reann, supported) = match self.rpc.playlist_peer_list(peer_id, &[]).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!(target: "playlist", "pull-list {peer_id}: {e}");
+                return;
+            }
+        };
+        if !supported || entries.is_empty() {
+            return;
+        }
+        let want: Vec<String> = entries
+            .into_iter()
+            .filter(|e| self.local_seq(&e.name).map_or(true, |s| s < e.seq)) // missing, or peer is newer
+            .map(|e| e.name)
+            .collect();
+        if want.is_empty() {
+            return;
+        }
+        log::debug!(target: "playlist", "pull from {peer_id}: want {} playlist(s)", want.len());
+        if let Err(e) = self.rpc.playlist_peer_list(peer_id, &want).await {
+            log::debug!(target: "playlist", "pull-want {peer_id}: {e}");
+        }
+    }
+
+    /// Pull the disclosure set from every newly-met non-master peer (cooldown-gated via `pulled`, which
+    /// the caller owns across ticks). Driven by the sync loop; this is what makes desktop↔browser sync
+    /// prompt in BOTH directions — a browser-authored playlist reaches a freshly-met desktop here, the
+    /// same way `pull_from_peer` on the browser reaches this desktop's.
+    async fn pull_new_peers(&self, pulled: &mut HashMap<String, i64>) {
+        let Ok(peers) = self.rpc.swarm_peers().await else { return };
+        let master = crate::ipfs::master_peer_id();
+        let now = now_secs();
+        pulled.retain(|_, t| now - *t < PULL_COOLDOWN_SECS); // reconnects re-pull after a real absence
+        for p in peers {
+            if p.peer == master || pulled.contains_key(&p.peer) {
+                continue; // seed holds no docs; and don't re-pull within the cooldown
+            }
+            pulled.insert(p.peer.clone(), now);
+            self.pull_from_peer(&p.peer).await;
         }
     }
 
@@ -1206,9 +1268,9 @@ fn row_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlaylistMeta> {
     })
 }
 
-/// The background driver: a ~20s sync poll, and a jittered ~15-minute announce cycle
-/// (the suppression that makes this polite lives node-side; expired-own renewal lives
-/// in `announce_once`).
+/// The background driver: a ~20s sync poll, a per-tick pull of newly-met peers, and a jittered
+/// ~5-minute announce cycle (the suppression that makes this polite lives node-side; expired-own
+/// renewal lives in `announce_once`). The pull is the prompt path; the announce cycle is the backstop.
 pub async fn run_loops(pl: Arc<Playlists>, app: tauri::AppHandle) {
     // Every client always has a private "Liked Tracks" playlist (Spotify-style): create
     // it eagerly so it's in the library from first launch. Detached so a slow/absent
@@ -1224,8 +1286,10 @@ pub async fn run_loops(pl: Arc<Playlists>, app: tauri::AppHandle) {
     });
     let mut cursor = 0u64;
     let mut ticks: u64 = 0;
-    // First announce soon after startup (make our playlists discoverable), then ~15min.
+    // First announce soon after startup (make our playlists discoverable), then ~5min.
     let mut next_announce: u64 = 2;
+    // Peers we've already pulled the disclosure set from (peer id -> last-pull secs), cooldown-gated.
+    let mut pulled: HashMap<String, i64> = HashMap::new();
     loop {
         // Coalesced push: any tick that changed the local store (a synced/updated/
         // tombstoned playlist, a budget eviction, or a seen-tier decay) emits a single
@@ -1234,13 +1298,20 @@ pub async fn run_loops(pl: Arc<Playlists>, app: tauri::AppHandle) {
         let (next_cursor, synced) = pl.sync_once(cursor).await;
         cursor = next_cursor;
         pl.push_manifest().await; // no-op unless the disclosure set changed
+        // Proactively pull any peer we've newly met — the prompt half of desktop↔browser sync (the
+        // ~15-min announce cycle below is only the backstop). A pulled peer's docs arrive via the
+        // reannounce → gossip → sync_once path above, so the next tick's `synced` reflects them.
+        pl.pull_new_peers(&mut pulled).await;
         ticks += 1;
         let mut decayed = false;
         if ticks >= next_announce {
             decayed = pl.announce_once().await;
-            // 45 ticks ≈ 15min; ±20% jitter from the clock (no rand dependency).
-            let jitter = (now_secs() as u64 % 19) as i64 - 9;
-            next_announce = ticks + (45i64 + jitter).max(1) as u64;
+            // 15 ticks ≈ 5min; ±3-tick (±1min) jitter from the clock (no rand dependency). This is the
+            // BACKSTOP cadence now that `pull_new_peers` gives directly-met peers their playlists in
+            // seconds — it only carries convergence to peers the pull can't reach (relay-only paths).
+            // Must stay above PULL/announce-window so a solo holder's own re-announce isn't suppressed.
+            let jitter = (now_secs() as u64 % 7) as i64 - 3;
+            next_announce = ticks + (15i64 + jitter).max(1) as u64;
         }
         if synced || decayed {
             let _ = app.emit("playlists:changed", ());

@@ -6,7 +6,7 @@
 // ever dials the author. That is what makes a browser (which cannot be dialled) a first-class
 // publisher rather than a second-class reader.
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { PeerId, Stream } from "@libp2p/interface";
+import type { IdentifyResult, PeerId, Stream } from "@libp2p/interface";
 import type { Libp2p } from "libp2p";
 import { lpStream } from "it-length-prefixed-stream";
 import { createIPNSRecord, marshalIPNSRecord, unmarshalIPNSRecord } from "./ipns-compat.ts";
@@ -35,9 +35,13 @@ export { exportKeys, importKeys, requestPersistence } from "./keys.ts";
 export { buildLink, parseLink } from "./link.ts";
 
 const BUDGET_BYTES = 50 * 1024 * 1024; // seen-tier only; library rows are exempt
-const ANNOUNCE_MS = 15 * 60 * 1000;
+const ANNOUNCE_MS = 5 * 60 * 1000; // backstop cadence (the on-connect pull is the prompt path)
 const BEACON_MS = 60 * 60 * 1000;
 const LIKED_TITLE = "Liked Tracks";
+/** Don't re-pull the disclosure set from the same peer more than once per this window. A pull is two
+ *  cheap stream round-trips, but a flapping connection shouldn't turn it into a dial storm. Long
+ *  enough to dedupe reconnect churn, short enough that a genuinely new peer is pulled promptly. */
+const PULL_COOLDOWN_SECS = 5 * 60;
 
 const b64 = (b: Uint8Array): string => btoa(String.fromCharCode(...b));
 const unb64 = (s: string): Uint8Array => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
@@ -116,6 +120,9 @@ export class Playlists {
   private plRate = new PeerRateLimiter();
   private plCooldown = new ReannounceCooldown();
   private beacons = new BeaconLedger();
+  /** Peers we've pulled the disclosure set from, and when — the per-peer PULL_COOLDOWN_SECS gate. */
+  private pulledPeers = new Map<string, number>();
+  private onIdentify?: (ev: CustomEvent<IdentifyResult>) => void;
 
   static async create(libp2p: Libp2p, onChange: () => void): Promise<Playlists> {
     const p = new Playlists();
@@ -134,6 +141,7 @@ export class Playlists {
   stop(): void {
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
+    if (this.onIdentify) this.libp2p.removeEventListener("peer:identify", this.onIdentify);
     void this.libp2p.unhandle(PLAYLIST_LIST_PROTOCOL).catch(() => {});
   }
 
@@ -182,6 +190,47 @@ export class Playlists {
       },
       { maxInboundStreams: 32, maxOutboundStreams: 64 }
     );
+
+    // Proactive pull: gossipsub never replays history to a newcomer, and a holder only re-announces
+    // on its ~15-min cycle — so without this a fresh browser waits minutes to see a peer's playlists.
+    // On meeting a peer that speaks playlist-list, ask for its disclosure set and `want` what we lack;
+    // the holder re-gossips those (suppression-bypassing) and they land in Discover within seconds.
+    // We gate on identify (protocols known) so we never dial a peer that can't serve it (the seed does
+    // support it but discloses nothing — a cheap no-op). Fires for BOTH sides: a desktop pulling a
+    // browser this way is how a browser-authored playlist reaches a freshly-met desktop.
+    this.onIdentify = (ev) => {
+      if (ev.detail.protocols?.includes(PLAYLIST_LIST_PROTOCOL)) void this.pullFromPeer(ev.detail.peerId);
+    };
+    this.libp2p.addEventListener("peer:identify", this.onIdentify);
+    // Peers already connected+identified before we subscribed won't re-fire identify — pull them now.
+    for (const peer of this.libp2p.getPeers()) void this.pullFromPeer(peer);
+  }
+
+  /** Ask a just-met peer for its disclosure set and force-reannounce anything we're missing or that
+   *  it holds a newer seq of. The reannounced docs arrive through the normal gossip → ingest path,
+   *  populating the Discover (seen) tier. Per-peer cooldown-gated; never throws to the caller. */
+  private async pullFromPeer(peerId: PeerId): Promise<void> {
+    const id = peerId.toString();
+    const now = nowSecs();
+    if (now - (this.pulledPeers.get(id) ?? 0) < PULL_COOLDOWN_SECS) return;
+    this.pulledPeers.set(id, now);
+    try {
+      const listed = await this.peerPlaylists(peerId, []); // round 1: what does it hold?
+      if (!listed.supported || listed.playlists.length === 0) return;
+      const local = new Map((await this.store.list()).map((r) => [r.name, r]));
+      const want = listed.playlists
+        .filter((e) => {
+          const l = local.get(e.name);
+          return !l || l.seq < e.seq; // missing, or the peer holds a newer version
+        })
+        .map((e) => e.name);
+      if (want.length === 0) return;
+      await this.peerPlaylists(peerId, want.slice(0, PL_WANT_MAX)); // round 2: make it reannounce them
+    } catch {
+      // A peer that dropped, rate-limited us, or speaks an incompatible build is not an error — the
+      // periodic announce cycle remains the backstop. Clear the gate so a later retry can pull.
+      this.pulledPeers.delete(id);
+    }
   }
 
   /** Ingest a gossiped envelope. Re-verifies from scratch: the topic validator may have run on a
@@ -438,7 +487,7 @@ export class Playlists {
       if (!row.is_mine && !row.held) continue;
       if (row.tombstoned) continue;
       const seen = this.lastSeen.get(row.name) ?? 0;
-      if (now - seen < 10 * 60) continue; // playlistAnnounceWindow
+      if (now - seen < 4 * 60) continue; // playlistAnnounceWindow (kept below ANNOUNCE_MS)
 
       if (row.is_mine && row.published) {
         const key = await loadKey(row.name);

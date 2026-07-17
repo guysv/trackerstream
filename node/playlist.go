@@ -50,8 +50,10 @@ var (
 	// playlistAnnounceWindow is the re-announce suppression horizon: a playlist seen
 	// announced on the topic within this window is NOT re-announced by us — whoever's
 	// jitter fires first wins, so steady state converges to ~one announce per playlist
-	// per window network-wide instead of holders × playlists.
-	playlistAnnounceWindow = 10 * time.Minute
+	// per window network-wide instead of holders × playlists. Kept BELOW the Rust announce
+	// cycle (~5min) so a solo holder's own cycle isn't self-suppressed; the on-connect pull
+	// (playlists.rs) is the prompt path, so this only floors the backstop's traffic.
+	playlistAnnounceWindow = 4 * time.Minute
 
 	// Per-peer playlist-topic rate caps, charged against the peer we RECEIVED from
 	// (first hop): a flood dies at the spammer's own neighbors and never rides the
