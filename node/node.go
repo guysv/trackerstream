@@ -402,6 +402,13 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	// advertises itself as a donor, because it never forwards.
 	go n.reprovideLoop(ctx, 22*time.Hour)
 
+	// Mesh membership (R6 star→mesh): keep a few DIRECT edges to OTHER clients so gossipsub grafts
+	// client↔client links instead of funneling everything through the master. Clients only — the
+	// server is already connected to everyone; and only with bootstrap (nothing to discover otherwise).
+	if cfg.Role == RoleClient && len(bootstrap) > 0 {
+		go n.meshLoop(ctx)
+	}
+
 	// Dial the configured bootstrap peers (the box) AFTER Bitswap is up, so its connection
 	// notifiee catches the Connected event (the broadcast-want path depends on it). The DHT's
 	// own notifiee seeds the routing table from the same connection; we then kick a routing
@@ -822,6 +829,34 @@ func isBareWebRTCAddr(a multiaddr.Multiaddr) bool {
 func endsInCircuit(a multiaddr.Multiaddr) bool {
 	ps := a.Protocols()
 	return len(ps) > 0 && ps[len(ps)-1].Code == multiaddr.P_CIRCUIT
+}
+
+// hasCircuit reports whether a contains a "/p2p-circuit" component ANYWHERE — true for both a bare
+// reservation "…/p2p-circuit" and a transport-encapsulated "…/p2p-circuit/webrtc". (endsInCircuit,
+// which checks only the last component, misses the latter.)
+func hasCircuit(a multiaddr.Multiaddr) bool {
+	for _, p := range a.Protocols() {
+		if p.Code == multiaddr.P_CIRCUIT {
+			return true
+		}
+	}
+	return false
+}
+
+// selfDialable reports whether another peer could actually reach us: a public direct address, or a
+// live relay reservation (a "/p2p-circuit" address AutoRelay has surfaced). A client with neither is
+// a ghost — advertising it to the donor rendezvous only makes finders waste a dial. This is the Go
+// analog of the web client's getMultiaddrs()-based `dialable` gate (apps/web/src/lib/offload.ts).
+func (n *Node) selfDialable() bool {
+	if n.control.Reachable() == "public" {
+		return true
+	}
+	for _, a := range n.host.Addrs() {
+		if hasCircuit(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // serverResourceManager builds a resource manager with raised System/Transient/Peer conn +

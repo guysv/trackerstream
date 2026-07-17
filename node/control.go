@@ -42,8 +42,13 @@ func newControl(n *Node) *control {
 
 // start wires the event subscription + connection notifiee and launches the presence loop.
 func (c *control) start(ctx context.Context) error {
+	// Subscribe to BOTH reachability and local-address changes. Reachability→public catches the
+	// public-donor case; EvtLocalAddressesUpdated catches a NAT'd client acquiring a relay
+	// reservation (which does NOT fire a reachability event) so its self-list happens promptly
+	// instead of waiting up to the 22h reprovide sweep.
 	sub, err := c.node.host.EventBus().Subscribe(
-		new(event.EvtLocalReachabilityChanged), eventbus.BufSize(16))
+		[]any{new(event.EvtLocalReachabilityChanged), new(event.EvtLocalAddressesUpdated)},
+		eventbus.BufSize(16))
 	if err != nil {
 		return err
 	}
@@ -57,16 +62,18 @@ func (c *control) start(ctx context.Context) error {
 				if !ok {
 					return
 				}
-				ev := e.(event.EvtLocalReachabilityChanged)
-				c.mu.Lock()
-				c.reachable = ev.Reachability
-				c.mu.Unlock()
-				c.node.logf("reachability → %s", ev.Reachability)
-				// A publicly-reachable CLIENT is now a usable block-forwarding donor — advertise the
-				// rendezvous so NAT'd peers' AutoRelay peer source can find it (R5). The reprovide
-				// loop refreshes it (and stops on a public→private flap). The seed never advertises as
-				// a donor — it doesn't forward.
-				if ev.Reachability == network.ReachabilityPublic && c.node.cfg.Role == RoleClient {
+				if ev, isReach := e.(event.EvtLocalReachabilityChanged); isReach {
+					c.mu.Lock()
+					c.reachable = ev.Reachability
+					c.mu.Unlock()
+					c.node.logf("reachability → %s", ev.Reachability)
+				}
+				// A DIALABLE CLIENT (public OR holding a live relay reservation) is a mesh member and a
+				// usable block-forwarding donor — advertise the rendezvous so other peers' eager-dial /
+				// AutoRelay peer source can find it (R6 star→mesh). Fires on either event; the reprovide
+				// loop refreshes it and stops on a public→private flap / dropped reservation. The seed
+				// never advertises as a donor — it doesn't forward.
+				if c.node.cfg.Role == RoleClient && c.node.selfDialable() {
 					c.node.provideNow(donorRendezvous)
 				}
 			}

@@ -35,7 +35,18 @@ type catalogMsg struct {
 func newPubSub(ctx context.Context, h host.Host) (*PubSub, error) {
 	// 2 MiB max message: a max-size playlist doc (1 MiB, validator-capped) + record +
 	// envelope framing must fit; the gossipsub default is 1 MiB.
-	ps, err := pubsub.NewGossipSub(ctx, h, pubsub.WithMaxMessageSize(2<<20))
+	//
+	// WithPeerExchange (R6, star→mesh): when a node's topic mesh overflows D_hi (12) it PRUNEs a
+	// peer and hands it signed peer records of other members; the pruned peer auto-dials + grafts
+	// them, so the mesh SELF-HEALS off the master without a DHT lookup. The load-bearing node is the
+	// master (the hub — first to exceed D_hi and prune), but enabling it on every role is symmetric
+	// and harmless (a client whose mesh never overflows simply never emits PX). Deliberately NOT
+	// OnlyPublicAddrsOnPeerExchange: that would strip the /p2p-circuit(/webrtc) + LAN addrs NAT'd
+	// clients depend on. Signed peer records come from identify by default — PX needs no extra wiring.
+	ps, err := pubsub.NewGossipSub(ctx, h,
+		pubsub.WithMaxMessageSize(2<<20),
+		pubsub.WithPeerExchange(true),
+	)
 	if err != nil {
 		return nil, err
 	}

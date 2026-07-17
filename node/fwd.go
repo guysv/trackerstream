@@ -24,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-msgio"
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 	"golang.org/x/time/rate"
 )
 
@@ -497,6 +498,13 @@ func donorPeerSource(idhtPtr **dht.IpfsDHT, self peer.ID, bootstrap []peer.AddrI
 					continue
 				}
 				seen[p.ID] = struct{}{}
+				// AutoRelay needs PUBLIC relay-capable candidates. Since the donor rendezvous now also
+				// carries NAT'd (circuit-only) self-listers (R6 star→mesh), skip anything without a
+				// public direct addr — restoring exactly the population the old public-only gate
+				// guaranteed. Those NAT'd peers are consumed by the mesh eager-dial loop instead.
+				if !hasPublicDirectAddr(p) {
+					continue
+				}
 				if !emit(p) {
 					return
 				}
@@ -504,6 +512,22 @@ func donorPeerSource(idhtPtr **dht.IpfsDHT, self peer.ID, bootstrap []peer.AddrI
 		}()
 		return out
 	}
+}
+
+// hasPublicDirectAddr keeps only relay-viable AddrInfos: at least one NON-circuit, public routable
+// addr. A circuit-fronted peer is itself NAT'd and cannot relay us; a private/LAN-only addr is not
+// a viable public relay. Used to keep NAT'd donor-rendezvous self-listers out of AutoRelay's
+// candidate set (they are for the mesh loop, not for relaying).
+func hasPublicDirectAddr(ai peer.AddrInfo) bool {
+	for _, a := range ai.Addrs {
+		if hasCircuit(a) {
+			continue
+		}
+		if manet.IsPublicAddr(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // relayHopID extracts B from a /…/p2p/<B>/p2p-circuit/… addr — the donor that fronts a NAT'd

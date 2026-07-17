@@ -204,12 +204,15 @@ func (n *Node) reprovideLoop(ctx context.Context, interval time.Duration) {
 				}
 				cancel()
 			}
-			// Donor rendezvous (R5): advertise iff we're a public CLIENT donor (the seed never forwards,
-			// so it never advertises as a donor). Gating each sweep on the LIVE reachability verdict
-			// means a public→private flap simply stops re-advertising on the next sweep — auto-
-			// deadvertise without bookkeeping. NOT added to the pinset (would pollute pin ls /
-			// verify-pinset); providing a CID we don't hold is fine (it's a peer assertion).
-			if n.cfg.Role == RoleClient && n.control.Reachable() == "public" {
+			// Donor rendezvous: advertise iff we're a DIALABLE CLIENT (the seed never forwards, so it
+			// never advertises as a donor). Was gated on Reachable()=="public"; now gated on
+			// selfDialable() (public OR a live relay reservation) so NAT'd clients self-list too and
+			// become mesh members (R6 star→mesh) — the mesh eager-dial loop dials them over their
+			// /p2p-circuit/webrtc addr. Gating each sweep on the LIVE verdict keeps the auto-deadvertise
+			// property: a public→private flap or a dropped reservation simply stops re-advertising on
+			// the next sweep. NOT added to the pinset (would pollute pin ls / verify-pinset); providing
+			// a CID we don't hold is fine (it's a peer assertion).
+			if n.cfg.Role == RoleClient && n.selfDialable() {
 				cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				if err := n.dht.Provide(cctx, donorRendezvous, true); err != nil {
 					n.logf("reprovide donor-rendezvous failed: %v", err)
