@@ -194,6 +194,27 @@ const donorRendezvousCid = (): Promise<CID> =>
     return CID.createV1(0x55, h);
   })());
 
+/** Advertise THIS browser to the donor rendezvous so other clients discover it and mesh with it —
+ *  the self-list half of the eager-dial loop (R6 star→mesh). Before this a browser only ever
+ *  `provide`d the roots it held (content discovery), never the rendezvous CID, so it was findable as
+ *  a source but invisible as a mesh member: it dialed public donors but nobody dialed it back.
+ *
+ *  Gated on the SAME "am I dialable?" test `Provider.provide` uses — a browser with no relay
+ *  reservation is undialable, and a rendezvous record pointing at it is a trap for whoever finds it
+ *  (see the churn note on Provider). Re-provided each sweep to keep the record fresh while the tab is
+ *  open; the gate re-checks liveness every time, so a browser that loses its reservation stops. */
+async function provideMembershipOnce(libp2p: Libp2p): Promise<void> {
+  const reachable = libp2p.getMultiaddrs().some((m) => dialable(m.toString()));
+  if (!reachable) return; // no relay reservation yet — nothing dialable to advertise
+  try {
+    const cid = await donorRendezvousCid();
+    await libp2p.contentRouting.provide(cid);
+    dlog("membership: advertised self to donor rendezvous");
+  } catch (e) {
+    dlog(`membership: provide failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 /** One discovery sweep: find the public donors and dial the browser-dialable ones we're not already
  *  connected to. Best-effort and fire-and-forget — a failed dial or an empty DHT is fine. */
 async function connectDonorsOnce(libp2p: Libp2p): Promise<void> {
@@ -221,9 +242,14 @@ async function connectDonorsOnce(libp2p: Libp2p): Promise<void> {
 }
 
 /** Start the eager mesh-membership loop: one sweep now, then every DONOR_DISCOVERY_INTERVAL_MS.
- *  Returns a stop function. */
+ *  Each sweep both ADVERTISES this browser to the rendezvous (so others mesh with it) and DIALS the
+ *  donors it finds. Returns a stop function. */
 export function startDonorDiscovery(libp2p: Libp2p): () => void {
-  void connectDonorsOnce(libp2p);
-  const timer = setInterval(() => void connectDonorsOnce(libp2p), DONOR_DISCOVERY_INTERVAL_MS);
+  const sweep = (): void => {
+    void provideMembershipOnce(libp2p);
+    void connectDonorsOnce(libp2p);
+  };
+  sweep();
+  const timer = setInterval(sweep, DONOR_DISCOVERY_INTERVAL_MS);
   return () => clearInterval(timer);
 }

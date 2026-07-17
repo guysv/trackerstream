@@ -170,7 +170,10 @@ export async function startNode(): Promise<TsNode> {
         // table with nothing to query and every lookup times out having asked nobody.
         peerInfoMapper: passthroughMapper,
       }),
-      pubsub: gossipsub({ maxInboundDataLength: MAX_PUBSUB_MSG }),
+      // doPX (R6 star→mesh): when we prune a topic-mesh peer, hand it signed peer records of other
+      // members so it re-meshes without a DHT walk — parity with node/pubsub.go's WithPeerExchange.
+      // Low-impact on a browser (it rarely overflows a mesh and prunes), but symmetric and harmless.
+      pubsub: gossipsub({ maxInboundDataLength: MAX_PUBSUB_MSG, doPX: true }),
     },
   });
 
