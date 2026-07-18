@@ -72,6 +72,9 @@ export class WebClient implements NodeClient {
 
     const ts = await startNode();
     mark("startNode (fetchBootstrap + dial seed)");
+    // Dev-only handle for inspecting the live node from the console (connections, peerStore, redial
+    // state) — indispensable for debugging the promoted-node reconnect. Gated, never in prod.
+    if (import.meta.env?.DEV || import.meta.env?.VITE_EXPOSE_NODE) (globalThis as { __tsnode?: TsNode }).__tsnode = ts;
     const fs = unixfs(ts.helia);
 
     // Resolve the catalog's IPNS name over the custom DHT, verifying the record locally — the node

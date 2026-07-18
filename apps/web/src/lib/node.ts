@@ -214,11 +214,20 @@ export async function startNode(): Promise<TsNode> {
 
   const masterId = boot.peerId;
 
+  // Every master dial MUST be bounded. A webrtc-direct dial has no inherent deadline, and against a
+  // master that still holds a half-open connection to our PeerId — the exact state right after a
+  // multi-tab failover promotes a new node under the SAME persisted identity — the dial neither
+  // succeeds nor fails: it HANGS. An unbounded hang inside redialOnce() below would leave the
+  // supervisor's `supervising` flag stuck true forever, so every later tick early-returns and the
+  // node never reconnects (observed: promoted tab sits at 0 peers indefinitely). The timeout turns a
+  // hang into a fast failure the supervisor can back off and retry — so once the master finally drops
+  // the departed tab's connection, a redial lands.
+  const DIAL_TIMEOUT_MS = 12_000;
   const dial = async (b: Bootstrap): Promise<void> => {
     let last: unknown;
     for (const a of b.addrs) {
       try {
-        await libp2p.dial(multiaddr(a));
+        await libp2p.dial(multiaddr(a), { signal: AbortSignal.timeout(DIAL_TIMEOUT_MS) });
         return;
       } catch (e) {
         last = e;
