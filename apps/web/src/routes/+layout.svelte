@@ -2,16 +2,19 @@
   // The web shell: boot a js-libp2p node, install it as the NodeClient, then mount the SAME app the
   // desktop runs. This file plus lib/client/web.ts is the entire difference between the two.
   import { AppShell, setClient } from "@trackerstream/ui";
-  import { WebClient } from "$lib/client/web";
+  import { bootClient } from "$lib/multitab/boot";
   import "@trackerstream/ui/theme.css";
 
   let { children } = $props();
 
-  // The node has to exist before any store touches client(), so the app doesn't mount until it does.
-  // Booting is a real network round-trip (fetch /bootstrap.json -> dial the seed over webrtc-direct
-  // -> resolve the catalog's IPNS name), so it gets an honest progress line rather than a blank page.
+  // The client has to exist before any store touches client(), so the app doesn't mount until it does.
+  // bootClient elects a leader over Web Locks: this tab either boots the real js-libp2p node (fetch
+  // /bootstrap.json -> dial the seed over webrtc-direct -> resolve the catalog's IPNS name) or, if
+  // another tab already owns the node, attaches to it as a follower — exactly one node per origin, so
+  // the two tabs don't fight over our shared PeerId. Either way it's a real wait, so it gets an
+  // honest progress line rather than a blank page.
   let error = $state<string | null>(null);
-  const boot = WebClient.create()
+  const boot = bootClient()
     .then((c) => setClient(c))
     .catch((e) => (error = e instanceof Error ? e.message : String(e)));
 </script>

@@ -8,11 +8,9 @@ import type {
   Capabilities,
   CatalogSearchOpts,
   LinkStatus,
-  MediaKeyAction,
   ModuleHit,
   NodeClient,
   NodeInfo,
-  NowPlayingMeta,
   PeerDetail,
   PeerPlaylists,
   PeerStats,
@@ -24,6 +22,7 @@ import type {
   TrackTuple,
   Unsub,
 } from "@trackerstream/ui/client";
+import { WEB_CAPS, downloadBlob, makePlatform } from "../webplatform.ts";
 import { unixfs } from "@helia/unixfs";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { MASTER_PEER_ID } from "@trackerstream/config";
@@ -37,19 +36,7 @@ import { Provider, dialable, warmRoot } from "../offload.ts";
 import { makeOffloadFetch } from "../blockfetch.ts";
 
 export class WebClient implements NodeClient {
-  readonly caps: Capabilities = {
-    // A browser cannot execute a program. Saving still works — reassembly is byte-exact, so we hand
-    // the user the real module file as a Blob.
-    openInTracker: false,
-    logsDir: false,
-    // navigator.mediaSession routes hardware media keys to the audio-playing tab. What we cannot do
-    // is grab them system-wide while another app is focused — a weaker capability, not a missing one.
-    globalMediaKeys: false,
-    // The browser now reserves on the master (see node.ts), so it is dialable AND serves
-    // "/trackerstream/playlist-list/1.0.0" like a desktop — it both answers and asks. (The seed still
-    // doesn't serve it by design; that peer just returns supported:false, which is a normal answer.)
-    peerPlaylists: true,
-  };
+  readonly caps: Capabilities = WEB_CAPS;
 
   private readonly ts: TsNode;
   private readonly cat: CatalogClient;
@@ -291,16 +278,18 @@ export class WebClient implements NodeClient {
     // player.svelte.ts is unchanged.
     setPlayhead: async (): Promise<void> => {},
     saveModule: async (args: { root: string; md5: string; filename: string }): Promise<void> => {
-      const { reassembleAny } = await import("../rebuild.ts");
-      const bytes = await reassembleAny(CID.parse(args.root), this.block);
-      const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: "application/octet-stream" }));
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = args.filename;
-      a.click();
-      URL.revokeObjectURL(url);
+      const bytes = await this.reassembleForDownload(args.root);
+      downloadBlob(bytes, args.filename);
     },
   };
+
+  /** Reassemble a module's byte-exact original from its root CID. Split out of saveModule so the
+   *  leader can hand the bytes to a follower (which does the Blob download in its OWN tab — see
+   *  multitab/server.ts); the leader downloading here would drop the file into a background tab. */
+  async reassembleForDownload(root: string): Promise<Uint8Array> {
+    const { reassembleAny } = await import("../rebuild.ts");
+    return reassembleAny(CID.parse(root), this.block);
+  }
 
   playlists = {
     search: (q: string): Promise<PlaylistMeta[]> => this.pl.search(q) as Promise<PlaylistMeta[]>,
@@ -337,54 +326,7 @@ export class WebClient implements NodeClient {
       (await this.pl.peerPlaylists(peerIdFromString(id), [name])).reannounced,
   };
 
-  platform = {
-    log: (level: "debug" | "warn" | "error", ...args: unknown[]): void => {
-      // No log FILE in a browser — the console is the log.
-      (level === "error" ? console.error : level === "warn" ? console.warn : console.debug)(...args);
-    },
-    // The web "deep link" is simply the /p/<name> route the tab was opened on.
-    onDeepLink: (cb: (url: string) => void): Unsub => {
-      if (location.pathname.startsWith("/p/")) cb(location.href);
-      return () => {};
-    },
-    nowPlaying: (meta: NowPlayingMeta | null): void => {
-      if (!("mediaSession" in navigator)) return;
-      const ms = navigator.mediaSession;
-      if (!meta) {
-        ms.metadata = null;
-        ms.playbackState = "none";
-        return;
-      }
-      ms.metadata = new MediaMetadata({ title: meta.title, artist: meta.artist, album: "trackerstream" });
-      ms.playbackState = meta.playing ? "playing" : "paused";
-    },
-    mediaKeys: (handler: (a: MediaKeyAction) => void): Unsub => {
-      if (!("mediaSession" in navigator)) return () => {};
-      const ms = navigator.mediaSession;
-      const wire: [MediaSessionAction, MediaKeyAction][] = [
-        ["play", "play"],
-        ["pause", "pause"],
-        ["nexttrack", "next"],
-        ["previoustrack", "prev"],
-      ];
-      for (const [a, action] of wire) {
-        try {
-          ms.setActionHandler(a, () => handler(action));
-        } catch {
-          /* the browser doesn't support this action */
-        }
-      }
-      return () => {
-        for (const [a] of wire) {
-          try {
-            ms.setActionHandler(a, null);
-          } catch {
-            /* ignore */
-          }
-        }
-      };
-    },
-  };
+  platform = makePlatform();
 
   events = {
     // The browser's equivalent of the desktop's sync loop: gossip ingest fires this the instant the
