@@ -33,6 +33,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/routing"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	relay "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/libp2p/go-libp2p/p2p/protocol/holepunch"
 	webrtcprivate "github.com/libp2p/go-libp2p/p2p/transport/webrtcprivate"
@@ -128,6 +129,22 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("bootstrap: %w", err)
 	}
 
+	// Browser-reachability relay path (R6). A NATed client is reachable by a browser ONLY over its
+	// /p2p-circuit/webrtc address, but go-libp2p's AutoRelay + address manager surface circuit addrs
+	// ONLY while reachability is Private — so a (mis)flap to Public (a sample-starved AutoNAT, or a
+	// UPnP guess that isn't actually inbound-dialable) tears down the reservation and DELETES the
+	// browser's only route. We decouple the two: hold our OWN standing reservation on the master
+	// (reservationLoop) and advertise the circuit addrs while it's held (makeWebrtcCircuitAddrsFactory),
+	// regardless of AutoNAT. ModeAuto is untouched — DHT self-promotion and direct-addr advertisement
+	// still track reachability; we only stop a Public verdict from removing the relay FALLBACK.
+	var reservationHeld atomic.Bool
+	master := masterAddrInfo(bootstrap)
+	relayFallback := cfg.Role == RoleClient && len(bootstrap) > 0 && len(cfg.STUNServers) > 0
+	var relayCircuitAddrs []multiaddr.Multiaddr // /p2p/<master>/p2p-circuit(/webrtc) — advertised while held
+	if relayFallback {
+		relayCircuitAddrs = circuitWebRTCAddrs(master)
+	}
+
 	bwc := metrics.NewBandwidthCounter()
 
 	var idht *dht.IpfsDHT
@@ -219,13 +236,13 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 			opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(donorPeerSource(&idht, self, bootstrap)))
 		}
 		// Make a NATed client discoverable over private-to-private WebRTC: rewrite the advertised
-		// addrs so each AutoRelay "/p2p-circuit" reservation also surfaces as "…/p2p-circuit/webrtc"
-		// (the address a browser dials to hole-punch to us). Without this go-libp2p advertises only a
-		// bare, undialable "/webrtc" and never combines it with the reservation. Gated on the
-		// webrtcprivate transport being enabled; self-gates to Private reachability (circuit addrs
-		// only exist then). See webrtcCircuitAddrsFactory.
+		// addrs so each "/p2p-circuit" reservation also surfaces as "…/p2p-circuit/webrtc" (the
+		// address a browser dials to hole-punch to us). Without this go-libp2p advertises only a
+		// bare, undialable "/webrtc" and never combines it with the reservation. It also appends the
+		// master circuit path unconditionally while reservationLoop holds our standing reservation —
+		// so a flap to Public can't strip the browser's only route. See makeWebrtcCircuitAddrsFactory.
 		if len(cfg.STUNServers) > 0 {
-			opts = append(opts, libp2p.AddrsFactory(webrtcCircuitAddrsFactory))
+			opts = append(opts, libp2p.AddrsFactory(makeWebrtcCircuitAddrsFactory(relayCircuitAddrs, &reservationHeld)))
 		}
 		// UPnP / NAT-PMP: opportunistically map the swarm ports on a UPnP-capable home
 		// router so a NATed client becomes directly reachable — no relay/DCUtR needed.
@@ -407,6 +424,16 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 	// server is already connected to everyone; and only with bootstrap (nothing to discover otherwise).
 	if cfg.Role == RoleClient && len(bootstrap) > 0 {
 		go n.meshLoop(ctx)
+	}
+
+	// Standing relay reservation on the master (R6 browser-reachability): hold a reservation
+	// independent of AutoNAT so /p2p-circuit/webrtc stays advertised even when reachability flaps to
+	// Public (go-libp2p's AutoRelay drops its reservation there, which would leave a browser with no
+	// dialable path to this NATed client). Reserving eagerly also removes the cold-start window where
+	// a just-started client has no circuit addr yet. Runs alongside AutoRelay (both refresh the one
+	// per-peer reservation when Private; this is the sole keeper when Public).
+	if relayFallback {
+		go n.reservationLoop(ctx, master, &reservationHeld)
 	}
 
 	// Dial the configured bootstrap peers (the box) AFTER Bitswap is up, so its connection
@@ -786,35 +813,136 @@ func loadOrCreateKey(repo string) (crypto.PrivKey, error) {
 	return priv, os.WriteFile(path, data, 0o600)
 }
 
-// webrtcCircuitAddrsFactory rewrites the host's advertised addresses so a NATed client is
-// discoverable over private-to-private WebRTC. go-libp2p advertises the webrtcprivate listener as a
-// bare, undialable "/webrtc" and never combines it with the AutoRelay "/p2p-circuit" reservation
-// addresses. This factory (a) drops the bare "/webrtc" — nothing can dial it — and (b) for every
-// address ending in "/p2p-circuit", additionally advertises "…/p2p-circuit/webrtc", which is what a
-// browser dials to hole-punch to us (webrtcprivate CanDial requires circuit + webrtc). The address
-// manager only surfaces "/p2p-circuit" addrs while reachability is Private, so this self-gates to
-// genuinely-NATed desktops; a publicly-reachable one keeps only its direct webrtc-direct address.
-func webrtcCircuitAddrsFactory(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-	out := make([]multiaddr.Multiaddr, 0, len(addrs)+1)
-	seen := make(map[string]struct{}, len(addrs)+1)
-	add := func(a multiaddr.Multiaddr) {
-		s := a.String()
-		if _, ok := seen[s]; ok {
-			return
+// makeWebrtcCircuitAddrsFactory builds the AddrsFactory that makes a NATed client discoverable over
+// private-to-private WebRTC. go-libp2p advertises the webrtcprivate listener as a bare, undialable
+// "/webrtc" and never combines it with the "/p2p-circuit" reservation addresses. The factory (a)
+// drops the bare "/webrtc" — nothing can dial it; (b) for every address ending in "/p2p-circuit",
+// additionally advertises "…/p2p-circuit/webrtc", which is what a browser dials to hole-punch to us
+// (webrtcprivate CanDial requires circuit + webrtc); and (c) while `held` (our standing master
+// reservation is live, see reservationLoop) appends `extra` — the master circuit path — UNCONDITIONALLY.
+// Part (c) is the fix: the address manager only surfaces its own "/p2p-circuit" addrs while
+// reachability is Private, so a flap to Public would otherwise delete the browser's ONLY route to a
+// NATed client. Advertising the relay path while Public is a pure superset (the same address shape,
+// just kept alive); a genuinely-public client still advertises its direct webrtc-direct addr too, and
+// a browser prefers that.
+func makeWebrtcCircuitAddrsFactory(extra []multiaddr.Multiaddr, held *atomic.Bool) func([]multiaddr.Multiaddr) []multiaddr.Multiaddr {
+	return func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+		out := make([]multiaddr.Multiaddr, 0, len(addrs)+len(extra)+1)
+		seen := make(map[string]struct{}, len(addrs)+len(extra)+1)
+		add := func(a multiaddr.Multiaddr) {
+			s := a.String()
+			if _, ok := seen[s]; ok {
+				return
+			}
+			seen[s] = struct{}{}
+			out = append(out, a)
 		}
-		seen[s] = struct{}{}
-		out = append(out, a)
+		for _, a := range addrs {
+			if isBareWebRTCAddr(a) {
+				continue
+			}
+			add(a)
+			if endsInCircuit(a) {
+				add(a.Encapsulate(webrtcprivate.WebRTCAddr))
+			}
+		}
+		if held.Load() {
+			for _, a := range extra {
+				add(a)
+			}
+		}
+		return out
 	}
-	for _, a := range addrs {
-		if isBareWebRTCAddr(a) {
-			continue
+}
+
+// masterAddrInfo folds all bootstrap entries sharing the first entry's peer ID into one AddrInfo for
+// the master relay — the box is listed once per transport. Zero value (empty ID) when no bootstrap.
+func masterAddrInfo(bootstrap []peer.AddrInfo) peer.AddrInfo {
+	if len(bootstrap) == 0 {
+		return peer.AddrInfo{}
+	}
+	m := peer.AddrInfo{ID: bootstrap[0].ID}
+	for _, ai := range bootstrap {
+		if ai.ID == m.ID {
+			m.Addrs = append(m.Addrs, ai.Addrs...)
 		}
-		add(a)
-		if endsInCircuit(a) {
-			add(a.Encapsulate(webrtcprivate.WebRTCAddr))
-		}
+	}
+	return m
+}
+
+// circuitWebRTCAddrs builds the advertise set for reaching THIS node through the master relay: for
+// each master transport addr, "<addr>/p2p/<master>/p2p-circuit" and its "…/p2p-circuit/webrtc" variant
+// (what a browser dials to hole-punch in). Mirrors exactly the addrs the address manager surfaces when
+// Private, so advertising them while held is a superset — no new address shape, just kept alive.
+func circuitWebRTCAddrs(master peer.AddrInfo) []multiaddr.Multiaddr {
+	if master.ID == "" {
+		return nil
+	}
+	suffix := multiaddr.StringCast("/p2p/" + master.ID.String() + "/p2p-circuit")
+	out := make([]multiaddr.Multiaddr, 0, len(master.Addrs)*2)
+	for _, a := range master.Addrs {
+		base := a.Encapsulate(suffix)
+		out = append(out, base, base.Encapsulate(webrtcprivate.WebRTCAddr))
 	}
 	return out
+}
+
+// reservationLoop keeps a live circuit-v2 reservation on the master relay regardless of AutoNAT
+// reachability, flipping `held` so the AddrsFactory advertises the circuit path. go-libp2p's own
+// AutoRelay only reserves while Private and tears the reservation — and the browser-dialable
+// /p2p-circuit/webrtc addr — down on a flip to Public, which is fatal for a NATed client a browser
+// can reach ONLY via the relay. This runs alongside AutoRelay: when Private both refresh the one
+// per-peer reservation; when Public this is the sole keeper. Refreshes before the voucher expires;
+// retries on error.
+func (n *Node) reservationLoop(ctx context.Context, master peer.AddrInfo, held *atomic.Bool) {
+	const (
+		retryWait  = 30 * time.Second
+		refreshPad = 5 * time.Minute // renew this long before the voucher expires
+		minWait    = time.Minute
+	)
+	wait := func(d time.Duration) bool {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-t.C:
+			return true
+		}
+	}
+	for {
+		if n.host.Network().Connectedness(master.ID) != network.Connected {
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := n.host.Connect(cctx, master)
+			cancel()
+			if err != nil {
+				held.Store(false)
+				if !wait(retryWait) {
+					return
+				}
+				continue
+			}
+		}
+		rctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		rsvp, err := relayclient.Reserve(rctx, n.host, master)
+		cancel()
+		if err != nil {
+			held.Store(false)
+			n.logf("master relay reservation failed: %v", err)
+			if !wait(retryWait) {
+				return
+			}
+			continue
+		}
+		held.Store(true)
+		renew := time.Until(rsvp.Expiration) - refreshPad
+		if renew < minWait {
+			renew = minWait
+		}
+		if !wait(renew) {
+			return
+		}
+	}
 }
 
 // isBareWebRTCAddr reports whether a is the lone "/webrtc" listener address (undialable without a
