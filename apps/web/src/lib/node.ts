@@ -276,40 +276,76 @@ export async function startNode(): Promise<TsNode> {
     }
   };
 
-  // Re-fetch /bootstrap.json, then redial. The re-fetch is the whole point: a seed RESTART is the
-  // common reason we lose the master, and a restart ROTATES the certhash — so the addr we hold is
-  // already dead and dialing it again just fails. Only the endpoint knows the live one.
-  let attempt = 0;
-  const redialOnce = async (): Promise<void> => {
-    try {
-      const fresh = await fetchBootstrap();
-      // Tear down the corpse BEFORE dialing. hangUp closes the zombie connection and, with the
-      // peerStore purge, stops libp2p from deduping the new dial onto the dead certhash — the exact
-      // reason a plain redial "succeeds" and still talks to nobody.
-      await libp2p.hangUp(masterPeer).catch(() => {});
-      await libp2p.peerStore.delete(masterPeer).catch(() => {});
-      await dial(fresh);
-      attempt = 0;
-    } catch (e) {
-      if (import.meta.env?.DEV || import.meta.env?.VITE_EXPOSE_NODE) {
-        console.warn(`[redial] attempt ${attempt} failed:`, e instanceof Error ? e.message : e);
-      }
-      attempt++;
+  // Track the seed's certhash so recovery can tell a RESTART from a same-certhash DROP. A restart
+  // ROTATES the certhash, so the fresh bootstrap advertises a genuinely-new, dialable endpoint and a
+  // redial works. A drop that ISN'T a restart (idle death, network blip) keeps the SAME certhash — and
+  // js-libp2p cannot re-dial a webrtc-direct connection to a certhash it has already closed: the seed
+  // still holds our dead connection (webrtc death is slow to register there) and rejects the re-dial as
+  // a duplicate, indefinitely (js-libp2p#1835). All of a bootstrap's addrs carry the one master cert.
+  const certhashOf = (b: Bootstrap): string => {
+    for (const a of b.addrs) {
+      const h = a.split("/certhash/")[1]?.split("/")[0];
+      if (h) return h;
     }
+    return "";
+  };
+  let currentCerthash = certhashOf(boot);
+
+  let attempt = 0;
+  // Dial a fresh bootstrap. Tear down the corpse FIRST — hangUp closes the zombie and the peerStore
+  // purge stops libp2p deduping the new dial onto the dead certhash — then dial and record the certhash
+  // we are now on.
+  const dialFresh = async (fresh: Bootstrap): Promise<void> => {
+    await libp2p.hangUp(masterPeer).catch(() => {});
+    await libp2p.peerStore.delete(masterPeer).catch(() => {});
+    await dial(fresh);
+    currentCerthash = certhashOf(fresh) || currentCerthash;
+  };
+
+  // TsNode.redial(): force a re-fetch + dial. Kept for the contract (a caller can force one); the
+  // supervisor below is what actually keeps us connected.
+  const redial = async (): Promise<void> => {
+    await dialFresh(await fetchBootstrap());
+  };
+
+  // Last-resort recovery: RELOAD to get a fresh node — the ONLY thing that reconnects a same-certhash
+  // webrtc-direct drop (#1835). The PeerId is persisted (loadOrCreateKey), so a reload keeps our SAME
+  // identity: reservations, provider records and beacons survive. Guarded against reload loops two
+  // ways: (1) everConnected — reload only to recover a connection we actually HAD, so a reloaded
+  // session that can't reach the seed leaves everConnected false and stops reloading; (2) a
+  // sessionStorage cooldown, so even a flapping seed can't reload faster than RELOAD_COOLDOWN_MS.
+  const RELOAD_COOLDOWN_MS = 90_000;
+  let everConnected = true; // the initial `await dial(boot)` above succeeded
+  const RELOAD_KEY = "ts:reconnect-reload-at";
+  const canReload = (): boolean => {
+    try {
+      return Date.now() - Number(sessionStorage.getItem(RELOAD_KEY) ?? 0) > RELOAD_COOLDOWN_MS;
+    } catch {
+      return true;
+    }
+  };
+  const reloadToRecover = (): void => {
+    try {
+      sessionStorage.setItem(RELOAD_KEY, String(Date.now()));
+    } catch {
+      /* private mode / storage disabled — reload anyway; everConnected still guards the loop */
+    }
+    location.reload();
+  };
+
+  const backoff = async (): Promise<void> => {
+    attempt++;
+    await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** attempt, 15_000)));
   };
 
   // One supervisor, not an event listener: peer:disconnect fires late (and sometimes on a transient
   // blip) precisely because of the zombie problem above, so we don't trust it as the trigger. Poll
-  // liveness instead, and redial when the probe says the master is unreachable — backing off only
-  // while it stays down so a genuinely-offline seed isn't a hot loop.
-  //
-  // BEST-EFFORT, KNOWN-LIMITED. This recovers the common case (seed restart -> new certhash) in
-  // local testing, but webrtc-direct connection-death is genuinely hard to observe in js-libp2p: a
-  // zombie connection reads healthy for tens of seconds and even the liveness ping can lag, so
-  // recovery latency is measured in seconds-to-tens-of-seconds and the tail is flaky. A real fix
-  // needs the js-libp2p webrtc transport to surface connection death promptly — which lands in the
-  // planned js-libp2p fork (also needed for go<->js private-webrtc interop). Until then this is a
-  // strict improvement over "a seed restart requires a manual reload", not a guarantee.
+  // liveness; on a dead seed, decide RESTART vs DROP by the live certhash:
+  //   - bootstrap fetch FAILS  -> the endpoint (hence seed) is likely down: back off, NEVER reload.
+  //   - certhash CHANGED       -> master restarted: redial the fresh, dialable endpoint.
+  //   - certhash SAME          -> our conn is a zombie the seed still holds (#1835): reload under our
+  //                               persisted PeerId. Recovers in ~one probe+fetch, not a grind of doomed
+  //                               12s dials.
   let supervising = false;
   const supervisor = setInterval(async () => {
     if (supervising) return;
@@ -317,21 +353,39 @@ export async function startNode(): Promise<TsNode> {
     try {
       if (await masterAlive()) {
         attempt = 0;
+        everConnected = true;
         return;
       }
-      await redialOnce();
-      const backoff = Math.min(1000 * 2 ** attempt, 15_000);
-      if (attempt > 0) await new Promise((r) => setTimeout(r, backoff));
+      const dev = import.meta.env?.DEV || import.meta.env?.VITE_EXPOSE_NODE;
+      let fresh: Bootstrap;
+      try {
+        fresh = await fetchBootstrap();
+      } catch (e) {
+        if (dev) console.warn(`[redial] bootstrap fetch failed:`, e instanceof Error ? e.message : e);
+        await backoff();
+        return;
+      }
+      if (certhashOf(fresh) && certhashOf(fresh) !== currentCerthash) {
+        try {
+          await dialFresh(fresh);
+          attempt = 0;
+        } catch (e) {
+          if (dev) console.warn(`[redial] attempt ${attempt} failed:`, e instanceof Error ? e.message : e);
+          await backoff();
+        }
+        return;
+      }
+      if (everConnected && canReload()) {
+        reloadToRecover();
+        return;
+      }
+      await backoff(); // can't reload (cooldown, or never connected this session) — keep probing
     } finally {
       supervising = false;
     }
   }, 4_000);
   // (No unref: setInterval returns a number in the browser, not a Node Timeout — nothing to unref,
   // and `"unref" in <number>` would throw.)
-
-  // Kept for the TsNode.redial() contract (a caller can force one), but the supervisor is what
-  // actually keeps us connected.
-  const redial = redialOnce;
 
   // Mesh membership — parity with a NATed desktop (minus DCUtR, which needs a UDP/TCP socket the
   // browser doesn't have). Two pieces:

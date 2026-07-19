@@ -84,7 +84,7 @@ export class WebClient implements NodeClient {
     // us at once. Best-effort: pagehide's budget is tight and stop() is async, so the seed-side
     // eviction (tsnode control.go evictStale) is the reliable backstop; this just makes the common
     // reload path fast. pagehide (not unload) so it still fires on mobile/bfcache paths.
-    addEventListener("pagehide", () => void ts.libp2p.stop().catch(() => {}), { once: true });
+    addEventListener("pagehide", () => void Promise.resolve(ts.libp2p.stop()).catch(() => {}), { once: true });
 
     const fs = unixfs(ts.helia);
 
