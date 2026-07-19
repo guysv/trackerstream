@@ -32,6 +32,7 @@
 import type { PeerId } from "@libp2p/interface";
 import type { Helia } from "helia";
 import { setMaxListeners } from "@libp2p/interface";
+import { peerIdFromString } from "@libp2p/peer-id";
 import type { CID } from "multiformats/cid";
 import { sha256 } from "multiformats/hashes/sha2";
 
@@ -69,6 +70,10 @@ const HAVER_TTL_MS = 30_000;
  *  WANT-HAVE round-trip on EVERY block whenever content-less public donors are connected (the common
  *  case — donor discovery meshes with random public peers, not holders of this exact module). */
 const NO_DONOR_COOLDOWN_MS = 4_000;
+/** Targeted WANT-BLOCK attempts to the seed before giving up on it and dropping to the broadcast/DHT
+ *  last resort. The seed is the module's origin so it always holds the block; a failure here is a
+ *  transient timeout under load, not a real absence, so a couple of retries clears it. */
+const SEED_ATTEMPTS = 3;
 
 function digestsEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
@@ -214,6 +219,32 @@ export function makeOffloadFetch(deps: { helia: Helia; bitswap: BitswapLike; mas
     return null;
   };
 
+  // The seed's PeerId as an object, for the targeted seed fetch below. Memoised — parsing is pure.
+  let seedPeerId: PeerId | null = null;
+  const seed = (): PeerId => (seedPeerId ??= peerIdFromString(masterId));
+
+  /** Pull a block FROM THE SEED with a targeted WANT-BLOCK — never the broadcast path.
+   *
+   *  WHY NOT helia.blockstore.get. That broadcasts the ENTIRE wantlist as one batched bitswap message
+   *  to every connected peer. A reassemble asks for a module's leaves all at once (stream.ts fetches
+   *  every sample/chunk concurrently), so the batch is large — and a go-libp2p seed over the browser's
+   *  single webrtc-direct connection leaves that batched message UNANSWERED: measured on prod, a
+   *  ~136-want batch is sent (taking ~6s) and comes back with zero blocks and zero presences. Worse,
+   *  @helia/bitswap then never re-sends — want-list.js marks each want "sent" per peer and has no
+   *  retry-on-no-response — so the fetch hangs until the caller's own timeout, i.e. the module never
+   *  loads. A SINGLE-want wantSessionBlock to the same seed is answered in ~one RTT (and 40 concurrent
+   *  land in ~2.5s), and the bitswap network layer already caps concurrent sends, so one targeted want
+   *  per leaf is both correct and safe. This is the path cached/donor-served modules always took; only
+   *  an uncached module with no dialable donor ever reached the broken broadcast — which is exactly why
+   *  some modules "never load" while others play fine. */
+  const wantSeed = async (cid: CID): Promise<Uint8Array | null> => {
+    for (let i = 0; i < SEED_ATTEMPTS; i++) {
+      const got = await wantBlockFrom(cid, seed(), performance.now());
+      if (got != null) return got;
+    }
+    return null;
+  };
+
   return async (cid: CID): Promise<Uint8Array> => {
     const local = await localGet(cid);
     if (local != null) return local;
@@ -221,9 +252,14 @@ export function makeOffloadFetch(deps: { helia: Helia; bitswap: BitswapLike; mas
     const offloaded = await tryOffload(cid).catch(() => null);
     if (offloaded != null) return offloaded;
 
-    // Fallback: the seed (and, if even it lacks the block, the DHT) via Helia's normal broadcast
-    // path. Reached only when no non-seed donor HAVEs the block, so the broadcast's WANT-BLOCK
-    // effectively goes to the seed alone — no duplicate full-block send.
+    // Seed fallback — targeted, not broadcast (see wantSeed). Reached when no non-seed donor HAVEs the
+    // block, which is the common case; the seed is the origin, so this virtually always returns bytes.
+    const fromSeed = await wantSeed(cid);
+    if (fromSeed != null) return fromSeed;
+
+    // Absolute last resort: the seed itself returned DONT_HAVE / timed out every attempt — a genuine
+    // "not on the seed" case where only the DHT / another provider can help. Helia's broadcast path
+    // reaches them; it is off the hot path and no longer where a normal module fetch ends up.
     return helia.blockstore.get(cid);
   };
 }
