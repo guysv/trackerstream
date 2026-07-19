@@ -151,10 +151,56 @@ func hopKind(addr ma.Multiaddr, _ peer.ID, master peer.ID, masterKnown bool) hop
 
 func (c *control) notifiee() network.Notifiee {
 	return &network.NotifyBundle{
-		ConnectedF: func(_ network.Network, conn network.Conn) {
+		ConnectedF: func(net network.Network, conn network.Conn) {
 			c.node.logf("connected %s via %s", conn.RemotePeer(), conn.RemoteMultiaddr())
+			c.evictStale(net, conn)
 		},
 	}
+}
+
+// staleConnMargin: a connection to a peer that predates a fresh one to the SAME peer by more than
+// this is a stale reconnect, not a transient dual-dial or a DCUtR relay+direct pair (those open
+// seconds apart). Wide enough to never touch legitimate concurrent connections.
+const staleConnMargin = 30 * time.Second
+
+// evictStale retires a peer's OLD connections when a fresh one arrives (master only).
+//
+// A browser that reloads or fails over reconnects under the SAME persistent PeerId — relay
+// reservations, provider records and playlist beacons are all keyed by it, so it cannot rotate.
+// Its previous webrtc-direct connection is left a half-open corpse: webrtc death is slow for either
+// side to observe (the browser's own supervisor notes this too, apps/web node.ts). Unretired, these
+// pile up on the master — they burn rcmgr connection slots, which then sheds the peer's fresh dials
+// (the connection-storm shedding), and they answer nobody. So when a NEW connection to a peer
+// arrives, close any connection to that same peer that predates it by staleConnMargin. The wide
+// margin means only a genuine stale reconnect is retired; brief redundancy is preserved.
+func (c *control) evictStale(net network.Network, fresh network.Conn) {
+	if c.node.cfg.Role != RoleServer {
+		return // the browser handles its own stale master connection (node.ts redialOnce)
+	}
+	var stale []network.Conn
+	for _, old := range net.ConnsToPeer(fresh.RemotePeer()) {
+		// Retire only a connection that BOTH predates the fresh one by a wide margin AND carries no
+		// active streams. The margin rules out a transient dual-dial / DCUtR pair; the idle check
+		// rules out killing a peer mid-transfer over a genuinely-used older connection. A dead
+		// webrtc-direct corpse is idle (its streams reset when the transport died), so the target
+		// zombie still qualifies.
+		if old != fresh &&
+			fresh.Stat().Opened.Sub(old.Stat().Opened) > staleConnMargin &&
+			old.Stat().NumStreams == 0 {
+			stale = append(stale, old)
+		}
+	}
+	if len(stale) == 0 {
+		return
+	}
+	// Close off the notifiee goroutine — Close can block briefly and must not stall connection setup.
+	go func() {
+		for _, old := range stale {
+			c.node.logf("evict stale conn to %s (%s old, superseded by fresh dial)",
+				old.RemotePeer(), time.Since(old.Stat().Opened).Round(time.Second))
+			_ = old.Close()
+		}
+	}()
 }
 
 // Warm records a peer as keepalive-worthy (warm holder). The keepalive loop redials warm

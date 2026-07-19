@@ -75,6 +75,17 @@ export class WebClient implements NodeClient {
     // Dev-only handle for inspecting the live node from the console (connections, peerStore, redial
     // state) — indispensable for debugging the promoted-node reconnect. Gated, never in prod.
     if (import.meta.env?.DEV || import.meta.env?.VITE_EXPOSE_NODE) (globalThis as { __tsnode?: TsNode }).__tsnode = ts;
+
+    // Politely close the node when this leader tab goes away (close OR reload). Our PeerId is
+    // persistent (loadOrCreateKey), so without a clean close the seed keeps our webrtc-direct
+    // connection as a half-open corpse keyed to that identity and only reaps it on its own slow
+    // timeout — during which a reloaded tab's redial under the SAME PeerId hangs (see node.ts) and
+    // the stale conn burns a seed connection slot. Stopping libp2p sends the close so the seed frees
+    // us at once. Best-effort: pagehide's budget is tight and stop() is async, so the seed-side
+    // eviction (tsnode control.go evictStale) is the reliable backstop; this just makes the common
+    // reload path fast. pagehide (not unload) so it still fires on mobile/bfcache paths.
+    addEventListener("pagehide", () => void ts.libp2p.stop().catch(() => {}), { once: true });
+
     const fs = unixfs(ts.helia);
 
     // Resolve the catalog's IPNS name over the custom DHT, verifying the record locally — the node

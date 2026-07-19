@@ -11,6 +11,16 @@ import { startLeaderServer } from "./server.ts";
 
 /** Elect, then return this tab's NodeClient. The leader also starts serving followers. */
 export async function bootClient(): Promise<NodeClient> {
+  // A bfcache restore (back/forward) resurrects a FROZEN page, and none of its coordination state
+  // survives usefully: the leader's node is dead (webrtc does not survive a freeze) yet its Web Lock
+  // was released on pagehide, so it is a phantom leader holding no lock; a follower's BroadcastChannel
+  // proxy points at a leader that may be long gone. In-place repair is fragile — reload to re-run
+  // election from a clean slate. `persisted` is true ONLY on a bfcache restore, so a normal load never
+  // pays this. Registered before election so it is armed for the life of the page.
+  addEventListener("pageshow", (e) => {
+    if ((e as PageTransitionEvent).persisted) location.reload();
+  });
+
   // No Web Locks: fall back to the pre-coordination behavior (every tab a standalone node). Only
   // ancient browsers land here, and they can't run our WebRTC stack anyway.
   if (!canElect()) return WebClient.create();

@@ -257,6 +257,17 @@ func New(ctx context.Context, cfg Config) (*Node, error) {
 		}
 	}
 	if cfg.Role == RoleServer {
+		// The master IS the network's known-public bootstrap box — direct-bound on a static public IP.
+		// Do NOT wait on AutoNAT to discover that. AutoNAT can only confirm "public" once a DIAL-BACK-
+		// capable peer is connected, but the whole audience is NATed browsers that cannot dial back,
+		// and go-libp2p only grants relay reservations once the node believes it is public — and a
+		// browser needs a reservation even to BOOT (its /p2p-circuit listen is fatal, apps/web node.ts).
+		// So a restart during a lull with no desktop/server peer online DEADLOCKS: the master waits for
+		// a peer to prove it public, and browsers can't become that peer. Forcing public breaks the
+		// cycle for good — the master relays + DHT-serves from t=0. It genuinely is public; if that ever
+		// stops being true the box is misconfigured, not mis-detected. (Observed live 2026-07-19: a
+		// master restart stranded every browser until an external client was hand-connected.)
+		opts = append(opts, libp2p.ForceReachabilityPublic())
 		// The master is an always-on bootstrap + seeder facing a large, churny inbound swarm
 		// (incl. residual public-IPFS dials on the well-known PeerId/port). go-libp2p's DEFAULT
 		// resource-manager limits are far too low for that: the Transient (pre-identify upgrade)

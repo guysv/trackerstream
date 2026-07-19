@@ -12,6 +12,7 @@ import { yamux } from "@chainsafe/libp2p-yamux";
 import { bitswap } from "@helia/block-brokers";
 import type { BitswapLike } from "./blockfetch.ts";
 import { circuitRelayTransport } from "@libp2p/circuit-relay-v2";
+import { FaultTolerance } from "@libp2p/interface";
 import { generateKeyPair, privateKeyFromProtobuf, privateKeyToProtobuf } from "@libp2p/crypto/keys";
 import { identify } from "@libp2p/identify";
 import { kadDHT, passthroughMapper } from "@libp2p/kad-dht";
@@ -136,6 +137,17 @@ export async function startNode(): Promise<TsNode> {
     // listenAddrs above — the master's addrs make the reservation deterministic, and a dialer then
     // reaches us over "…/p2p-circuit/webrtc" (relayed SDP + hole-punch to a direct datachannel).
     addresses: { listen: listenAddrs },
+    // Do NOT let a failed listen kill the whole node. js-libp2p defaults to FATAL_ALL: if ANY listen
+    // address fails to bind, createLibp2p throws and the tab shows "could not join the swarm" — nothing
+    // works. But EVERY one of our listen addrs is a circuit-relay reservation on the master
+    // (…/p2p-circuit and /webrtc, which need a reservation to listen at all). When the master can't
+    // grant one — it just restarted, is momentarily non-public, or is briefly unreachable — the whole
+    // boot FAILS, even though our DIRECT webrtc-direct connection to it (Bitswap + catalog) would work
+    // fine. Reservations only make us dialable BY OTHERS; they are not required to consume. NO_FATAL
+    // lets the node boot on whatever bound, so a browser always comes up and serves/plays, and the
+    // reservation re-establishes on its own when the master is ready (the discovery topology re-fires).
+    // Observed live 2026-07-19: a master restart left every browser unable to boot until this.
+    transportManager: { faultTolerance: FaultTolerance.NO_FATAL },
     transports: [
       webRTCDirect(), // -> the master and any public seed. No STUN/TURN: the certhash IS the handshake.
       // -> other browsers. SDP is signalled over the circuit relay; ICE uses the seed's coturn,
