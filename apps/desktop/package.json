@@ -1,6 +1,6 @@
 {
   "name": "@trackerstream/desktop",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "trackerstream desktop client (Tauri + Svelte)",
   "type": "module",
   "scripts": {
